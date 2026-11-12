@@ -199,9 +199,70 @@ The workspace uses a separate firewall container. It blocks private and reserved
 
 The stack uses named volumes for its persistent data. Recreating a container keeps those volumes. Deleting the volumes removes your data.
 
+## Use the Kubernetes runtime
+
+Set `NOD_RUNTIME=kubernetes` to use separate server, workspace, and browser pods. Docker remains the default when you omit this setting. The existing Compose files, installer, and Docker images keep their behavior.
+
+### Build the images
+
+Use Git, Node.js 24.21.0 or newer, and Docker with Buildx. From a source checkout, run:
+
+```sh title="Terminal"
+node deployment/kubernetes/build.mjs
+```
+
+The script builds Linux AMD64 images from the checkout and loads them into your local Docker engine. It doesn't publish images or change a cluster. It uses the existing source Dockerfiles and lockfile, without a prebuilt bundle or a locally cached base image. Docker still needs internet access to download base images and dependencies.
+
+The server image extends the normal self-host server build with checksum-pinned `kubectl` 1.36.6, removes the Docker client, and defaults to Kubernetes. Buildx connects the two builds directly. Don't build `deployment/kubernetes/Dockerfile` alone: its `nod-server` context comes from the script, not a registry.
+
+Images use these tags, where `<revision>` is the full Git commit:
+
+- `nod-server:kubernetes-<revision>`
+- `nod-workspace:<revision>`
+- `nod-browser:<revision>`
+
+An uncommitted checkout adds `-dirty` to the revision and image label. Use a clean, committed checkout for releases. To rebuild only the server, pass `server` to the script. This build supports AMD64 only; ARM64 needs its own verified `kubectl` checksum and validation.
+
+### Configure the workloads
+
+Set `NOD_KUBERNETES_NAMESPACE` to the namespace containing `nod-workspace-0` and `nod-browser-0`. Both pods must have a container named `runtime`. Use singleton StatefulSets to preserve those pod names. The server needs only `get` on these named pods and `get` and `create` on their `pods/exec` subresource. It doesn't need pod listing, Secret reads, or workload creation. Kubernetes RBAC cannot restrict exec to a particular command or container. Treat the server as trusted with both pods.
+
+Set `command: ["sleep", "infinity"]` on the workspace container so it stays available for exec. Without this override, the image inherits `node` as its default command and exits when standard input closes.
+
+Use the matching upstream workspace and browser images. The workspace runtime needs root with only `SETUID`, `SETGID`, and `SETPCAP`. Each command drops to the workspace or connected CLI user, clears capabilities, and sets no-new-privileges. The browser runs as UID 1000. Neither runtime pod needs a service account token, privileged mode, a Docker socket, or a host mount.
+
+Mount the same persistent workspace directory at `/var/lib/nod/workspaces` in the server and `/workspace` in the workspace pod. Persist the server data, workspace home, connected CLI installation directory `/var/tmp`, and browser `/data`. Provide writable temporary directories and browser `/home/node`. Keep all three workloads on the same node when using ReadWriteOnce storage.
+
+For a shared PostgreSQL server, set `DATABASE_URL` to a dedicated database owned by a non-superuser Nod role. Supply `NOD_AUTH_TOKEN` and `NOD_VAULT_KEY` through a server-only Secret. Deny network traffic by default, then permit DNS, public internet, and only the server's required private connections. Allow Kubernetes API access only from the server and trusted operational jobs.
+
+Stop the server before stopping its runtime pods for a consistent backup. Save the database, persistent directories, and installation secrets together. Restore into an isolated environment without starting the assistant, then check application data before reconnecting accounts.
+
+### Update and validate
+
+Keep the runtime code, build script, and tests in the source fork. Keep cluster manifests, backup tools, secrets, and deployed image digests in your deployment repository. No cluster address, registry account, or private credential is built into this integration.
+
+Merge a reviewed upstream revision into an update branch. Resolve changes to `src/server/composition.ts`, the shared command supervisor, and the workspace and browser protocols before rebuilding all three images. Review the pinned `kubectl` version against your API server's supported version skew. Source and lockfile pins don't freeze Debian package repositories, so rebuilt images can have different digests.
+
+Run the focused sandbox and browser tests, `pnpm run lint`, and `pnpm --dir docs build`. Check Docker compatibility with the existing disposable Compose test:
+
+```sh title="Terminal"
+node deployment/kubernetes/build.mjs compose workspace browser
+NOD_IMAGE_TAG="$(git rev-parse HEAD)" node deployment/self-host/check.mjs
+```
+
+These commands assume a clean checkout. The Compose check uses temporary credentials and volumes, tests authentication, workspace and browser execution, and persistence, then removes its test stack. It doesn't call a model or a connected account.
+
+In a disposable Kubernetes deployment, check workspace command output, cancellation, connected CLI isolation, and browser execution. Verify that the server can't execute in a third pod or read Secrets. Test your network policies and an isolated backup restore before updating production.
+
+Audit all image layers for secrets before publishing to your approved registry. Record the source commit and all three registry digests in the deployment repository. Deploy by digest, retain the previous images, and take a tested backup first. A database migration may require restoring that backup rather than only rolling back an image.
+
+:::caution
+This is a maintained fork integration, not an upstream Kubernetes installer. You own the manifests, network policies, storage, backups, image updates, and acceptance tests.
+:::
+
 ## Keep it running
 
-The containers restart when Docker starts. On a Mac, Docker Desktop starts after you sign in when its startup setting is enabled.
+For Docker installations, the containers restart when Docker starts. On a Mac, Docker Desktop starts after you sign in when its startup setting is enabled. Kubernetes installations use the restart and replacement behavior of their Deployments and StatefulSets instead.
 
 Follow [Back up and update a server](/deploy/server-operations/) before your first update. Keep the Vault key with your backup; the database alone cannot recover saved credentials.
 
