@@ -122,6 +122,7 @@ try {
       },
     },
     pod('prepare', images[1], {
+      securityContext: { runAsUser: 0, runAsGroup: 0 },
       command: [
         'sh',
         '-ec',

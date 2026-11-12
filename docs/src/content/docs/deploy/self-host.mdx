@@ -227,6 +227,8 @@ An uncommitted checkout adds `-dirty` to the revision and image label. Use a cle
 
 Set `NOD_KUBERNETES_NAMESPACE` to the namespace containing `nod-workspace-0` and `nod-browser-0`. Both pods must have a container named `runtime`. Use singleton StatefulSets to preserve those pod names. The server needs only `get` on these named pods and `get` and `create` on their `pods/exec` subresource. It doesn't need pod listing, Secret reads, or workload creation. Kubernetes RBAC cannot restrict exec to a particular command or container. Treat the server as trusted with both pods.
 
+Create a server-only ServiceAccount and bind that restricted Role to it with a RoleBinding. Set `serviceAccountName` on the server pod to this account and `automountServiceAccountToken: true` for in-cluster `kubectl` authentication. Set `automountServiceAccountToken: false` on both workspace and browser pods. For Deployments and StatefulSets, these settings belong in `spec.template.spec`.
+
 Set `command: ["sleep", "infinity"]` on the workspace container so it stays available for exec. Without this override, the image inherits `node` as its default command and exits when standard input closes.
 
 Use the matching upstream workspace and browser images. The workspace runtime needs root with only `SETUID`, `SETGID`, and `SETPCAP`. Each command drops to the workspace or connected CLI user, clears capabilities, and sets no-new-privileges. The browser runs as UID 1000. Neither runtime pod needs a service account token, privileged mode, a Docker socket, or a host mount.
