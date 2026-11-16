@@ -1203,6 +1203,7 @@ export async function createPiModelRuntime(
     let settleBudget: ((spentUsd: number | null) => Promise<void>) | undefined;
     const guardedFetch =
       access.provider === 'compatible' ||
+      access.provider === 'cortecs' ||
       access.provider === 'radius' ||
       access.provider === 'cloudflare-workers-ai' ||
       access.provider === 'cloudflare-ai-gateway' ||
@@ -1210,7 +1211,7 @@ export async function createPiModelRuntime(
       Boolean(usage);
     const sent = audio?.context ?? context;
     const replay =
-      access.provider === 'compatible'
+      access.provider === 'compatible' || access.provider === 'cortecs'
         ? { ...sent, messages: portableToolCallIds(sent.messages, target.id) }
         : sent;
     const upstream = stream(target, replay, {
