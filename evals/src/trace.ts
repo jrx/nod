@@ -1,5 +1,5 @@
-import { readdir, readFile, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readdir, readFile, readlink, stat } from 'node:fs/promises';
+import { join, relative } from 'node:path';
 import type { Write, AppsWorld } from './world/apps.ts';
 import type { Interaction, Session } from './session.ts';
 import { approvalOrder, type Stack } from './stack.ts';
@@ -63,6 +63,8 @@ export interface Run {
   userMessages: Array<{ at: number; text: string }>;
   writes: Write[];
   files: string[];
+  home: Record<string, Buffer>;
+  trashed: string[];
   artifacts: Array<{ id: string; threadId: string | null }>;
   schedules: Array<{
     title: string;
@@ -216,6 +218,29 @@ export function handedReads(
       handed: true,
     }));
   });
+}
+
+async function snapshot(root: string) {
+  const entries = await readdir(root, { recursive: true, withFileTypes: true });
+  const parents = new Set(entries.map((entry) => entry.parentPath));
+  const kept = entries.filter(
+    (entry) =>
+      entry.isFile() ||
+      entry.isSymbolicLink() ||
+      (entry.isDirectory() && !parents.has(join(entry.parentPath, entry.name))),
+  );
+  return Object.fromEntries(
+    await Promise.all(
+      kept.map(async (entry) => {
+        const path = join(entry.parentPath, entry.name);
+        const name = relative(root, path);
+        if (entry.isSymbolicLink())
+          return [name, Buffer.from(`symlink to ${await readlink(path)}`)];
+        if (entry.isDirectory()) return [`${name}/`, Buffer.alloc(0)];
+        return [name, await readFile(path)];
+      }),
+    ),
+  ) as Record<string, Buffer>;
 }
 
 export async function collectUsage(pool: Stack['pool']): Promise<Run['usage']> {
@@ -491,6 +516,8 @@ export async function collect(options: {
     userMessages: session.userMessages,
     writes: world.apps?.writes ?? [],
     files,
+    home: stack.home ? await snapshot(stack.home) : {},
+    trashed: [...(stack.trashed ?? [])],
     artifacts,
     schedules,
     scheduleRuns,

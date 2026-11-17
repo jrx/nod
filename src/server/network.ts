@@ -17,9 +17,11 @@ export function serverNetwork(environment: Record<string, string | undefined>) {
     throw new Error('NOD_PUBLIC_URL must be an HTTP or HTTPS origin.');
   }
   const local = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+  const withDefaultPort = `${url.protocol}//${url.hostname}:${url.protocol === 'https:' ? 443 : 80}`;
+  const spellings = [url.origin, withDefaultPort].flatMap((origin) => [origin, `${origin}/`]);
   if (
     !['http:', 'https:'].includes(url.protocol) ||
-    (address !== url.origin && address !== `${url.origin}/`) ||
+    !spellings.includes(address) ||
     (url.protocol !== 'https:' && !local.has(url.hostname))
   )
     throw new Error('NOD_PUBLIC_URL must be an HTTPS origin, or HTTP on localhost.');
@@ -35,6 +37,6 @@ export function serverNetwork(environment: Record<string, string | undefined>) {
     host,
     publicOrigin: url.origin,
     authToken,
-    accessOrigin: environment.NOD_PUBLIC_URL !== undefined || authToken ? url.origin : undefined,
+    accessOrigin: environment.NOD_PUBLIC_URL !== undefined ? url.origin : undefined,
   };
 }

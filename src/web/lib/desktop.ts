@@ -8,9 +8,23 @@ export type DesktopPreferences = {
   launchAtLogin: boolean;
 };
 
-export type DesktopSettings = DesktopPreferences & {
-  onboardingPreferenceStep: 'launchAtLogin' | 'complete';
+export type DesktopSettings = DesktopPreferences;
+
+type LocalSetup = { preferenceStep: 'launchAtLogin' | 'complete' };
+
+type LocalRuntime = {
+  status(): Promise<DesktopStatus>;
+  subscribeStatus(listener: (status: DesktopStatus) => void): () => void;
+  prepare(options?: { retry: boolean }): Promise<DesktopStatus>;
+  setup(): Promise<LocalSetup>;
+  completePreferences(): Promise<LocalSetup>;
+  reconcileSetup(): Promise<void>;
 };
+
+type ClientPlatform =
+  | { kind: 'browser' }
+  | { kind: 'desktop-remote' }
+  | { kind: 'desktop-local'; runtime: LocalRuntime };
 
 export type DesktopStatus = {
   phase?: string;
@@ -37,8 +51,8 @@ export type DesktopUpdateStatus = {
   dismissedVersion?: string;
 };
 
-export type DesktopSettingsChange = { onboardingCompleted?: true } & Partial<
-  Pick<DesktopSettings, 'theme' | 'notifications' | 'launchAtLogin' | 'onboardingPreferenceStep'>
+export type DesktopSettingsChange = Partial<
+  Pick<DesktopPreferences, 'theme' | 'notifications' | 'launchAtLogin'>
 >;
 
 type DesktopSettingsSection = 'general' | 'models' | 'preferences';
@@ -61,9 +75,14 @@ type DesktopAppOpening = {
 
 type DesktopWindow = Window & {
   nodDesktop?: {
+    protocolVersion?: number;
+    mode?: 'local' | 'remote';
+    localRuntime?: LocalRuntime;
     remote?: boolean;
     ready?(): Promise<void>;
-    getSettings(): Promise<DesktopSettings>;
+    getSettings(): Promise<
+      DesktopSettings & { onboardingPreferenceStep?: LocalSetup['preferenceStep'] }
+    >;
     status?(): Promise<DesktopStatus>;
     onStatus?(listener: (status: DesktopStatus) => void): () => void;
     updateStatus?(): Promise<DesktopUpdateStatus>;
@@ -71,7 +90,13 @@ type DesktopWindow = Window & {
     dismissUpdate?(version: string): Promise<void>;
     restartUpdate?(): Promise<void>;
     prepare?(options?: { retry: boolean }): Promise<DesktopStatus>;
-    saveSettings(input: DesktopSettingsChange): Promise<DesktopSettings>;
+    savePreferences?(input: DesktopSettingsChange): Promise<DesktopSettings>;
+    saveSettings(
+      input:
+        | DesktopSettingsChange
+        | { onboardingCompleted: true }
+        | { launchAtLogin: true; onboardingPreferenceStep: 'complete' },
+    ): Promise<DesktopSettings & { onboardingPreferenceStep?: LocalSetup['preferenceStep'] }>;
     getZoomFactor?(): Promise<number>;
     setZoomFactor?(factor: number): Promise<number>;
     removeAllData(): Promise<void>;
@@ -100,8 +125,66 @@ export function desktopRendererReady() {
   void (window as DesktopWindow).nodDesktop?.ready?.();
 }
 
+export function clientPlatform(): ClientPlatform {
+  const bridge = (window as DesktopWindow).nodDesktop;
+  if (!bridge) return { kind: 'browser' };
+  if (bridge.protocolVersion !== undefined) {
+    if (bridge.protocolVersion !== 1 || !['local', 'remote'].includes(bridge.mode ?? ''))
+      throw new Error('This desktop connection is not supported. Update Nod, then try again.');
+    if (bridge.mode === 'remote') return { kind: 'desktop-remote' };
+    if (!bridge.localRuntime)
+      throw new Error('Local setup is unavailable. Update Nod, then try again.');
+    return { kind: 'desktop-local', runtime: bridge.localRuntime };
+  }
+  if (typeof bridge.getSettings !== 'function') return { kind: 'browser' };
+  if (bridge.remote) return { kind: 'desktop-remote' };
+  return {
+    kind: 'desktop-local',
+    runtime: {
+      status: () => {
+        if (!bridge.status) throw new Error('Local setup is unavailable.');
+        return bridge.status();
+      },
+      subscribeStatus: (listener) => bridge.onStatus?.(listener) ?? (() => {}),
+      prepare: (options) => {
+        if (!bridge.prepare) throw new Error('Restart Nod to try setting up your workspace again.');
+        return bridge.prepare(options);
+      },
+      setup: async () => ({
+        preferenceStep: (await bridge.getSettings()).onboardingPreferenceStep ?? 'launchAtLogin',
+      }),
+      completePreferences: async () => {
+        const saved = await bridge.saveSettings({
+          launchAtLogin: true,
+          onboardingPreferenceStep: 'complete',
+        });
+        if (saved.onboardingPreferenceStep !== 'complete')
+          throw new Error('Nod could not finish device setup. Try again.');
+        return { preferenceStep: 'complete' };
+      },
+      reconcileSetup: async () => {
+        await bridge.saveSettings({ onboardingCompleted: true });
+      },
+    },
+  };
+}
+
+function localRuntime() {
+  const platform = clientPlatform();
+  if (platform.kind !== 'desktop-local') throw new Error('Local setup is unavailable.');
+  return platform.runtime;
+}
+
 export function desktopRuntimeAvailable() {
-  return desktopSettingsAvailable() && !(window as DesktopWindow).nodDesktop?.remote;
+  return clientPlatform().kind === 'desktop-local';
+}
+
+export function desktopSetup() {
+  return localRuntime().setup();
+}
+
+export function completeDesktopPreferences() {
+  return localRuntime().completePreferences();
 }
 
 export function desktopSettingsAvailable() {
@@ -138,11 +221,13 @@ function settingsBridge() {
 }
 
 export function getDesktopSettings() {
-  return settingsBridge().getSettings();
+  const bridge = settingsBridge();
+  return bridge.protocolVersion === 1 ? bridge.getPreferences() : bridge.getSettings();
 }
 
 export function saveDesktopSettings(change: DesktopSettingsChange) {
-  return settingsBridge().saveSettings(change);
+  const bridge = settingsBridge();
+  return bridge.savePreferences ? bridge.savePreferences(change) : bridge.saveSettings(change);
 }
 
 export function getDesktopZoomFactor() {
@@ -225,11 +310,13 @@ export function onFeedbackRequested(listener: () => void) {
 }
 
 export function desktopStatus() {
-  return (window as DesktopWindow).nodDesktop?.status?.();
+  const platform = clientPlatform();
+  return platform.kind === 'desktop-local' ? platform.runtime.status() : undefined;
 }
 
 export function subscribeDesktopStatus(listener: (status: DesktopStatus) => void) {
-  return (window as DesktopWindow).nodDesktop?.onStatus?.(listener) ?? (() => {});
+  const platform = clientPlatform();
+  return platform.kind === 'desktop-local' ? platform.runtime.subscribeStatus(listener) : () => {};
 }
 
 export function desktopUpdateStatus() {
@@ -253,9 +340,7 @@ export function restartDesktopUpdate() {
 }
 
 export async function retryDesktopRuntime() {
-  const bridge = (window as DesktopWindow).nodDesktop;
-  if (!bridge?.prepare) throw new Error('Restart Nod to try setting up your workspace again.');
-  const status = await bridge.prepare({ retry: true });
+  const status = await localRuntime().prepare({ retry: true });
   const failure =
     status.error ||
     (status.phase === 'error' ? status.message : undefined) ||

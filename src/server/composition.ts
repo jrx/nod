@@ -656,6 +656,8 @@ export function createDefaultAdapters(
             mode,
             allowedNumber: configured.WHATSAPP_ALLOWED_NUMBER,
             store: createChannelSessionStore({ pool, ownerId, keyStore }),
+            onDrop: (drop) =>
+              logFailure('channel_message_dropped', null, { provider: 'whatsapp', ...drop }),
           }),
         );
       },
@@ -1070,6 +1072,7 @@ async function initializeApplication(
     memory,
     learnedSkills,
     models: adapters.models,
+    localFilesAvailable: Boolean(adapters.trash),
     consumers,
     stopConsumer: (id) => boss.offWork('scheduled-task', { id, wait: true }),
     taskModels: {
@@ -1260,17 +1263,26 @@ async function initializeApplication(
     trash: adapters.trash,
     available: Boolean(adapters.trash),
   });
-  const preparationPaused = async () => {
+  const preparationBlocked = async () => {
+    if ((await ledger.preparationLimit()).reached)
+      return 'the monthly preparation allowance is reached';
+    const unpriced = adapters.models?.unpricedPreparationModel();
+    if (unpriced) return `${unpriced} has no price, so the preparation allowance cannot bound it`;
+  };
+  const preparationPause = async () => {
     const prefs = await speechPreferences.get();
-    return prefs.proactivePaused || isQuietTime(prefs) || (await ledger.preparationLimit()).reached;
+    if (prefs.proactivePaused) return 'automatic preparation is paused';
+    if (isQuietTime(prefs)) return 'it is quiet hours';
+    return preparationBlocked();
   };
   const integrations = await createIntegrations(pool, {
     localFiles,
     mailCheck: async (...args) => {
-      if (await preparationPaused()) return args[0].map(() => undefined);
+      const pause = await preparationPause();
+      if (pause) return args[0].map(() => `background email checks wait because ${pause}`);
       return ledger.withPreparation(randomUUID(), () => mailCheck(...args));
     },
-    paused: preparationPaused,
+    paused: async () => Boolean(await preparationPause()),
     analytics: captureAnalytics,
     analyticsConsent,
     admission,
@@ -1977,7 +1989,7 @@ async function initializeApplication(
     curator: adapters.classificationCurator && ledger.curator(adapters.classificationCurator),
     analytics: captureAnalytics,
     modelAvailable: async () =>
-      !(await ledger.preparationLimit()).reached &&
+      !(await preparationBlocked()) &&
       (adapters.models
         ? await adapters.models.automaticRequestsAllowed({ kind: 'background' }, true)
         : adapters.model.configured),
@@ -2609,6 +2621,23 @@ async function initializeApplication(
             readWork,
           );
           return result;
+        }
+        if (isLocalFilesAction(action) && localFiles.available && !(await localFiles.enabled())) {
+          await localFiles.assertStartedByOwner(turn);
+          const input = { localFilesEnabled: true };
+          const verdict = await trust.check(turn, 'NOD_notification_preferences_update', input);
+          return approvals.request(turn, 'NOD_notification_preferences_update', input, {
+            allowed: !verdict.confirm,
+            ...(verdict.confirm ? {} : { basis: verdict.basis }),
+            signal: options.signal,
+            admit: options.admit,
+            expectedChatRevision: verdict.chatRevision,
+            details: {
+              ...(typeof args.path === 'string' ? { requestedPath: args.path } : {}),
+              accessScope:
+                'Enable local file access in the home folder and external drives for work the owner starts. Hidden files, secrets, private system folders and kept-out folders stay blocked. This enables the setting only; the requested file action has not run.',
+            },
+          });
         }
         const prepare = () =>
           hasWorkspaceFiles(args)

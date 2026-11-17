@@ -16,7 +16,7 @@ export function modelContext<
       maxTokens: Math.min(
         model.maxTokens,
         companion?.maxTokens ?? Infinity,
-        compact ? Math.floor(window / 4) : Infinity,
+        Math.floor(window / (compact ? 4 : 2)),
       ),
     },
     compact,

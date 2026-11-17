@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "tsc --noEmit",
+    "check": "bun check --no-script",
     "test": "node --import tsx --test tests/*.test.ts",
     "eval": "tsx src/cli.ts"
   }

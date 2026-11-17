@@ -19,7 +19,6 @@ import {
 import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
 import { basename, join } from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 import { promisify } from 'node:util';
 import { parse } from 'yaml';
@@ -533,13 +532,14 @@ test('connected CLIs run only their sealed install with a clean environment', as
   }
 });
 
-test('an uncertain workspace operation cancels and drains commands already in flight', async () => {
-  const processes: Array<ReturnType<WorkspaceCommandLauncher>> = [];
-  let signalCancellation: () => void = () => {};
-  const cancelled = new Promise<void>((resolve) => {
-    signalCancellation = resolve;
-  });
-  const launch: WorkspaceCommandLauncher = () => {
+function fakeDocker(check: (args: string[]) => Promise<{ code: number; stderr?: string }>) {
+  const launches: Array<{
+    workdir: string;
+    request: Promise<{ args: string[] }>;
+    cancelled: Promise<void>;
+    child: ReturnType<WorkspaceCommandLauncher> & EventEmitter;
+  }> = [];
+  const launch: WorkspaceCommandLauncher = (_command, args) => {
     const child = Object.assign(new EventEmitter(), {
       stdin: new PassThrough(),
       stdout: new PassThrough(),
@@ -548,11 +548,43 @@ test('an uncertain workspace operation cancels and drains commands already in fl
         return true;
       },
     });
-    child.stdin.on('data', (data) => {
-      if (data.toString() === '{"type":"cancel"}\n') signalCancellation();
+    let received: (request: { args: string[] }) => void = () => {};
+    let cancel: () => void = () => {};
+    const request = new Promise<{ args: string[] }>((resolve) => (received = resolve));
+    const cancelled = new Promise<void>((resolve) => (cancel = resolve));
+    let buffered = '';
+    child.stdin.on('data', (chunk: Buffer) => {
+      buffered += chunk.toString();
+      for (let end = buffered.indexOf('\n'); end >= 0; end = buffered.indexOf('\n')) {
+        const line = buffered.slice(0, end);
+        buffered = buffered.slice(end + 1);
+        if (line === '{"type":"cancel"}') cancel();
+        else received(JSON.parse(line));
+      }
     });
-    processes.push(child as unknown as ReturnType<WorkspaceCommandLauncher>);
-    return processes.at(-1)!;
+    const index = launches.length;
+    launches.push({
+      workdir: args[args.indexOf('--workdir') + 1]!,
+      request,
+      cancelled,
+      child: child as unknown as ReturnType<WorkspaceCommandLauncher> & EventEmitter,
+    });
+    void request.then(({ args }) => {
+      if (args.at(-1) === 'ok') setImmediate(() => exit(index, 0));
+      else if (args[0] === '/usr/bin/python3')
+        void check(args).then(({ code, stderr }) => exit(index, code, null, stderr));
+    });
+    return child as unknown as ReturnType<WorkspaceCommandLauncher>;
+  };
+  const exit = (index: number, code: number, reason: string | null = null, stderr = '') => {
+    const { child } = launches[index]!;
+    if (stderr)
+      child.stdout.emit(
+        'data',
+        JSON.stringify({ type: 'stderr', data: Buffer.from(stderr).toString('base64') }) + '\n',
+      );
+    child.stdout.emit('data', JSON.stringify({ type: 'exit', code, reason }) + '\n');
+    child.emit('close', 0);
   };
   const workspace = createDockerWorkspace({
     container: 'nod-workspace-fixture',
@@ -564,37 +596,132 @@ test('an uncertain workspace operation cancels and drains commands already in fl
     workspacePath: '/synthetic/fixture',
     signal: new AbortController().signal,
   });
-  let failureSettled = false;
-  const failed = assert.rejects(execute(session, 'first'), /did not stop safely/).finally(() => {
-    failureSettled = true;
-  });
-  const drained = assert.rejects(execute(session, 'second'), /Task cancelled/);
-  let acknowledged = false;
-  const acknowledge = () => {
-    if (acknowledged) return;
-    acknowledged = true;
-    processes[1].stdout.emit('data', '{"type":"exit","code":-15,"reason":"cancelled"}\n');
-    processes[1].emit('close', 0);
-  };
+  return { launches, workspace, session, exit };
+}
+
+test('an uncertain command is stopped once and the workspace keeps working', async () => {
+  const docker = fakeDocker(async () => ({ code: 0 }));
+  const first = execute(docker.session, 'first');
+  const second = execute(docker.session, 'second');
   try {
-    processes[0].emit('close', 1);
-    await Promise.race([
-      cancelled,
-      delay(500).then(() => {
-        throw new Error('Existing command was not cancelled.');
-      }),
-    ]);
-    await assert.rejects(execute(session, 'later'), /Restart Nod/);
-    assert.equal(processes.length, 2);
-    assert.equal(failureSettled, false);
-    acknowledge();
-    await Promise.all([failed, drained]);
+    docker.launches[0]!.child.stderr.emit('data', 'synthetic transport error\n');
+    docker.launches[0]!.child.emit('close', 1);
+    await docker.launches[1]!.cancelled;
+    docker.exit(1, -15, 'cancelled');
+    await assert.rejects(second, /Task cancelled/);
+    const failure = await first.then(
+      () => assert.fail('The first command should not finish.'),
+      (error: Error) => error,
+    );
+    assert.equal(await execute(docker.session, 'ok'), '');
+    assert.match(
+      failure.message,
+      /did not stop safely: its command stream closed before the command confirmed it finished \(exit code 1: synthetic transport error\)\. Its processes are confirmed stopped and its result is unknown\. The workspace is available\./,
+    );
+    const requests = await Promise.all(docker.launches.map(({ request }) => request));
+    assert.deepEqual(
+      requests.map(({ args }) => args.at(-1)),
+      ['first', 'second', '/proc', 'ok'],
+    );
+    assert.deepEqual(
+      docker.launches.map(({ workdir }) => workdir),
+      ['/workspace/fixture', '/workspace/fixture', '/var/tmp', '/workspace/fixture'],
+    );
+    assert.deepEqual(requests[2]!.args.slice(0, 3), ['/usr/bin/python3', '-I', '-c']);
   } finally {
-    acknowledge();
-    await workspace.dispose();
-    await Promise.allSettled([failed, drained]);
+    await docker.workspace.dispose();
+    await Promise.allSettled([first, second]);
   }
 });
+
+test('the workspace stays fenced when a live process cannot be read', async () => {
+  const proc = await mkdtemp(join(tmpdir(), 'nod-proc-'));
+  await mkdir(join(proc, '1'));
+  await writeFile(join(proc, '1', 'stat'), `1 (docker-init) S 0 1 1${' 0'.repeat(16)} 5`);
+  await writeFile(join(proc, '1', 'cmdline'), '/sbin/docker-init\0--\0/usr/bin/sleep\0');
+  await mkdir(join(proc, '4242', 'stat'), { recursive: true });
+  const docker = fakeDocker(async (args) => {
+    try {
+      await promisify(execFile)('python3', ['-I', '-c', args[3]!, proc]);
+      return { code: 0 };
+    } catch (error) {
+      return { code: 1, stderr: (error as { stderr: string }).stderr };
+    }
+  });
+  const first = execute(docker.session, 'first');
+  const reason =
+    /did not stop safely: .*Nod could not confirm that its processes stopped: Nod could not read process 4242: \[Errno 21\] Is a directory: .*\. Restart Nod before continuing\./;
+  try {
+    docker.launches[0]!.child.emit('close', 137);
+    await assert.rejects(first, reason);
+    await assert.rejects(execute(docker.session, 'ok'), reason);
+    assert.equal(docker.launches.length, 2);
+  } finally {
+    await docker.workspace.dispose();
+    await Promise.allSettled([first]);
+    await rm(proc, { recursive: true, force: true });
+  }
+});
+
+if (process.env.NOD_TEST_WORKSPACE_IMAGE)
+  test(
+    'recovery ends a fully detached process even after the command removed its folder',
+    { timeout: 120_000 },
+    async (t) => {
+      const container = `nod-workspace-recovery-${randomUUID().slice(0, 8)}`;
+      const docker = async (...args: string[]) =>
+        (await promisify(execFile)('docker', args, { timeout: 30_000 })).stdout.trim();
+      t.after(() => docker('rm', '-f', container).catch(() => {}));
+      await docker(
+        'run',
+        '-d',
+        '--init',
+        '--network',
+        'none',
+        '--name',
+        container,
+        '--entrypoint',
+        '/usr/bin/sleep',
+        process.env.NOD_TEST_WORKSPACE_IMAGE!,
+        'infinity',
+      );
+      const threadId = randomUUID();
+      await docker('exec', '--user', 'node', container, 'mkdir', `/workspace/${threadId}`);
+      const daemons = async () =>
+        Number(
+          await docker(
+            'exec',
+            '--user',
+            'node',
+            container,
+            'python3',
+            '-c',
+            [
+              'import os',
+              'def match(pid):',
+              ' try: return open(f"/proc/{pid}/cmdline","rb").read()==b"/usr/bin/sleep\\x00301\\x00"',
+              ' except OSError: return False',
+              'print(sum(match(pid) for pid in os.listdir("/proc") if pid.isdigit()))',
+            ].join('\n'),
+          ),
+        );
+      const run = (script: string) =>
+        runWorkspaceCommand({ container, threadId, args: ['bash', '-c', script] });
+      const error = await run(
+        'python3 -c \'import os,sys\nif os.fork(): sys.exit()\nos.setsid()\nif os.fork(): sys.exit()\nos.execve("/usr/bin/sleep",["/usr/bin/sleep","301"],{})\'; cd /; rm -r "/workspace/${threadId}"; sleep 1; kill -9 $PPID',
+      ).then(
+        () => assert.fail('The command should not finish.'),
+        (error: unknown) => error,
+      );
+      assert.ok(error instanceof WorkspaceCommandError && error.uncertain && error.stop);
+      assert.equal(await daemons(), 1);
+      await error.stop();
+      assert.equal(await daemons(), 0);
+      assert.equal(await docker('inspect', '-f', '{{.State.Running}}', container), 'true');
+      await docker('exec', '--user', 'node', container, 'mkdir', `/workspace/${threadId}`);
+      assert.equal((await run('echo available')).stdout.toString(), 'available\n');
+    },
+  );
 
 test('workspace uploads transfer binary chunks atomically and reject symlink directories', async () => {
   const f = await local();
@@ -671,6 +798,11 @@ test('self-hosted runtime limits Docker access to unprivileged execution in its 
     response.writeHead(201, { 'Content-Type': 'application/json' });
     response.end(JSON.stringify({ Id: executionId }));
   });
+  engine.on('upgrade', (request, stream) => {
+    forwarded.push({ path: request.url!, body: {} });
+    stream.write('HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n');
+    stream.pipe(stream);
+  });
   const proxy = createRuntimeProxy({
     socketPath: socket,
     workspace: 'nod-workspace-fixture',
@@ -710,6 +842,7 @@ test('self-hosted runtime limits Docker access to unprivileged execution in its 
       { Env: ['SECRET=synthetic'] },
       { WorkingDir: '/' },
       { WorkingDir: '/workspace/../var/tmp' },
+      { WorkingDir: '/var/tmp/other' },
       { Tty: true },
       { HostConfig: { Binds: ['/host:/host'] } },
     ])
@@ -748,6 +881,15 @@ test('self-hosted runtime limits Docker access to unprivileged execution in its 
     );
     assert.equal(
       (
+        await call('/containers/nod-workspace-fixture/exec', {
+          ...command,
+          WorkingDir: '/var/tmp',
+        })
+      ).status,
+      201,
+    );
+    assert.equal(
+      (
         await call('/containers/nod-browser-fixture/exec', {
           ...command,
           WorkingDir: '',
@@ -768,6 +910,37 @@ test('self-hosted runtime limits Docker access to unprivileged execution in its 
       (await call('/containers/nod-workspace-fixture/exec?unsafe=true', command)).status,
       403,
     );
+    const { connect } = await import('node:net');
+    const attach = (body: unknown) =>
+      new Promise<{ head: string; stream: ReturnType<typeof connect> }>((resolve, reject) => {
+        const stream = connect(address.port, '127.0.0.1');
+        const payload = JSON.stringify(body);
+        let head = '';
+        stream.on('error', reject);
+        stream.on('data', function read(chunk) {
+          head += chunk.toString();
+          if (!head.includes('\r\n\r\n')) return;
+          stream.off('data', read);
+          resolve({ head, stream });
+        });
+        stream.write(
+          `POST /v1.44/exec/${executionId}/start HTTP/1.1\r\nHost: docker\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(payload)}\r\n\r\n${payload}`,
+        );
+      });
+    const refused = await attach({ Detach: true, Tty: false });
+    assert.match(refused.head, /^HTTP\/1\.1 403 /);
+    refused.stream.destroy();
+    const attached = await attach({ Detach: false, Tty: false });
+    assert.match(attached.head, /^HTTP\/1\.1 101 /);
+    assert.equal(forwarded.at(-1)!.path, `/v1.44/exec/${executionId}/start`);
+    proxy.closeAllConnections();
+    const echoed = await new Promise<string>((resolve, reject) => {
+      attached.stream.once('data', (chunk) => resolve(chunk.toString()));
+      attached.stream.once('close', () => reject(new Error('The proxy closed the exec stream.')));
+      attached.stream.write('{"args":["synthetic"]}\n');
+    });
+    assert.equal(echoed, '{"args":["synthetic"]}\n');
+    attached.stream.destroy();
   } finally {
     await Promise.all([
       new Promise<void>((resolve) => proxy.close(() => resolve())),
@@ -927,8 +1100,13 @@ test('local files stay in home, skip secrets and kept-out folders, and never ove
   const data = join(base, 'data');
   await mkdir(join(data, 'keys'), { recursive: true });
   const keep: string[] = [];
+  let enabled = false;
   const pool = {
     query: async (sql: string, values: string[]) => {
+      if (sql.startsWith('SELECT local_files_enabled')) {
+        assert.equal(values[0], 'owner');
+        return { rows: [{ local_files_enabled: enabled }] };
+      }
       if (sql.startsWith('WITH RECURSIVE'))
         return { rows: [{ id: values[0], source: 'user', message_id: 'm', proactive: false }] };
       if (sql.startsWith('INSERT') && !keep.includes(values[1]!)) keep.push(values[1]!);
@@ -950,6 +1128,17 @@ test('local files stay in home, skip secrets and kept-out folders, and never ove
   });
   const turn = { turnId: 'turn', threadId: 'thread' };
   try {
+    await assert.rejects(files.prepare('LOCAL_FILES_LIST', { path: outside }), /access is off/);
+    await assert.rejects(files.execute('LOCAL_FILES_READ', { path: outside }), /access is off/);
+    enabled = true;
+    const prepared = await files.prepare('LOCAL_FILES_WRITE', {
+      path: join(shared, 'blocked.txt'),
+      text: 'Synthetic file',
+    });
+    enabled = false;
+    await assert.rejects(files.execute('LOCAL_FILES_WRITE', prepared), /access is off/);
+    assert.equal(existsSync(join(shared, 'blocked.txt')), false);
+    enabled = true;
     for (const path of [undefined, null, 42])
       await assert.rejects(
         files.keepOut(turn, path as unknown as string, pool),

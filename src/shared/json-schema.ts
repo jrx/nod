@@ -1,4 +1,5 @@
-import { NextStack, Resolve, Stack } from 'typebox/schema';
+import { Compile } from 'typebox/compile';
+import { Meta, NextStack, Resolve, Stack } from 'typebox/schema';
 
 const maps = new Set(['properties', '$defs', 'definitions', 'dependentSchemas', 'dependencies']);
 const schemas = new Set([
@@ -224,4 +225,31 @@ export function withoutSchemaPatterns(value: unknown): unknown {
     references.set(from, replacements);
   }
   return clean(value, false, state);
+}
+
+const draft2020 = Compile(
+  Meta['https://json-schema.org/draft/2020-12/schema'] as Parameters<typeof Compile>[0],
+);
+
+export function draft2020Schema(value: unknown): unknown {
+  if (draft2020.Check(value)) return value;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, item]) => {
+      if (draft2020.Check({ [key]: item })) return [[key, item]];
+      const repaired =
+        maps.has(key) && item && typeof item === 'object' && !Array.isArray(item)
+          ? Object.fromEntries(
+              Object.entries(item).map(([name, schema]) => [name, draft2020Schema(schema)]),
+            )
+          : schemas.has(key)
+            ? Array.isArray(item)
+              ? item.map(draft2020Schema)
+              : draft2020Schema(item)
+            : undefined;
+      return repaired !== undefined && draft2020.Check({ [key]: repaired })
+        ? [[key, repaired]]
+        : [];
+    }),
+  );
 }

@@ -10,7 +10,7 @@ export const agentModels: Partial<Record<ModelProvider, string>> = {
   'cloudflare-workers-ai': '@cf/moonshotai/kimi-k2.7-code',
   deepseek: 'deepseek-flash',
   fireworks: 'accounts/fireworks/models/kimi-k3',
-  google: 'gemini-3.8-flash',
+  google: 'gemini-4-argon',
   'google-vertex': 'gemini-4-argon',
   groq: 'qwen/qwen3.8-27b',
   huggingface: 'moonshotai/Kimi-K3',

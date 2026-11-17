@@ -42,7 +42,7 @@ export function registerLocalAccess(
       ? [`127.0.0.1:${port}`]
       : origin
         ? [origin.host]
-        : [`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`],
+        : ['localhost', '127.0.0.1', '[::1]'].map((name) => new URL(`http://${name}:${port}`).host),
   );
   const expected = Buffer.from(access.key);
   const cookie = accessCookie(port);

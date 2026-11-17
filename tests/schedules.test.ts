@@ -47,6 +47,7 @@ test(
     };
     let failAfterTask = false;
     const watched = new Map<string, string>();
+    let watchPolls = 0;
     let modelPaused = false;
     const personal = createPersonalService({
       pool: db.pool,
@@ -54,8 +55,10 @@ test(
       scheduler: thread.boss,
       now: () => clock,
       watchable: async (ids) => ids.every((id) => watched.has(id)),
-      watchState: async (ids) =>
-        ids.every((id) => watched.has(id)) ? ids.map((id) => watched.get(id)).join() : null,
+      watchState: async (ids) => {
+        watchPolls++;
+        return ids.every((id) => watched.has(id)) ? ids.map((id) => watched.get(id)).join() : null;
+      },
       modelPaused: () => modelPaused,
       enqueueTurn: async (...args) => {
         assert.ok(args[1]?.client);
@@ -1063,6 +1066,45 @@ test(
           clock = before;
         },
       );
+      await t.test('stale watched jobs do not poll accounts or start runs', async () => {
+        const before = clock;
+        const account = randomUUID();
+        watched.set(account, 'v1');
+        const disabled = await create({ cron: '*/15 * * * *', watch: [account] });
+        const disabledJob = await jobFor(disabled.id);
+        const pause = await request('PATCH', `/api/schedules/${disabled.id}`, {
+          enabled: false,
+        });
+        assert.equal(pause.statusCode, 200, pause.body);
+        const beforeDisabled = watchPolls;
+        clock = new Date(disabledJob.data.scheduledFor);
+        await deliver([disabledJob]);
+        assert.equal(watchPolls, beforeDisabled);
+        assert.equal((await runs(disabled.id)).length, 0);
+
+        const revised = await create({ cron: '*/15 * * * *', watch: [account] });
+        const oldJob = await jobFor(revised.id);
+        const update = await request('PATCH', `/api/schedules/${revised.id}`, {
+          title: 'Updated fixture watch',
+        });
+        assert.equal(update.statusCode, 200, update.body);
+        const currentJob = await jobFor(revised.id);
+        assert.notEqual(currentJob.id, oldJob.id);
+        assert.notEqual(currentJob.data.revision, oldJob.data.revision);
+        const beforeRevised = watchPolls;
+        clock = new Date(oldJob.data.scheduledFor);
+        await deliver([oldJob]);
+        assert.equal(watchPolls, beforeRevised);
+        assert.equal((await runs(revised.id)).length, 0);
+
+        clock = new Date(currentJob.data.scheduledFor);
+        await deliver([currentJob]);
+        assert.equal(watchPolls, beforeRevised + 1);
+        assert.equal((await runs(revised.id)).length, 1);
+        await request('DELETE', `/api/schedules/${disabled.id}`);
+        await request('DELETE', `/api/schedules/${revised.id}`);
+        clock = before;
+      });
       await t.test(
         'a watch schedule skips a fire only while its accounts are unchanged since a finished run',
         async () => {

@@ -41,6 +41,8 @@ Several controls protect each connection:
 | **App content cannot grant permission** | Nod marks app results as untrusted data. The trust check sees your words and the proposed action, never the app results. An email cannot authorize an action.                                                                                                            |
 | **A record you can review**             | [Usage](/use/spending/) shows app actions and the words that allowed them while the source message exists. You can [disconnect an account](#manage-connected-accounts) or revoke access in the provider's settings.                                                      |
 
+Each signed request carries the time it was signed. If your computer's clock is wrong, the connection service refuses the request. Nod then uses the time the service reports and signs that request once more.
+
 Composio documents credential encryption with AES-256-GCM and TLS for data in transit. Its [security documentation](https://docs.composio.dev/docs/security/overview) explains these controls. Its [Trust Center](https://trust.composio.dev/) provides security reports and its subprocessor list.
 
 With the default setup, app requests and results pass through n8n's connection service and Composio. Other setups use the connection service their operator selects. ZDR limits storage for covered calls. It does not reduce OAuth permissions or set retention for your model provider, destination apps, or Nod's local data. The trust check uses a model and can make mistakes. See the [Security review guide](/trust/security-review/) for the wider boundaries.
@@ -85,11 +87,13 @@ Nod checks Gmail for new mail while it's running. The connection service doesn't
 
 ## When the connection service is busy
 
-All apps connected through the connection service share one allowance for your Nod install. When the service answers HTTP 429 (too many requests) or 503 (unavailable), Nod pauses background reads of all those apps. The pause lasts as long as the service's `Retry-After` header asks, up to 15 minutes. Without that header, it lasts one minute and doubles after each refusal, up to 30 minutes. A successful app request that starts after the latest refusal ends the pause.
+All apps connected through the connection service share one allowance for your Nod install. When the service answers HTTP 429 (too many requests) or 503 (unavailable), Nod pauses background reads of all those apps. The pause lasts as long as the service's `Retry-After` header asks, up to 15 minutes. Without that header, the wait starts at one minute. A later refusal doubles it only if that request started after the previous refusal arrived. The wait can grow to 30 minutes. Refusals from requests already in flight do not each add a step. A successful app request that starts after the latest refusal ends the pause.
+
+When the connection service reports its own rate limit or outage during a Gmail inbox check, Nod waits instead of trying that check again immediately. It keeps its cursor and any completed messages for a later check.
 
 During the pause:
 
-- A read you ask for, in chat or a task you started, still tries once. If the service refuses it, the pause grows.
+- A read you ask for, in chat or a task you started, still tries once. If the service refuses it, the same wait rules apply.
 - An action, such as sending an email, fails at once with the time the pause ends. Nod doesn't send it, so it can't run twice. Ask again after that time.
 - Background checks, scheduled reads and reads in tasks Nod starts skip these apps. They can try again later.
 

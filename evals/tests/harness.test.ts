@@ -43,6 +43,7 @@ import {
   showsNumber,
   urlsGrounded,
 } from '../src/checks.ts';
+import tidyDownloads from '../src/scenarios/local-file-tidy-downloads.ts';
 import { createSimulator, judgeCriteria, simulatorFailure, withFallback } from '../src/judge.ts';
 import { createCapture, proactiveBaselineInstructions } from '../src/capture.ts';
 import { createSpend, mergeAttemptCosts } from '../src/spend.ts';
@@ -3688,6 +3689,39 @@ test('only calibrated scenarios that passed every one of at least five attempts 
   await rm(root, { recursive: true, force: true });
 });
 
+test('local file checks fail a missing move and any change or trash of the owner files', async () => {
+  const world = tidyDownloads.world({ now: Date.now });
+  const untouched = Object.fromEntries(
+    Object.entries(world.localFiles!).map(([path, bytes]) => [path, Buffer.from(bytes)]),
+  );
+  const tidied = Object.fromEntries(
+    Object.entries(untouched).map(([path, bytes]) => [
+      path.replace(/^Downloads\/(?=[^/]+\.pdf$)/, 'Downloads/Invoices/'),
+      bytes,
+    ]),
+  );
+  const expectations = tidyDownloads.expect(world);
+  const grade = (home: Record<string, Buffer>, trashed: string[] = []) =>
+    Promise.all(
+      ['moves-the-pdfs', 'changes-nothing-else'].map(async (id) => {
+        const rule = expectations.find((item) => item.id === id);
+        if (rule?.kind !== 'check') throw new Error(`Missing ${id} check`);
+        return (await rule.check({ ...quietRun(world), home, trashed })).pass;
+      }),
+    );
+  assert.deepEqual(await grade(tidied), [true, true]);
+  assert.deepEqual(await grade(untouched), [false, true]);
+  assert.deepEqual(await grade({ ...tidied, 'Downloads/notes.txt': Buffer.from('changed') }), [
+    true,
+    false,
+  ]);
+  assert.deepEqual(await grade({ ...tidied, 'Downloads/extra/': Buffer.alloc(0) }), [true, false]);
+  const { 'Downloads/photo.jpg': _photo, ...withoutPhoto } = tidied;
+  assert.deepEqual(await grade(withoutPhoto), [true, false]);
+  assert.deepEqual(await grade(tidied, ['Downloads/photo.jpg']), [true, false]);
+  assert.deepEqual(await grade(tidied, ['Downloads/Invoices/draft.pdf']), [true, true]);
+});
+
 function quietRun(world: ReturnType<Scenario['world']>): Run {
   return {
     api: async () => ({ status: 200, body: {} }),
@@ -3708,6 +3742,8 @@ function quietRun(world: ReturnType<Scenario['world']>): Run {
     userMessages: [],
     writes: world.apps?.writes ?? [],
     files: [],
+    home: {},
+    trashed: [],
     artifacts: [],
     schedules: [],
     scheduleRuns: [],

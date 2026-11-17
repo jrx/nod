@@ -26,6 +26,7 @@ import type {
 } from '../shared/models.ts';
 import {
   apiKeyConnectionProviders,
+  boundedPrice,
   modelProviderInfo,
   modelProviderNames,
   azureDeploymentPattern,
@@ -614,6 +615,36 @@ export function createModelService(options: {
       void reload().catch((error: unknown) => logFailure('model_settings_reload_failed', error));
     });
   }
+  function chosen(auxiliary: boolean, choice: ModelSelection | null) {
+    const selected = auxiliary ? selection && { ...selection } : choice && { ...choice };
+    const row = rows.find((row) => row.id === selected?.connectionId);
+    if (!row || !selected)
+      throw new ConnectionError('Open Settings > Models. Connect a service and choose a model.');
+    if (row.status !== 'connected') throw attention(row);
+    const definition =
+      (auxiliary
+        ? row.models.find((model) => model.choice.id === memoryModels[row.provider])
+        : undefined) ?? row.models.find((model) => model.choice.id === selected.modelId);
+    if (!definition || (!definition.choice.efforts.includes(selected.effort) && !auxiliary))
+      throw new ConnectionError(
+        `The selected model is unavailable on this connection (${row.provider} / ${selected.modelId}). Reload its models or choose another model in Settings > Models.`,
+      );
+    const companion = definition.choice.audio ? textCompanion(row) : undefined;
+    if (definition.choice.audio && !companion) throw missingTextCompanion();
+    return { selected, row, definition, companion };
+  }
+  function unpricedPreparationModel() {
+    try {
+      const background = service.workModel({ kind: 'background' }).selection;
+      for (const auxiliary of [false, true]) {
+        const { definition, companion } = chosen(auxiliary, background);
+        const target = companion ?? definition;
+        if (!boundedPrice(modelPricing(target))) return target.choice.name;
+      }
+    } catch {
+      return;
+    }
+  }
   function lightModel(): ModelSelection | null {
     const candidate = classificationModel();
     if (!candidate) return null;
@@ -1091,6 +1122,7 @@ export function createModelService(options: {
       }
     },
     light: lightModel,
+    unpricedPreparationModel,
     priceOf(choice: ModelSelection | null | undefined) {
       const definition = rows
         .find((row) => row.id === choice?.connectionId)
@@ -1176,6 +1208,7 @@ export function createModelService(options: {
       return () => observers.delete(observer);
     },
     view(): ModelsResponse {
+      const unpriced = unpricedPreparationModel();
       return {
         connections: rows.map(
           ({ id, provider, method, label, status, managed, models, keyEnding, issue }) => ({
@@ -1199,6 +1232,7 @@ export function createModelService(options: {
         selection,
         routes,
         light: lightModel(),
+        ...(unpriced ? { unpricedPreparationModel: unpriced } : {}),
       };
     },
     async initialize() {
@@ -1452,21 +1486,7 @@ export function createModelService(options: {
       auxiliary = false,
       choice: ModelSelection | null = selection,
     ): Promise<ModelAccess> {
-      const selected = auxiliary ? selection && { ...selection } : choice && { ...choice };
-      const row = rows.find((row) => row.id === selected?.connectionId);
-      if (!row || !selected)
-        throw new ConnectionError('Open Settings > Models. Connect a service and choose a model.');
-      if (row.status !== 'connected') throw attention(row);
-      const definition =
-        (auxiliary
-          ? row.models.find((model) => model.choice.id === memoryModels[row.provider])
-          : undefined) ?? row.models.find((model) => model.choice.id === selected.modelId);
-      if (!definition || (!definition.choice.efforts.includes(selected.effort) && !auxiliary))
-        throw new ConnectionError(
-          `The selected model is unavailable on this connection (${row.provider} / ${selected.modelId}). Reload its models or choose another model in Settings > Models.`,
-        );
-      const companion = definition.choice.audio ? textCompanion(row) : undefined;
-      if (definition.choice.audio && !companion) throw missingTextCompanion();
+      const { selected, row, definition, companion } = chosen(auxiliary, choice);
       return {
         provider: row.provider,
         method: row.method,

@@ -60,7 +60,6 @@ export function BrowserHandoff({ turnId, paused = false }: { turnId: string; pau
       { resolve(value: Blob): void; reject(reason: unknown): void; writing: Promise<void> }
     >(),
   );
-  const view = useRef(crypto.randomUUID());
   const imageLoad = useRef<{
     url: string;
     resolve: () => void;
@@ -334,6 +333,7 @@ export function BrowserHandoff({ turnId, paused = false }: { turnId: string; pau
   useEffect(() => {
     if (closed || unavailable) return;
     const controller = new AbortController();
+    const viewId = crypto.randomUUID();
     let activeSignal: AbortSignal | undefined = controller.signal;
     let current = '';
     const release = () => {
@@ -345,35 +345,34 @@ export function BrowserHandoff({ turnId, paused = false }: { turnId: string; pau
     setShown(false);
     setFrame('');
     void apiStream(
-      `/api/browser-handoff/stream?turnId=${encodeURIComponent(turnId)}&view=${view.current}-${attempt}`,
+      `/api/browser-handoff/stream?turnId=${encodeURIComponent(turnId)}&view=${viewId}`,
       { signal: controller.signal },
       (body, signal) => {
         activeSignal = signal;
-        return browserFrames(
-          body,
-          (bytes) =>
-            new Promise<void>((resolve, reject) => {
-              signal?.throwIfAborted();
-              const url = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }));
-              release();
-              current = url;
-              const finish = (error?: unknown) => {
-                window.clearTimeout(timeout);
-                signal?.removeEventListener('abort', abort);
-                if (imageLoad.current?.url === url) imageLoad.current = null;
-                if (error) reject(error);
-                else resolve();
-              };
-              const abort = () => finish(signal?.reason);
-              const timeout = window.setTimeout(
-                () => finish(new Error('The browser frame did not load.')),
-                10_000,
-              );
-              imageLoad.current = { url, resolve: () => finish(), reject: finish };
-              signal?.addEventListener('abort', abort, { once: true });
-              setFrame(url);
-            }),
-        );
+        return browserFrames(body, async (bytes) => {
+          await new Promise<void>((resolve, reject) => {
+            signal?.throwIfAborted();
+            const url = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' }));
+            release();
+            current = url;
+            const finish = (error?: unknown) => {
+              window.clearTimeout(timeout);
+              signal?.removeEventListener('abort', abort);
+              if (imageLoad.current?.url === url) imageLoad.current = null;
+              if (error) reject(error);
+              else resolve();
+            };
+            const abort = () => finish(signal?.reason);
+            const timeout = window.setTimeout(
+              () => finish(new Error('The browser frame did not load.')),
+              10_000,
+            );
+            imageLoad.current = { url, resolve: () => finish(), reject: finish };
+            signal?.addEventListener('abort', abort, { once: true });
+            setFrame(url);
+          });
+          await post('/api/browser-handoff/frame-ack', { turnId, view: viewId }, signal);
+        });
       },
     )
       .catch((reason) => {

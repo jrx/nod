@@ -12,7 +12,7 @@ export function createRuntimeProxy({
     throw new Error('A browser container is required.');
   const executions = new Map();
   const denied = (response) => response.writeHead(403).end('Runtime operation refused.');
-  const gateway = http.createServer(async (request, response) => {
+  const handle = async (request, response, source = request) => {
     const path = request.url?.replace(/^\/v1\.\d+(?=\/)/, '') || '';
     const method = request.method;
     const now = Date.now();
@@ -36,7 +36,7 @@ export function createRuntimeProxy({
         inspecting = inspect[1];
       } else if (method === 'POST' && create && [workspace, browser].includes(create[1])) {
         if (executions.size >= 4096) return response.writeHead(503).end();
-        body = await readJson(request);
+        body = await readJson(await source);
         const allowed = new Set([
           'User',
           'WorkingDir',
@@ -75,13 +75,17 @@ export function createRuntimeProxy({
           )
             return denied(response);
         } else if (body.User === 'node') {
-          if (!/^\/workspace\/[0-9a-f-]{36}$/.test(body.WorkingDir || '')) return denied(response);
+          if (
+            body.WorkingDir !== '/var/tmp' &&
+            !/^\/workspace\/[0-9a-f-]{36}$/.test(body.WorkingDir || '')
+          )
+            return denied(response);
         } else if (!/^[2-5]\d{4}:1002$/.test(body.User || '') || body.WorkingDir !== '/var/tmp')
           return denied(response);
         creating = true;
       } else if (execute && executions.has(execute[1])) {
         if (execute[2] === 'start' && method === 'POST') {
-          body = await readJson(request);
+          body = await readJson(await source);
           if (
             Object.keys(body).some((key) => !['Detach', 'Tty'].includes(key)) ||
             body.Detach !== false ||
@@ -166,11 +170,45 @@ export function createRuntimeProxy({
     } catch {
       if (!response.headersSent) response.writeHead(400).end('Invalid runtime request.');
     }
+  };
+  const gateway = http.createServer((request, response) => handle(request, response));
+  gateway.on('upgrade', (request, socket, head) => {
+    socket.on('error', () => socket.destroy());
+    socket.setTimeout(10_000, () => socket.destroy());
+    const response = new http.ServerResponse(request);
+    response.assignSocket(socket);
+    response.on('finish', () => socket.end());
+    const body = upgradeBody(request, socket, head);
+    body.catch(() => {});
+    handle(request, response, body);
   });
   gateway.headersTimeout = 10_000;
   gateway.requestTimeout = 30_000;
   gateway.maxHeadersCount = 32;
   return gateway;
+}
+
+function upgradeBody(request, socket, head) {
+  const length = Number(request.headers['content-length'] ?? 0);
+  if (!Number.isSafeInteger(length) || length < 0 || length > 65_536)
+    return Promise.reject(new Error('Invalid body length.'));
+  return new Promise((resolve, reject) => {
+    let data = head;
+    const take = (chunk) => {
+      if (chunk) data = Buffer.concat([data, chunk]);
+      if (data.length < length) return;
+      socket.off('data', take);
+      socket.off('end', end);
+      socket.pause();
+      socket.setTimeout(0);
+      if (data.length > length) socket.unshift(data.subarray(length));
+      resolve([data.subarray(0, length)]);
+    };
+    const end = () => reject(new Error('The request body ended early.'));
+    socket.on('data', take);
+    socket.once('end', end);
+    take();
+  });
 }
 
 async function readJson(stream) {

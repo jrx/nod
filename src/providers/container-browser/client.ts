@@ -245,7 +245,13 @@ export function createBridgeComputer(options: {
           const error = new Error('Browser observations are paused during credential entry.');
           return reject(Object.assign(error, { statusCode: 423 }));
         }
-        reject(new Error('The workspace browser could not complete this action. Try again.'));
+        reject(
+          new Error(
+            response.detail
+              ? `The workspace browser could not complete this action: ${response.detail}`
+              : 'The workspace browser could not complete this action. Try again.',
+          ),
+        );
       });
       void (async () => {
         child.stdin.write(encoded);

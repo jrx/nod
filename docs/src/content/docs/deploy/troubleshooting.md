@@ -43,6 +43,12 @@ Keep a copy of the key somewhere safe. Saved credentials can't be read without i
 
 Another program uses port `4310`. Set another `PORT` in `.env` and [apply the configuration](/deploy/configuration/#apply-configuration-changes). Update your browser address and any SSH tunnel to match. A direct source install also needs database port `54329` on `127.0.0.1`; the self-hosting stack keeps its database port private.
 
+### This host is not permitted.
+
+When `NOD_PUBLIC_URL` is set, Nod answers only at that address. The Docker setup always sets it (by default to `http://localhost:4310`). A request for any other host gets this error. That includes `127.0.0.1`, `localhost` after you set an HTTPS address, and a reverse proxy that changes the `Host` header. Without `NOD_PUBLIC_URL`, Nod answers only at `localhost`, `127.0.0.1` and `[::1]` on its own port.
+
+Open Nod at that exact address, and make sure a reverse proxy passes the public `Host` header through unchanged. To use another address, change `NOD_PUBLIC_URL` and [apply the configuration](/deploy/configuration/#apply-configuration-changes). Nod accepts one address at a time.
+
 ### You lost the access link
 
 For a local source install without `NOD_AUTH_TOKEN`, Nod prints a link with `#access=` when it starts, and your browser keeps the cookie. To get a new link, delete `access-key` in your data folder (`.local/` by default) and restart. A server configured with `NOD_AUTH_TOKEN` prints its address without that link; use its configured token, or follow [Rotate access](/deploy/server-operations/#rotate-access).
@@ -52,6 +58,8 @@ For a local source install without `NOD_AUTH_TOKEN`, Nod prints a link with `#ac
 ### Linux cannot start its private computer
 
 A local Linux desktop assistant requires hardware virtualization and access to `/dev/kvm`. Check that virtualization is enabled in your firmware and that your Linux account can use KVM. On distributions with a `kvm` group, your account must belong to it. Sign out and back in after a group change, then reopen Nod. Nod does not use software emulation as a fallback.
+
+If an older build reported `copy_file_range failed: invalid argument`, install the latest Nod bundle and retry. Nod now uses normal reads and writes to copy its first guest image. It verifies the complete copy before Lima can use it. An older empty disk is replaced only after Nod checks that every byte is zero and stops the computer. Disks with other data are kept.
 
 ### Linux cannot save or unlock keys
 
@@ -93,6 +101,10 @@ On Windows, the message reads "Nod needs more free disk space to prepare its pri
 
 Retry first. Do not delete the profile, VM, database, or runtime cache by hand to fix it. If it still fails, [send feedback](#send-feedback-with-a-diagnostic-report). If the chat cannot open, select **Show startup log** on the error screen. Send that log with a screenshot of the error. When a setup command fails, the message includes the last lines of its output.
 
+On Mac and Linux, Nod records new first setups and marks them complete after the computer passes its startup checks. If a recorded setup fails or is interrupted, the next attempt replaces the unfinished computer. A failed replacement reports its own error and stops the attempt. Computers that completed setup are kept. Missing configuration for an existing computer also stops setup and keeps its files.
+
+An interrupted Mac setup from an older version can lack that record. If retry still fails, keep its files and [send feedback with the startup log](#send-feedback-with-a-diagnostic-report).
+
 If the background service does not respond within two minutes, the startup log records the elapsed wait and the last health check failure. It also records whether the service reported its port. An unexpected service exit has a separate log entry.
 
 On a Mac, setup keeps runtime files that passed their checks, even if a later download fails. **Try again** checks and reuses those files. It does not remove a verified image while the private computer loads it.
@@ -104,6 +116,10 @@ On a Mac, **Technical details** and the startup log also show the cause of a run
 Quit Nod and open it again. If the error continues, restart Windows. Keep your app data. WSL setup errors also include the original Windows error.
 
 To start over, select **Remove all data…** in the **Nod** menu. Nod deletes your profile and private computer, then restarts and opens setup. See [Remove Nod](/get-started/install-desktop/#remove-nod) for what it keeps.
+
+### Windows keeps offering the same update
+
+Nod versions before 0.7.0 on Windows can't install their own updates. Quit Nod from the tray icon, then run the latest installer as described in [Update Nod](/get-started/install-desktop/#update-nod). It keeps your profile, keys and data. Don't uninstall Nod or delete its folders first.
 
 ### Windows says WSL is missing
 
@@ -127,7 +143,11 @@ ChatGPT sign-in receives its callback on port 1455. Another Nod app or another s
 
 Return to **Apps** and select **Connect** again. Keep the sign-in page and any window it opens until authorization finishes. A copied, expired or already used link cannot finish a connection. If the system's encrypted storage is locked, unlock it and restart Nod.
 
-If the connection service is unavailable or reports a limit, try again later. If the problem persists, [send feedback with a diagnostic report](/deploy/troubleshooting/#send-feedback-with-a-diagnostic-report).
+If the connection service refuses the request, the sign-in page names its reason and HTTP status, such as `public_budget_exceeded` and `HTTP 429`. If the connection service is unavailable or reports a limit, try again later. If the problem persists, [send feedback with a diagnostic report](/deploy/troubleshooting/#send-feedback-with-a-diagnostic-report).
+
+### An app tool fails with HTTP 403
+
+If an app tool error shows `HTTP 403` and a UTC time, [send feedback with a diagnostic report](/deploy/troubleshooting/#send-feedback-with-a-diagnostic-report). Include that time and any Cloudflare Ray ID in your feedback text. The displayed `0x` is a formatting prefix; support removes it before searching Cloudflare.
 
 ### App sign-in opens an unreachable address on a remote server
 

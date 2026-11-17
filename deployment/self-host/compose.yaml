@@ -173,12 +173,13 @@ services:
       - |
         origin=$${NOD_PUBLIC_URL%/}
         case "$$origin" in
-          https://*) authority=$${origin#https://} ;;
+          https://*) authority=$${origin#https://}; authority=$${authority%:443} ;;
           *) echo 'The HTTPS profile requires an https:// origin on port 443.' >&2; exit 1 ;;
         esac
         case "$$authority" in
           ''|*[!a-zA-Z0-9.-]*) echo 'The HTTPS profile requires a DNS or IPv4 host on port 443. Use an existing proxy for other ports or IPv6.' >&2; exit 1 ;;
         esac
+        export NOD_PUBLIC_URL="$$origin"
         exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     environment:
       NOD_PUBLIC_URL: ${NOD_PUBLIC_URL:-http://localhost:${PORT:-4310}}

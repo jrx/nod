@@ -8,6 +8,12 @@ export interface ProcessOptions {
   timeoutMs?: number;
 }
 
+export class RuntimeTimeLimitError extends Error {
+  constructor() {
+    super('Runtime command exceeded its time limit.');
+  }
+}
+
 export function serviceEnvironment(): NodeJS.ProcessEnv {
   return Object.fromEntries(
     [
@@ -57,7 +63,7 @@ export function runProcess(
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', abort);
       if (options.signal?.aborted) return reject(new Error('Task cancelled.'));
-      if (stopped) return reject(new Error('Runtime command exceeded its time limit.'));
+      if (stopped) return reject(new RuntimeTimeLimitError());
       resolve({
         stdout: Buffer.concat(chunks).toString('utf8'),
         stderr: Buffer.concat(errors).toString('utf8'),

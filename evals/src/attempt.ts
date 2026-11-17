@@ -113,6 +113,7 @@ async function run(spec: AttemptSpec): Promise<AttemptResult> {
       siteUpstreamPort: sites.port,
       hermetic: definition.tier !== 'live',
       environment,
+      localFiles: world.localFiles,
     }));
     phase = 'prepare';
     await prepare(stack, world, definition.timeZone ?? 'Europe/Madrid');

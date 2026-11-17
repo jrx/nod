@@ -231,6 +231,24 @@ export function createLocalFiles(
     return rows[0]?.local_keep_out ?? [];
   }
 
+  async function enabled() {
+    if (!available) return false;
+    const { rows } = await pool.query<{ local_files_enabled: boolean }>(
+      'SELECT local_files_enabled FROM preferences WHERE owner_id=$1',
+      [ownerId],
+    );
+    return rows[0]?.local_files_enabled === true;
+  }
+
+  async function assertEnabled() {
+    if (!available) throw unavailable();
+    if (!(await enabled()))
+      throw new IntegrationError(
+        'Local file access is off. Request localFilesEnabled: true with notification_preferences_update to ask the owner to turn it on in chat.',
+        403,
+      );
+  }
+
   async function assertStartedByOwner(turn: Turn | undefined, database: Query = pool) {
     const { rows } = turn
       ? await database.query<{
@@ -627,7 +645,7 @@ export function createLocalFiles(
   }
 
   async function prepare(action: Action, args: Record<string, unknown>) {
-    if (!available) throw unavailable();
+    await assertEnabled();
     const input = validate(action, args);
     const real = resolver(action, await keptOut());
     if (input.moves)
@@ -645,7 +663,7 @@ export function createLocalFiles(
     args: Record<string, unknown>,
     context: { signal?: AbortSignal; read?: WorkspaceRead } = {},
   ) {
-    if (!available) throw unavailable();
+    await assertEnabled();
     const { signal } = context;
     const input = validate(action, args) as Input;
     signal?.throwIfAborted();
@@ -825,6 +843,7 @@ export function createLocalFiles(
 
   return {
     available,
+    enabled,
     keptOut,
     keepOut,
     assertStartedByOwner,

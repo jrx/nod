@@ -28,6 +28,7 @@ import type {
 } from '../../ports/models.ts';
 import {
   bedrockRegionPattern,
+  boundedPrice,
   modelProviders,
   modelProviderNames,
   type ModelProvider,
@@ -1323,11 +1324,7 @@ export async function createPiModelRuntime(
           : body;
         settleBudget = await access.reserve?.(() => {
           const prices = target.cost;
-          return prices &&
-            [prices.input, prices.output, prices.cacheRead, prices.cacheWrite].every(
-              (price) => Number.isFinite(price) && price >= 0,
-            ) &&
-            Math.max(prices.input, prices.output, prices.cacheRead, prices.cacheWrite) > 0
+          return boundedPrice(prices)
             ? (Buffer.byteLength(JSON.stringify(prepared)) *
                 Math.max(prices.input * 2, prices.cacheWrite, prices.cacheRead) +
                 output * prices.output) /

@@ -167,6 +167,7 @@ let updateSource;
 let updates;
 let checkingUpdates;
 let updateRequestedManually = false;
+let updateRestartConfirmed = false;
 let updatePhase = 'idle';
 let updateProgress;
 let updateFailed = false;
@@ -379,9 +380,7 @@ function publicPreferences() {
 
 async function readDesktopSettings() {
   return {
-    ...(remoteConnection
-      ? { onboardingCompleted: true, onboardingPreferenceStep: 'complete' }
-      : await settings.get()),
+    ...(remoteConnection ? { onboardingPreferenceStep: 'complete' } : await settings.get()),
     ...publicPreferences(),
   };
 }
@@ -908,7 +907,7 @@ function showSettings(section = 'general', loading = false) {
     window
       .loadURL(
         `${setupURL}?${new URLSearchParams({
-          firstSetup: String(!onboardingCompleted),
+          firstSetup: String(!onboardingCompleted && !welcomePassed),
           ...(section === 'server' ? { server: 'true' } : {}),
           ...(section === 'onboarding'
             ? { onboarding: 'true', remote: String(Boolean(remoteConnection || status.remote)) }
@@ -1334,7 +1333,7 @@ function captureFreshAppOpen() {
     if (
       !saved ||
       saved.serverUrl ||
-      saved.onboardingCompleted ||
+      saved.onboardingPreferenceStep === 'complete' ||
       saved.welcome ||
       remoteConnection ||
       onboardingCompleted ||
@@ -1683,24 +1682,108 @@ async function transferWelcome() {
   return transferringWelcome;
 }
 
+async function saveRendererSettings(event, value) {
+  if (!isSetup(event) && !isEngine(event)) throw new Error('This action is unavailable.');
+  if (quitting) throw new Error('Nod is closing.');
+  const allowed = ['theme', 'notifications', 'launchAtLogin'];
+  if (isEngine(event) && value?.onboardingCompleted === true && Object.keys(value).length === 1) {
+    if (!remoteConnection) await reconcileLocalSetup(true);
+    else if (!(await accountSetupComplete()))
+      throw new Error('Finish onboarding before continuing.');
+    for (const window of engineWindows) deliverAppLink(window);
+    return readDesktopSettings();
+  }
+  if (isEngine(event) && !onboardingCompleted) allowed.push('onboardingPreferenceStep');
+  if (isSetup(event) && !onboardingCompleted) allowed.push('welcome');
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.keys(value).some((field) => !allowed.includes(field))
+  )
+    throw new Error('These settings are not supported.');
+  let loginChanged = typeof value.launchAtLogin === 'boolean';
+  let previousLogin;
+  if (loginChanged) {
+    try {
+      previousLogin = opensAtLogin();
+      setOpenAtLogin(value.launchAtLogin);
+      if (opensAtLogin() !== value.launchAtLogin)
+        throw new Error(
+          'Open at login could not be updated. Check Nod in your computer’s login items, then try again.',
+        );
+    } catch (error) {
+      if (value.onboardingPreferenceStep !== 'complete' || value.launchAtLogin !== true)
+        throw error;
+      if (typeof previousLogin === 'boolean') {
+        try {
+          setOpenAtLogin(previousLogin);
+        } catch {}
+      }
+      value = { ...value };
+      delete value.launchAtLogin;
+      loginChanged = false;
+    }
+  }
+  let saved;
+  try {
+    saved = await settings.save(value);
+  } catch (error) {
+    if (loginChanged) {
+      try {
+        setOpenAtLogin(previousLogin);
+      } catch {}
+    }
+    throw error;
+  }
+  if (value.welcome?.usageData === false) deferAppOpening();
+  if (value.welcome?.continued === false) captureStartupPath('local');
+  if (onboardingCompleted) nativePreferencesPending = false;
+  const confirmNotifications = value.notifications === true && !preferences.notifications;
+  applyPreferences(saved);
+  if (confirmNotifications) showNotificationConfirmation();
+  for (const window of engineWindows) deliverAppLink(window);
+  if (!['preparing', 'starting', 'error'].includes(status.phase)) update({ message: 'Ready.' });
+  return readDesktopSettings();
+}
+
+async function accountSetupComplete() {
+  const response = await engineRequest('/api/session');
+  if (!response.ok)
+    throw new Error(
+      `Nod could not read account setup: ${response.status} ${bounded(await response.text()) || response.statusText}`,
+    );
+  return (await response.json()).settings?.onboardingCompleted === true;
+}
+
+async function reconcileLocalSetup(required = false) {
+  if (remoteConnection || !engine || !enginePreferencesReady || quitting)
+    throw new Error('Local setup is unavailable.');
+  const activeEngine = engine;
+  const completed = await accountSetupComplete();
+  const saved = await settings.get();
+  if (quitting || engine !== activeEngine || remoteConnection)
+    throw new Error(engineFailure || 'Local setup stopped before it could be checked.');
+  const preferencesComplete = saved.onboardingPreferenceStep === 'complete' || saved.launchAtLogin;
+  if (required && (!completed || !preferencesComplete))
+    throw new Error('Finish onboarding before continuing.');
+  if (completed && saved.launchAtLogin && saved.onboardingPreferenceStep !== 'complete')
+    await settings.save({ onboardingPreferenceStep: 'complete' });
+  if (quitting || engine !== activeEngine || remoteConnection)
+    throw new Error(engineFailure || 'Local setup stopped before it could be checked.');
+  onboardingCompleted = completed && preferencesComplete;
+  nativePreferencesPending = completed && !preferencesComplete;
+  if (nativePreferencesPending) {
+    welcomePassed = true;
+    welcomeNavigation = false;
+  }
+  updateReadinessNotice();
+}
+
 async function finishEnginePreparation(pending = false) {
   await appPreferences.sync();
   if (quitting || !engine) throw new Error(engineFailure || 'Nod is closing.');
-  if (!onboardingCompleted) {
-    const response = await engineRequest('/api/session');
-    if (response.ok && (await response.json()).settings?.onboardingCompleted === true) {
-      const saved = await settings.get();
-      if (saved.onboardingPreferenceStep === 'complete' || saved.launchAtLogin) {
-        applyPreferences(await settings.save({ onboardingCompleted: true }));
-        onboardingCompleted = true;
-        nativePreferencesPending = false;
-      } else {
-        nativePreferencesPending = true;
-        welcomePassed = true;
-        welcomeNavigation = false;
-      }
-    }
-  }
+  await reconcileLocalSetup();
   if (quitting || !engine) throw new Error(engineFailure || 'Nod is closing.');
   if (!pending && !engineRuntimeReady) {
     engine.postMessage({ type: 'nod-runtime-ready' });
@@ -1798,13 +1881,15 @@ function refreshUpdateMenu() {
   publishUpdateStatus();
 }
 
-async function checkForUpdates(manual = true, restartReady = false) {
+async function checkForUpdates(manual = true, restartReady = false, confirmed = false) {
   if (!updates || quitting) return;
   if (checkingUpdates) {
     if (manual) updateRequestedManually = true;
+    if (confirmed) updateRestartConfirmed = true;
     return checkingUpdates;
   }
   updateRequestedManually = manual;
+  updateRestartConfirmed = confirmed;
   const release = () => {
     if (checkingUpdates === checking) checkingUpdates = undefined;
     refreshUpdateMenu();
@@ -1830,14 +1915,16 @@ async function checkForUpdates(manual = true, restartReady = false) {
           if (candidate.version !== previousVersion) await notifyUpdate(candidate);
           if (!updateRequestedManually || quitting) return;
         }
-        const { response } = await dialog.showMessageBox({
-          message: `Nod ${candidate.version} is ready.`,
-          buttons: ['Restart', 'Later'],
-          defaultId: 1,
-          cancelId: 1,
-          noLink: true,
-        });
-        if (response !== 0 || quitting) return;
+        if (!updateRestartConfirmed) {
+          const { response } = await dialog.showMessageBox({
+            message: `Nod ${candidate.version} is ready.`,
+            buttons: ['Restart', 'Later'],
+            defaultId: 1,
+            cancelId: 1,
+            noLink: true,
+          });
+          if (response !== 0 || quitting) return;
+        }
         restarting = true;
         await updates.restart();
         return;
@@ -2471,7 +2558,8 @@ else {
           prepareRuntime: async (candidate, signal, report) => {
             const saved = await settings.get();
             const includeRuntime =
-              !saved.serverUrl && (saved.onboardingCompleted || saved.welcome?.continued === true);
+              !saved.serverUrl &&
+              (saved.onboardingPreferenceStep === 'complete' || saved.welcome?.continued === true);
             if (windows) {
               const { stageWindowsUpdate } = await import(
                 pathToFileURL(join(engineRoot, 'desktop/runtime/windows.mjs')).href
@@ -2610,7 +2698,7 @@ else {
         if (!isEngine(event)) throw new Error('This action is unavailable.');
         if ((!updates?.ready && !checkingUpdates) || quitting)
           throw new Error('No desktop update is ready.');
-        await checkForUpdates(true, true);
+        await checkForUpdates(true, true, true);
       });
       ipcMain.handle('nod:settings:get', (event) => {
         if (!isSetup(event) && !isEngine(event)) throw new Error('This action is unavailable.');
@@ -2725,77 +2813,42 @@ else {
         applyPreferences(await settings.save({ theme }));
         return publicPreferences();
       });
-      ipcMain.handle('nod:settings:save', async (event, value) => {
-        if (!isSetup(event) && !isEngine(event)) throw new Error('This action is unavailable.');
-        const allowed = ['theme', 'notifications', 'launchAtLogin'];
-        if (isEngine(event) && !remoteConnection) allowed.push('onboardingCompleted');
-        if (isEngine(event) && !onboardingCompleted) allowed.push('onboardingPreferenceStep');
-        if (isSetup(event) && !onboardingCompleted) allowed.push('welcome');
+      ipcMain.handle('nod:settings:save', saveRendererSettings);
+      ipcMain.handle('nod:preferences:save', async (event, value) => {
+        if (!isEngine(event)) throw new Error('This action is unavailable.');
         if (
           !value ||
           typeof value !== 'object' ||
           Array.isArray(value) ||
-          Object.keys(value).some((field) => !allowed.includes(field))
-        )
-          throw new Error('These settings are not supported.');
-        if (quitting) throw new Error('Nod is closing.');
-        if (value.onboardingCompleted !== undefined) {
-          const response = await engineRequest('/api/session');
-          if (
-            value.onboardingCompleted !== true ||
-            !response.ok ||
-            (await response.json()).settings?.onboardingCompleted !== true
+          Object.keys(value).some(
+            (key) => !['theme', 'notifications', 'launchAtLogin'].includes(key),
           )
-            throw new Error('Finish onboarding before continuing.');
-        }
-        let loginChanged = typeof value.launchAtLogin === 'boolean';
-        let previousLogin;
-        if (loginChanged) {
-          try {
-            previousLogin = opensAtLogin();
-            setOpenAtLogin(value.launchAtLogin);
-            if (opensAtLogin() !== value.launchAtLogin)
-              throw new Error(
-                'Open at login could not be updated. Check Nod in your computer’s login items, then try again.',
-              );
-          } catch (error) {
-            if (value.onboardingPreferenceStep !== 'complete' || value.launchAtLogin !== true)
-              throw error;
-            if (typeof previousLogin === 'boolean') {
-              try {
-                setOpenAtLogin(previousLogin);
-              } catch {}
-            }
-            value = { ...value };
-            delete value.launchAtLogin;
-            loginChanged = false;
-          }
-        }
-        let saved;
-        try {
-          saved = await settings.save(value);
-        } catch (error) {
-          if (loginChanged) {
-            try {
-              setOpenAtLogin(previousLogin);
-            } catch {}
-          }
-          throw error;
-        }
-        if (value.welcome?.usageData === false) deferAppOpening();
-        if (value.welcome?.continued === false) captureStartupPath('local');
-        onboardingCompleted = remoteConnection ? true : saved.onboardingCompleted;
-        if (onboardingCompleted) nativePreferencesPending = false;
-        const confirmNotifications = value.notifications === true && !preferences.notifications;
-        applyPreferences(saved);
-        if (confirmNotifications) showNotificationConfirmation();
+        )
+          throw new Error('These preferences are not supported.');
+        await saveRendererSettings(event, value);
+        return publicPreferences();
+      });
+      ipcMain.handle('nod:setup:get', async (event) => {
+        if (!isEngine(event) || remoteConnection) throw new Error('Local setup is unavailable.');
+        return { preferenceStep: (await settings.get()).onboardingPreferenceStep };
+      });
+      ipcMain.handle('nod:setup:preferences', async (event) => {
+        if (!isEngine(event) || remoteConnection) throw new Error('Local setup is unavailable.');
+        if ((await settings.get()).onboardingPreferenceStep !== 'complete')
+          await saveRendererSettings(event, {
+            launchAtLogin: true,
+            onboardingPreferenceStep: 'complete',
+          });
+        return { preferenceStep: 'complete' };
+      });
+      ipcMain.handle('nod:setup:reconcile', async (event) => {
+        if (!isEngine(event) || remoteConnection) throw new Error('Local setup is unavailable.');
+        await reconcileLocalSetup(true);
         for (const window of engineWindows) deliverAppLink(window);
-        if (!['preparing', 'starting', 'error'].includes(status.phase))
-          update({ message: 'Ready.' });
-        return readDesktopSettings();
       });
       ipcMain.handle('nod:prepare', async (event, options) => {
         if (!isSetup(event) && !isEngine(event)) throw new Error('This action is unavailable.');
+        if (isEngine(event) && remoteConnection) throw new Error('Local setup is unavailable.');
         if (options?.retry === true && !enginePreferencesReady) welcomeTransferError = undefined;
         await transferWelcome();
         if (options?.retry === true && status.windowError) {
@@ -2877,12 +2930,14 @@ else {
         await resumeState();
         const removeData = Menu.getApplicationMenu?.()?.getMenuItemById('remove-local-data');
         if (removeData) removeData.enabled = !saved.serverUrl;
-        onboardingCompleted = Boolean(saved.serverUrl) || saved.onboardingCompleted;
+        onboardingCompleted = Boolean(saved.serverUrl);
+        welcomePassed = saved.onboardingPreferenceStep === 'complete';
         update({ remote: Boolean(saved.serverUrl) });
         applyPreferences(saved);
-        guidedStartup = !saved.serverUrl && !saved.onboardingCompleted;
+        guidedStartup = !saved.serverUrl && saved.onboardingPreferenceStep !== 'complete';
         const presented = showSettings('general', true);
-        if (saved.serverUrl || saved.onboardingCompleted || saved.welcome) void prepare();
+        if (saved.serverUrl || saved.onboardingPreferenceStep === 'complete' || saved.welcome)
+          void prepare();
         await presented;
       } catch (error) {
         showSettings('general', true);

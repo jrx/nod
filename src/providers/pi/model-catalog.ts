@@ -228,23 +228,34 @@ export async function nativeCatalog(
       z.object({ data: z.array(z.unknown()).max(10000) }),
       await read('https://api.mistral.ai/v1/models', headers),
     );
-    return select(
-      list(
-        data.data,
-        z.object({
-          id: modelId,
-          archived: z.boolean().optional(),
-          capabilities: z.object({ completion_chat: z.boolean(), function_calling: z.boolean() }),
+    const models = list(
+      data.data,
+      z.object({
+        id: modelId,
+        archived: z.boolean().optional(),
+        capabilities: z.object({
+          completion_chat: z.boolean(),
+          function_calling: z.boolean(),
+          vision: z.boolean().optional(),
         }),
-      )
-        .filter(
-          (model) =>
-            !model.archived &&
-            model.capabilities.completion_chat &&
-            model.capabilities.function_calling,
-        )
-        .map((model) => model.id),
+      }),
+    ).filter(
+      (model) =>
+        !model.archived &&
+        model.capabilities.completion_chat &&
+        model.capabilities.function_calling,
     );
+    const vision = new Map(models.map((model) => [model.id, model.capabilities.vision]));
+    return select(models.map((model) => model.id)).map((model) => {
+      const supportsImages = vision.get(model.id);
+      if (supportsImages === undefined) return model;
+      return {
+        ...model,
+        input: supportsImages
+          ? [...new Set([...model.input, 'image' as const])]
+          : model.input.filter((input) => input !== 'image'),
+      };
+    });
   }
 
   if (provider === 'radius') {

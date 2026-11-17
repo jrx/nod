@@ -1,3 +1,13 @@
+import { createBrowserWorkerFixture as harness } from './browser-fixture.ts';
+import { existingDaemonCommand } from '../src/providers/agent-browser/screens.ts';
+import { openDevtools } from '../src/providers/agent-browser/devtools.ts';
+import { createServer as createHttpServer } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { BrowserActionError, type BrowserAction } from '../src/ports/computer.ts';
+import { createAgentBrowserComputer } from '../src/providers/agent-browser/index.ts';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
@@ -405,6 +415,551 @@ test(
       await pool.end();
       await admin.query(`DROP SCHEMA ${schema} CASCADE`);
       await admin.end();
+    }
+  },
+);
+
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+test(
+  'reloading a page reached by a form POST does not resubmit it',
+  { timeout: 60_000 },
+  async () => {
+    let posts = 0;
+    const server = createHttpServer((request, response) => {
+      response.setHeader('content-type', 'text/html');
+      if (request.method === 'POST') {
+        posts += 1;
+        response.end(`<title>Done</title><p>count ${posts}</p>`);
+        return;
+      }
+      response.end('<form method="post" action="/submit"><button id="go">Go</button></form>');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const directory = await mkdtemp(join(tmpdir(), 'nod-reload-'));
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+    });
+    try {
+      await computer.act('post', { action: 'open', url: origin });
+      await computer.act('post', { action: 'click', selector: '#go' });
+      await computer.act('post', { action: 'wait', text: 'count 1' });
+      assert.equal(posts, 1);
+      await computer.act('post', { action: 'reload' });
+      await computer.act('post', { action: 'wait', load: 'load' });
+      assert.equal(posts, 1);
+      await computer.act('post', { action: 'open', url: origin });
+      await computer.act('post', { action: 'reload' });
+      assert.equal(posts, 1);
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'private submission keeps SPA state, delayed requests and field formats, and pauses scripts while a value stays',
+  { timeout: 60_000 },
+  async () => {
+    const submitted = deferred<string>();
+    const cardSubmitted = deferred<string>();
+    let submissions = 0;
+    const server = createHttpServer(async (request, response) => {
+      response.setHeader('content-type', 'text/html');
+      if (request.url === '/record') {
+        let body = '';
+        for await (const bytes of request) body += bytes;
+        submissions++;
+        submitted.resolve(body);
+        response.end('Accepted');
+      } else if (request.url === '/card-record') {
+        let body = '';
+        for await (const bytes of request) body += bytes;
+        cardSubmitted.resolve(body);
+        response.end('Accepted');
+      } else if (request.url === '/delayed') {
+        response.end(`<input id="company"><input id="password" type="password"><button id="submit">Continue</button><script>
+        document.querySelector('button').onclick = () => setTimeout(() => fetch('/record', { method: 'POST', body: JSON.stringify({company: document.querySelector('#company').value, password: document.querySelector('#password').value}) }), 1200);
+      </script>`);
+      } else if (request.url === '/card') {
+        response.end(
+          '<h2>Order total EUR 30</h2><input id="number"><select id="month"><option value="">Choose month</option><option value="aug">August</option></select><input id="year"><input id="expiry"><button id="submit">Pay</button><script>document.querySelector("button").onclick = () => fetch("/card-record", {method:"POST", body:JSON.stringify({month:document.querySelector("#month").value, year:document.querySelector("#year").value, expiry:document.querySelector("#expiry").value})});</script>',
+        );
+      } else {
+        response.end(`<input id="username"><button id="submit">Continue</button><script>
+        document.querySelector('button').onclick = () => { document.body.innerHTML = '<h1>Password step</h1><input type="password" id="password">'; };
+      </script>`);
+      }
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const directory = await mkdtemp(join(tmpdir(), 'nod-private-state-'));
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+    });
+    try {
+      await computer.act('state', { action: 'open', url: origin });
+      await computer.injectCredentials({
+        threadId: 'state',
+        origin,
+        kind: 'identifier',
+        username: 'synthetic@example.test',
+        usernameSelector: '#username',
+        submitSelector: '#submit',
+      });
+      assert.match((await computer.act('state', { action: 'snapshot' })).text, /Password step/);
+      await computer.act('state', { action: 'open', url: `${origin}/delayed` });
+      await computer.act('state', {
+        action: 'fill',
+        selector: '#company',
+        text: 'Synthetic company',
+      });
+      await computer.act('state', { action: 'evaluate', script: 'document.title' });
+      await computer.injectCredentials({
+        threadId: 'state',
+        origin,
+        kind: 'password',
+        password: 'Synthetic private value',
+        passwordSelector: '#password',
+        submitSelector: '#submit',
+      });
+      assert.deepEqual(JSON.parse(await submitted.promise), {
+        company: 'Synthetic company',
+        password: 'Synthetic private value',
+      });
+      assert.equal(submissions, 1);
+      assert.equal(
+        (await computer.act('state', { action: 'snapshot' })).text.includes(
+          'Synthetic private value',
+        ),
+        false,
+      );
+      await assert.rejects(
+        computer.act('state', {
+          action: 'evaluate',
+          script: 'Promise.resolve(document.querySelector("#password").value.length)',
+        }),
+        /scripts are paused/,
+      );
+      await computer.act('state', { action: 'open', url: `${origin}/card` });
+      const fields = {
+        number: '#number',
+        expiryMonth: '#month',
+        expiryYear: { selector: '#year', format: 'YY' },
+        expiry: { selector: '#expiry', format: 'YYYY-MM' },
+      };
+      const bound = await computer.cardDestinations('state', fields);
+      await computer.fillCard({
+        threadId: 'state',
+        ...bound,
+        fields,
+        submitSelector: '#submit',
+        card: {
+          cardNumber: '4242424242424242',
+          expiryMonth: 8,
+          expiryYear: 2030,
+          cardholder: 'Synthetic owner',
+        },
+      });
+      assert.deepEqual(JSON.parse(await cardSubmitted.promise), {
+        month: 'aug',
+        year: '30',
+        expiry: '2030-08',
+      });
+      assert.match(
+        (await computer.act('state', { action: 'snapshot' })).text,
+        /Order total EUR 30/,
+      );
+      await assert.rejects(
+        computer.act('state', {
+          action: 'evaluate',
+          script: 'document.querySelector("#number").value',
+        }),
+        /scripts are paused/,
+      );
+      await computer.act('fence', { action: 'open', url: `${origin}/card` });
+      await computer.act('fence', {
+        action: 'evaluate',
+        script: 'globalThis.__nodScripted = false',
+      });
+      const recovered = createAgentBrowserComputer({
+        dataRoot: directory,
+        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+        privateNetwork: true,
+        headless: true,
+      });
+      try {
+        assert.equal((await recovered.currentPage('fence')).origin, origin);
+        await recovered.act('fence', { action: 'snapshot' });
+        await assert.rejects(
+          recovered.cardDestinations('fence', fields),
+          /script ran on this document/,
+        );
+        await computer.act('fence', { action: 'reload' });
+        assert.equal(
+          (await recovered.cardDestinations('fence', fields)).destinations.number,
+          origin,
+        );
+      } finally {
+        await recovered.dispose();
+      }
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'native sign-in methods bind observed controls and refuse changed or repeated selections',
+  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 90_000 },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-method-native-'));
+    const received: string[] = [];
+    const cancelling = new AbortController();
+    const cancelled = deferred();
+    let cancelledMethod: string | undefined;
+    const changes: Record<string, string> = {
+      replaced: 'primary.replaceWith(primary.cloneNode(true))',
+      renamed: "primary.textContent = 'Delete account'",
+      accessibleName: "primary.setAttribute('aria-label', 'Delete account')",
+      destination: "primary.form.action = '/other'",
+      disabled: 'primary.disabled = true',
+      hidden: "primary.style.display = 'none'",
+      base: "document.querySelector('base').href = '/other/'",
+      covered:
+        "const cover=document.createElement('button');cover.style.cssText='position:fixed;inset:0;z-index:1000';cover.textContent='Cover';cover.onclick=()=>fetch('/covered',{method:'POST'});document.body.append(cover)",
+      changedOnPress: "primary.addEventListener('mousedown',()=>primary.form.action='/other')",
+      removedOnRelease: "primary.addEventListener('mouseup',()=>primary.remove())",
+    };
+    const server = createHttpServer(async (request, response) => {
+      if (request.url === '/pressed') {
+        cancelling.abort();
+        await cancelled.promise;
+        response.end();
+        return;
+      }
+      if (request.method === 'POST') {
+        received.push(request.url!);
+        response.writeHead(303, { location: '/done' });
+        response.end();
+        return;
+      }
+      response.setHeader('content-type', 'text/html');
+      if (request.url === '/done') {
+        response.end('<h1>Selected</h1>');
+        return;
+      }
+      if (
+        ['/framed', '/foreign', '/duplicate', '/scaled-half', '/scaled-double'].includes(
+          request.url!,
+        )
+      ) {
+        const scaled = request.url!.startsWith('/scaled-');
+        const source =
+          request.url === '/foreign' || scaled
+            ? `http://localhost:${(server.address() as { port: number }).port}/${scaled ? 'scaled-inner' : 'inner'}`
+            : '/inner';
+        const transform = scaled
+          ? `transform:scale(${request.url === '/scaled-half' ? 0.5 : 2});transform-origin:top left;`
+          : '';
+        response.end(
+          `
+          ${request.url === '/duplicate' ? '<button id="primary">Continue with Example</button>' : ''}
+          <iframe title="Sign in" src="${source}" onload="document.getElementById('frame-state').textContent='Frame ready'" style="width:700px;height:400px;margin:70px 100px;border:12px solid;${transform}"></iframe><button id="reload-frame" onclick="document.getElementById('frame-state').textContent='Loading frame';document.querySelector('iframe').contentWindow.location.reload()">Reload frame</button><p id="frame-state">Loading frame</p>`,
+        );
+        return;
+      }
+      if (request.url === '/cancel') {
+        response.end(
+          '<form action="/selected" method="post"><button id="primary" onmousedown="const xhr=new XMLHttpRequest();xhr.open(\'POST\',\'/pressed\',false);xhr.send()">Continue with Example</button></form><button id="ordinary" onclick="if(event.isTrusted)fetch(\'/ordinary\',{method:\'POST\'})">Continue browsing</button>',
+        );
+        return;
+      }
+      const change = changes[request.url!.slice(1)] ?? '';
+      const primary =
+        request.url === '/image'
+          ? '<input id="primary" type="image" onclick="if(!event.isTrusted)event.preventDefault()" alt="Continue with Example" src="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22240%22 height=%2240%22%3E%3Crect width=%22240%22 height=%2240%22 fill=%22gray%22/%3E%3C/svg%3E">'
+          : '<button id="primary" onclick="if(!event.isTrusted)event.preventDefault()"><span>Continue with Example</span></button>';
+      response.end(
+        `
+        ${request.url === '/scaled-inner' ? '<script>addEventListener("pointermove",()=>{const xhr=new XMLHttpRequest();xhr.open("POST","/moved",false);xhr.send()},{once:true})</script>' : ''}
+        <base href="/"><form action="selected" method="post">${primary}<button id="alternate" formaction="/alternate">Use another account</button></form><a id="link" href="linked">Continue with Link</a><button id="change" onclick="${change}">Change control</button>`,
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const origin = `http://127.0.0.1:${address.port}`;
+    let socketPath = '';
+    const makeComputer = () => {
+      const computer = createAgentBrowserComputer({
+        dataRoot: directory,
+        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+        privateNetwork: true,
+        headless: true,
+        daemonCommand: async (path, command, signal, timeoutMs) => {
+          socketPath = path;
+          return existingDaemonCommand(path, command, signal, timeoutMs);
+        },
+      });
+      const selectMethod = computer.selectSignInMethod!;
+      computer.selectSignInMethod = async (id, input, signal) => {
+        if (input.methodId === cancelledMethod)
+          signal?.addEventListener('abort', () => cancelled.resolve(), { once: true });
+        return selectMethod(id, input, signal);
+      };
+      return computer;
+    };
+    const worker = await harness({ computer: makeComputer });
+    const client = worker.client(directory, { timeoutMs: 30_000 });
+    const act = (input: BrowserAction) => client.act('fixture', input);
+    const choices = [
+      { label: 'Misleading label', selector: '#primary span' },
+      { label: 'Another misleading label', selector: '#alternate' },
+    ];
+    try {
+      await act({ action: 'open', url: origin });
+      await assert.rejects(
+        client.signInMethods!('fixture', origin, [
+          { label: 'First', selector: '#primary' },
+          { label: 'Second', selector: '#primary span' },
+        ]),
+      );
+      const bound = await client.signInMethods!('fixture', origin, choices);
+      assert.deepEqual(
+        bound.methods.map(({ label }) => label),
+        ['Continue with Example', 'Use another account'],
+      );
+      assert.deepEqual(bound.methods[0]!.page.submits, {
+        method: 'POST',
+        to: origin + '/selected',
+      });
+      assert.deepEqual(bound.methods[1]!.page.submits, {
+        method: 'POST',
+        to: origin + '/alternate',
+      });
+      const selection = { origin, document: bound.document, methodId: bound.methods[0]!.id };
+      await assert.rejects(client.selectSignInMethod!('other', selection));
+      await client.selectSignInMethod!('fixture', selection);
+      await act({ action: 'wait', url: '**/done' });
+      assert.deepEqual(received, ['/selected']);
+      await assert.rejects(client.selectSignInMethod!('fixture', selection));
+      await assert.rejects(
+        client.selectSignInMethod!('fixture', { ...selection, methodId: bound.methods[1]!.id }),
+      );
+      for (const change of [...Object.keys(changes), 'navigation', 'origin', 'closed']) {
+        await act({ action: 'open', url: origin + '/' + change });
+        const stale = await client.signInMethods!('fixture', origin, choices);
+        if (change === 'navigation') await act({ action: 'reload' });
+        else if (change === 'closed') await client.close('fixture');
+        else if (change !== 'origin') await act({ action: 'click', selector: '#change' });
+        await assert.rejects(
+          client.selectSignInMethod!('fixture', {
+            origin: change === 'origin' ? 'https://another.example' : origin,
+            document: stale.document,
+            methodId: stale.methods[0]!.id,
+          }),
+        );
+        assert.deepEqual(received, ['/selected']);
+      }
+      await act({ action: 'open', url: origin + '/base' });
+      const linked = await client.signInMethods!('fixture', origin, [
+        { label: 'Ignored', selector: '#link' },
+      ]);
+      await act({ action: 'click', selector: '#change' });
+      await assert.rejects(
+        client.selectSignInMethod!('fixture', {
+          origin,
+          document: linked.document,
+          methodId: linked.methods[0]!.id,
+        }),
+      );
+      assert.deepEqual(received, ['/selected']);
+      await act({ action: 'open', url: origin });
+      const snapshot = (await act({ action: 'snapshot' })).text;
+      const ref = /button "Continue with Example"[^\n]*ref=(e\d+)/.exec(snapshot)?.[1];
+      assert.ok(ref);
+      const byRef = await client.signInMethods!('fixture', origin, [
+        { label: 'Ignored', selector: '@' + ref },
+      ]);
+      assert.equal(byRef.methods[0]!.label, 'Continue with Example');
+      await assert.rejects(
+        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '@e9999' }]),
+      );
+      await act({ action: 'open', url: origin + '/covered' });
+      await act({ action: 'click', selector: '#change' });
+      const covered = /button "Continue with Example"[^\n]*ref=(e\d+)/.exec(
+        (await act({ action: 'snapshot' })).text,
+      )?.[1];
+      assert.ok(covered);
+      await assert.rejects(
+        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '@' + covered }]),
+      );
+      await assert.rejects(
+        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: 'button' }]),
+      );
+      await act({ action: 'open', url: origin + '/duplicate' });
+      await assert.rejects(
+        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '#primary' }]),
+      );
+      for (const path of ['/framed', '/foreign']) {
+        await act({ action: 'open', url: origin + path });
+        await act({ action: 'wait', text: 'Frame ready' });
+        const inspect = () =>
+          client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '#primary' }]);
+        if (path === '/foreign') {
+          await assert.rejects(inspect());
+          continue;
+        }
+        const framed = await inspect();
+        assert.equal(framed.methods[0]!.label, 'Continue with Example');
+        await act({ action: 'click', selector: '#reload-frame' });
+        await act({ action: 'wait', text: 'Frame ready' });
+        await assert.rejects(
+          client.selectSignInMethod!('fixture', {
+            origin,
+            document: framed.document,
+            methodId: framed.methods[0]!.id,
+          }),
+        );
+        const refreshed = await inspect();
+        assert.equal(refreshed.document, framed.document);
+        await client.selectSignInMethod!('fixture', {
+          origin,
+          document: refreshed.document,
+          methodId: refreshed.methods[0]!.id,
+        });
+        const deadline = Date.now() + 5000;
+        while (received.length < 2 && Date.now() < deadline) await delay(10);
+        assert.deepEqual(received, ['/selected', '/selected']);
+      }
+      const controller = new AbortController();
+      controller.abort();
+      await assert.rejects(client.selectSignInMethod!('fixture', selection, controller.signal));
+      assert.deepEqual(received, ['/selected', '/selected']);
+      await act({ action: 'open', url: origin + '/image' });
+      const image = await client.signInMethods!('fixture', origin, [
+        { label: 'Ignored', selector: '#primary' },
+      ]);
+      assert.equal(image.methods[0]!.label, 'Continue with Example');
+      assert.deepEqual(image.methods[0]!.page.submits, {
+        method: 'POST',
+        to: origin + '/selected',
+      });
+      await client.selectSignInMethod!('fixture', {
+        origin,
+        document: image.document,
+        methodId: image.methods[0]!.id,
+      });
+      await act({ action: 'wait', url: '**/done' });
+      assert.deepEqual(received, ['/selected', '/selected', '/selected']);
+      await assert.rejects(
+        client.selectSignInMethod!('fixture', {
+          origin,
+          document: image.document,
+          methodId: image.methods[0]!.id,
+        }),
+      );
+
+      for (const [index, path] of ['/framed', '/foreign'].entries()) {
+        await act({ action: 'open', url: origin + path });
+        await act({ action: 'wait', text: 'Frame ready' });
+        const connection = await existingDaemonCommand(socketPath, { action: 'cdp_url' });
+        const tabs = await existingDaemonCommand(socketPath, { action: 'tab_list' });
+        const tab = (tabs.tabs as { active: boolean; targetId: string }[]).find(
+          (value) => value.active,
+        )!;
+        let inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
+        try {
+          const bound = await inspector.signInControl({ pixel: { x: 150, y: 100 } });
+          assert.equal(
+            bound.origin,
+            path === '/foreign' ? `http://localhost:${address.port}` : origin,
+          );
+          assert.equal(bound.targetFrameId === bound.frameId, path === '/foreign');
+          assert.notEqual(bound.loaderId, await inspector.document());
+          if (path === '/framed') {
+            await act({ action: 'click', selector: '#reload-frame' });
+            await act({ action: 'wait', text: 'Frame ready' });
+            await assert.rejects(inspector.selectSignInControl(bound));
+          }
+          inspector.close();
+          inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
+          const current = await inspector.signInControl({ pixel: { x: 150, y: 100 } });
+          inspector.close();
+          inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
+          await inspector.selectSignInControl(current);
+          const deadline = Date.now() + 5000;
+          while (received.length < 4 + index && Date.now() < deadline) await delay(10);
+          assert.deepEqual(received, Array(4 + index).fill('/selected'));
+          await assert.rejects(inspector.selectSignInControl(current));
+        } finally {
+          inspector.close();
+        }
+      }
+      for (const path of ['/scaled-half', '/scaled-double']) {
+        await act({ action: 'open', url: origin + path });
+        await act({ action: 'wait', text: 'Frame ready' });
+        const connection = await existingDaemonCommand(socketPath, { action: 'cdp_url' });
+        const tabs = await existingDaemonCommand(socketPath, { action: 'tab_list' });
+        const tab = (tabs.tabs as { active: boolean; targetId: string }[]).find(
+          (value) => value.active,
+        )!;
+        const inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
+        try {
+          const bound = await inspector.signInControl({ selector: '#primary' });
+          await assert.rejects(inspector.selectSignInControl(bound));
+          assert.deepEqual(received, Array(5).fill('/selected'));
+        } finally {
+          inspector.close();
+        }
+      }
+      await act({ action: 'open', url: origin + '/cancel' });
+      const interrupted = await client.signInMethods!('fixture', origin, [
+        { label: 'Ignored', selector: '#primary' },
+      ]);
+      cancelledMethod = interrupted.methods[0]!.id;
+      const interruptedSelection = {
+        origin,
+        document: interrupted.document,
+        methodId: cancelledMethod,
+      };
+      await assert.rejects(
+        client.selectSignInMethod!('fixture', interruptedSelection, cancelling.signal),
+      );
+      assert.equal(cancelling.signal.aborted, true);
+      assert.deepEqual(received, Array(5).fill('/selected'));
+      await assert.rejects(client.selectSignInMethod!('fixture', interruptedSelection));
+      await assert.rejects(act({ action: 'click', selector: '#ordinary' }), /unavailable/);
+      await act({ action: 'open', url: origin + '/cancel' });
+      await act({ action: 'click', selector: '#ordinary' });
+      const deadline = Date.now() + 5000;
+      while (received.length < 6 && Date.now() < deadline) await delay(10);
+      assert.deepEqual(received, [...Array(5).fill('/selected'), '/ordinary']);
+    } finally {
+      await worker.close();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
     }
   },
 );

@@ -122,9 +122,17 @@ When you send a message while Nod works, a second line says **Got your message. 
 
 ![Nod's status line reads "Comparing flight prices · skyscanner.net · 2 min", with "Got your message. I'll read it after this step." below it, after a follow-up message.](../../../assets/screens/chat-live-line.png)
 
+### Feedback during long tasks
+
+For longer tasks you request, Nod looks for a small useful part it can check before collecting everything or preparing the final output. This rule applies with any tool or source. A partial result must help you act or decide on its own and be worth an interruption. Nod weighs urgency, missing context, and recent messages. If related checks could change the result's meaning, Nod finishes those checks first.
+
+Nod sends the first result that meets these conditions as soon as it is ready, then continues the full request. It follows your delivery instructions. Later related findings arrive together. Each partial result states material limits and checked coverage.
+
+Routine activity stays in the live line. Time passing alone does not trigger another message. If no useful result is supported, Nod keeps checking. The status line continues while work remains.
+
 ### When Nod stops
 
-Work ends with an answer, a question, or a short message saying what stopped it. A schedule, or a task Nod started on its own, also tells you by name when it fails. When you only share context, such as a routine, Nod can save it without replying. Nod can send a useful, verified partial result before it finishes; the status line continues while work remains.
+Work ends with an answer, a question, or a short message saying what stopped it. A schedule, or a task Nod started on its own, also tells you by name when it fails. When you only share context, such as a routine, Nod can save it without replying.
 
 In the sidebar, the Chat item shows a moving dot while Nod works and a solid dot when it's waiting for you.
 

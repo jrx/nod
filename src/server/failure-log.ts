@@ -18,12 +18,24 @@ function field(value: unknown) {
     : undefined;
 }
 
+function httpStatus(value: unknown) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599
+    ? value
+    : undefined;
+}
+
 export function logFailure(event: string, error: unknown, context?: Record<string, unknown>) {
   try {
     void Promise.resolve(failures.getStore()?.(event, error, context)).catch(() => {});
   } catch {}
-  const { name, code, statusCode } = (error ?? {}) as Record<string, unknown>;
+  const { name, code, statusCode, status } = (error ?? {}) as Record<string, unknown>;
   console.error(
-    JSON.stringify({ event, name: field(name), code: field(code), statusCode: field(statusCode) }),
+    JSON.stringify({
+      event,
+      name: field(name),
+      code: field(code),
+      statusCode: field(statusCode),
+      status: httpStatus(status),
+    }),
   );
 }

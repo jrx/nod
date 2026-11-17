@@ -33,7 +33,7 @@ const nodActions: Array<[string, string]> = [
   ['NOD_vault_allow', 'Use a saved sign-in'],
   ['NOD_limits_update', 'Change spending limits'],
   ['NOD_model_select', 'Change the model'],
-  ['NOD_notification_preferences_update', 'Change notifications'],
+  ['NOD_notification_preferences_update', 'Change Nod settings'],
   ['NOD_schedule_pause', 'Pause a schedule'],
   ['NOD_schedule_cancel', 'Pause a schedule'],
   ['NOD_schedule_create', 'Create a schedule'],

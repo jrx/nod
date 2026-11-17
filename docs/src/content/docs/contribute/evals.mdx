@@ -14,7 +14,7 @@ The short version: each attempt boots its own Nod with a real model. The apps, w
 For the landing-page results, benchmark definitions, and measurement limits, read [How we evaluate Nod](/how-it-works/benchmarks/).
 
 :::caution[Evals cost money]
-They call live models. An attempt costs about $0.10 to $0.50. A full controlled run has 291 attempts before time-window skips. The unit tests never call them.
+They call live models. An attempt costs about $0.10 to $0.50. A full controlled run has 312 attempts before time-window skips. The unit tests never call them.
 :::
 
 The collector requires a captured prompt for each successful background turn that opened the agent or recorded an agent request. A recorded source-screen result with no agent start or request needs no agent prompt. Missing records alone do not prove that a source screen ran. Its source reads and model usage still count. Missing prompts from executed agent work are measurement errors.
@@ -34,11 +34,12 @@ flowchart TD
   grade --> judge[Independent judge<br/>for judgement calls]
 ```
 
-| Real                                                             | Fake                                                                                                                                                                     |
-| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| The model, Pi, tools, turns, memory, schedules, approvals, Vault | Gmail, Calendar, Sheets, Drive, Docs and Slack as stateful fakes behind the same port as Composio; Notion and Linear as fake MCP servers that Nod signs in to with OAuth |
-| The workspace container, Chromium, downloads and uploads         | Websites with logins, codes, carts and bookings, served under made-up hostnames                                                                                          |
-| The clock                                                        | The user: scripted answers and approvals, plus a model-voiced persona for other questions                                                                                |
+| Real                                                             | Fake                                                                                                                                                                                                                 |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The model, Pi, tools, turns, memory, schedules, approvals, Vault | Gmail, Calendar, Sheets, Drive, Docs and Slack as stateful fakes behind the same port as Composio; Notion and Linear as fake MCP servers that Nod signs in to with OAuth                                             |
+| The workspace container, Chromium, downloads and uploads         | Websites with logins, codes, carts and bookings, served under made-up hostnames                                                                                                                                      |
+| Local files and their path checks                                | The owner's home folder: a temporary folder for each attempt, with a fake Trash and local file access already on. On macOS and Linux, mounted drives are on the keep-out list. Local-file evals don't run on Windows |
+| The clock                                                        | The user: scripted answers and approvals, plus a model-voiced persona for other questions                                                                                                                            |
 
 Web search and page fetch (`web_search` and `fetch_content`) run on the server. A fetch to a named fixture host uses the local test server. Other requests can reach the public web.
 
@@ -60,7 +61,7 @@ The fake apps are hand-written approximations of Composio's responses, not recor
    pnpm run eval:capability doctor --fix
    ```
 
-3. Run all 97 controlled cases, three attempts each.
+3. Run all 104 controlled cases, three attempts each.
 
    ```sh title="Terminal"
    pnpm run eval:capability run
@@ -78,7 +79,7 @@ The release suite adds 247 cases: 200 of everyday work across every connected ap
 pnpm run eval:capability run --tier release --repeat 3 --concurrency 3 --budget 500
 ```
 
-`--tier release` runs the release cases together with every controlled case, 344 attempts per repeat before time-window skips. Each attempt starts its own workspace and browser containers; `--concurrency 6` fits in 8 GB of Docker memory. Database connections are a separate limit. Start with concurrency two when you use a standard disposable database. Each attempt starts several connection pools. Parallel campaigns add their load. Increase concurrency only when the database has spare connections. To run one area, add `--capability vault`, or name cases with `--scenario`.
+`--tier release` runs the release cases together with every controlled case, 351 attempts per repeat before time-window skips. Each attempt starts its own workspace and browser containers; `--concurrency 6` fits in 8 GB of Docker memory. Database connections are a separate limit. Start with concurrency two when you use a standard disposable database. Each attempt starts several connection pools. Parallel campaigns add their load. Increase concurrency only when the database has spare connections. To run one area, add `--capability vault`, or name cases with `--scenario`.
 
 Results go to `.local/capability-evals/<label>/`. Open `report.html` to read every transcript and check. A label never overwrites an earlier run. If a worker fails before it can save checks, its log records the phase: start, prepare, play, collect, or grade.
 
@@ -285,7 +286,7 @@ flowchart TD
 
 ## The suite
 
-The suite has 348 cases: 97 controlled cases, 247 release cases, three live web cases and the harness canary.
+The suite has 355 cases: 104 controlled cases, 247 release cases, three live web cases and the harness canary.
 
 | Status      | Meaning                                                                                                                    |
 | ----------- | -------------------------------------------------------------------------------------------------------------------------- |
@@ -320,6 +321,10 @@ Payment cases use a synthetic merchant and never a real card. They measure task 
 | `health-results-pdf`                    | Get my blood test PDF from email, explain it, remind me to re-test                | files, apps, memory, schedules           | scored                 |
 | `invoice-signin-blocker`                | Explain why an invoice needs sign-in and what to do next                          | browser, vault, progress                 | calibrating            |
 | `invoices-overdue`                      | Find who owes me money in my email, keep a sheet, draft reminders                 | apps, files, approvals                   | scored                 |
+| `local-file-read-invoice-pdf`           | Read the total from an invoice PDF in Downloads without asking                    | files                                    | calibrating            |
+| `local-file-save-notes`                 | Save meeting notes as a Markdown file in Documents and change nothing else        | files                                    | calibrating            |
+| `local-file-show-screenshot`            | Show a Desktop screenshot as an attachment to the reply                           | files                                    | calibrating            |
+| `local-file-tidy-downloads`             | Move the PDFs in Downloads into a new folder and leave everything else alone      | files                                    | calibrating            |
 | `login-2fa-metrics`                     | Log in with 2FA and read weekly active users                                      | vault, browser, approvals                | scored                 |
 | `login-authenticator-key`               | Sign in with a saved authenticator key and read last month’s payouts              | vault, browser, approvals                | known gap              |
 | `memory-across-reset`                   | Remember what I told you and never ask twice                                      | memory, progress                         | scored                 |

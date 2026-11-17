@@ -394,6 +394,7 @@ export interface Preferences {
   quietStart: string;
   quietEnd: string;
   proactivePaused: boolean;
+  localFilesEnabled: boolean;
 }
 export type ChannelProvider = 'telegram' | 'whatsapp';
 export interface ChannelLinkStatus {

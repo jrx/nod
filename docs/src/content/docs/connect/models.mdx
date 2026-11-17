@@ -17,7 +17,7 @@ Select **Add connection** (or **Add** when you already have a connection), then 
 
 | Connection                         | Setup                                                     | Initial choice                           |
 | ---------------------------------- | --------------------------------------------------------- | ---------------------------------------- |
-| Google Gemini                      | [AI Studio API key](https://aistudio.google.com/api-keys) | Gemini 3.8 Flash, medium effort          |
+| Google Gemini                      | [AI Studio API key](https://aistudio.google.com/api-keys) | Gemini 4 Argon, medium effort            |
 | OpenAI / ChatGPT                   | API key or existing ChatGPT sign-in                       | GPT-6.1 Sol / GPT-6 Sol, high effort     |
 | Anthropic                          | API key                                                   | Claude Opus 5.5, high effort             |
 | OpenRouter                         | API key or browser sign-in                                | GPT-6.1 Sol, high effort                 |
@@ -32,10 +32,10 @@ Other providers include Ant Ling, Baseten, Cerebras, DeepSeek, Fireworks AI, Gro
 
 When an account model list is available, Nod loads it. For services with only a bundled catalog, Nod saves the key and checks access on first use. Neither a catalog nor a saved key proves that your account has credit or permission to run every listed model.
 
-You can change the initial choice. Nod preserves a working choice when you add another connection. It uses the recommended model when available, otherwise the first supported model in that connection's catalog. For Google Gemini, you must choose a model if Gemini 3.8 Flash is unavailable. When Bedrock offers several models or profiles, you must also choose because profiles can change where requests are processed.
+You can change the initial choice. Nod preserves a working choice when you add another connection. It uses the recommended model when available, otherwise the first supported model in that connection's catalog. For Google Gemini, you must choose a model if Gemini 4 Argon is unavailable. When Bedrock offers several models or profiles, you must also choose because profiles can change where requests are processed.
 
-:::note[Google free access]
-Create a Gemini API key with your Google account in AI Studio. Gemini 3.8 Flash has a [free tier](https://ai.google.dev/gemini-api/docs/pricing), subject to project quotas and availability; Gemini 4 Argon needs paid API access. The free tier has different data-use terms, so review Google's terms before sending private material.
+:::note[Google API access]
+Create a Gemini API key with your Google account in AI Studio. Nod recommends Gemini 4 Argon, which requires paid API access. Gemini 3.8 Flash is a lower-cost option with a [free tier](https://ai.google.dev/gemini-api/docs/pricing), subject to project quotas and availability. The model picker shows these access limits. The free tier has different data-use terms, so review Google's terms before sending private material.
 :::
 
 Google does not permit third-party assistants to reuse [Gemini CLI OAuth](https://geminicli.com/docs/resources/faq/). A Gemini app subscription is not a Nod sign-in option. Anthropic's [authentication conditions](https://code.claude.com/docs/en/legal-and-compliance) also require an API connection for Claude in Nod.
@@ -128,7 +128,7 @@ The `openrouter/free` and `openrouter/auto` routers can select different models 
 
 1. Select **Google Gemini**, then open the link to create a key in AI Studio.
 2. Copy the key into **API key** and select **Connect**.
-3. Keep Gemini 3.8 Flash for a capable starting choice, or choose another listed model.
+3. Keep the recommended Gemini 4 Argon if your project has paid API access. For a lower-cost option with limited free access, choose Gemini 3.8 Flash.
 
 </Steps>
 

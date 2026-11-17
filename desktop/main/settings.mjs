@@ -3,7 +3,7 @@ import { constants } from 'node:fs';
 import { access, mkdir, open, readFile, realpath, rename, rm } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-const preferenceFields = ['launchAtLogin', 'notifications', 'onboardingCompleted'];
+const preferenceFields = ['launchAtLogin', 'notifications'];
 const onboardingPreferenceSteps = ['notifications', 'launchAtLogin', 'complete'];
 
 export function desktopContentPolicy(posthogHost) {
@@ -91,12 +91,15 @@ export function createSettingsStore(path, encryption, platform = process.platfor
     try {
       const file = await open(temporary, 'wx', 0o600);
       try {
-        await file.writeFile(JSON.stringify(value));
+        const { onboardingCompleted, ...saved } = value;
+        await file.writeFile(JSON.stringify({ ...saved, version: 2 }));
         await file.sync();
       } finally {
         await file.close();
       }
       await rename(temporary, path);
+      delete value.onboardingCompleted;
+      value.version = 2;
       current = value;
       unsynced = true;
       await durable();
@@ -112,9 +115,12 @@ export function createSettingsStore(path, encryption, platform = process.platfor
       const record = (input) => input && typeof input === 'object' && !Array.isArray(input);
       if (!record(value) || !record(value.secrets)) throw new Error();
       if (
-        value.version !== 1 ||
+        ![1, 2].includes(value.version) ||
         !['system', 'light', 'dark'].includes(value.theme) ||
         preferenceFields.some((field) => typeof value[field] !== 'boolean') ||
+        (value.version === 1
+          ? typeof value.onboardingCompleted !== 'boolean'
+          : value.onboardingCompleted !== undefined) ||
         (value.zoomFactor !== undefined &&
           (!Number.isFinite(value.zoomFactor) ||
             value.zoomFactor < 0.25 ||
@@ -138,12 +144,13 @@ export function createSettingsStore(path, encryption, platform = process.platfor
     } catch (error) {
       if (error.code !== 'ENOENT') throw new Error('Nod could not open its saved settings.');
     }
+    if (value?.onboardingCompleted) value.onboardingPreferenceStep = 'complete';
     current = value ?? {
-      version: 1,
+      version: 2,
       theme: 'system',
       launchAtLogin: false,
       notifications: false,
-      onboardingCompleted: false,
+      onboardingPreferenceStep: 'launchAtLogin',
       secrets: {},
     };
     unsynced = !!value;
@@ -239,13 +246,10 @@ export function createSettingsStore(path, encryption, platform = process.platfor
       notifications: value.notifications,
       theme: value.theme,
       zoomFactor: value.zoomFactor ?? 1,
-      onboardingCompleted: value.onboardingCompleted,
       ...(value.serverUrl ? { serverUrl: value.serverUrl } : {}),
       ...(value.welcome ? { welcome: { ...value.welcome } } : {}),
       onboardingPreferenceStep:
-        value.onboardingCompleted || value.onboardingPreferenceStep === 'complete'
-          ? 'complete'
-          : 'launchAtLogin',
+        value.onboardingPreferenceStep === 'complete' ? 'complete' : 'launchAtLogin',
     };
   }
   return {
@@ -331,7 +335,7 @@ export function createSettingsStore(path, encryption, platform = process.platfor
         }
         if (input.welcome !== undefined) {
           if (
-            previous.onboardingCompleted ||
+            previous.onboardingPreferenceStep === 'complete' ||
             previous.welcome?.continued ||
             !input.welcome ||
             typeof input.welcome !== 'object' ||
@@ -351,18 +355,11 @@ export function createSettingsStore(path, encryption, platform = process.platfor
           value[field] = input[field];
         }
         if (input.onboardingPreferenceStep !== undefined) {
-          if (previous.onboardingCompleted || input.onboardingPreferenceStep !== 'complete')
+          if (input.onboardingPreferenceStep !== 'complete')
             throw new Error('Choose your desktop preference before continuing.');
           value.onboardingPreferenceStep = input.onboardingPreferenceStep;
         }
-        if (
-          value.onboardingCompleted &&
-          !previous.onboardingCompleted &&
-          value.onboardingPreferenceStep !== 'complete' &&
-          !value.launchAtLogin
-        )
-          throw new Error('Finish the desktop preference step before continuing.');
-        if (value.onboardingCompleted) delete value.welcome;
+        if (value.onboardingPreferenceStep === 'complete') delete value.welcome;
         await write(value);
         return redacted(value);
       });

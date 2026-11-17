@@ -22,6 +22,7 @@ type PersonalDependencies = ScheduleDependencies & {
   memory?: MemoryService;
   learnedSkills?: LearnedSkills;
   models?: ReturnType<typeof createModelService>;
+  localFilesAvailable?: boolean;
   taskModels?: {
     list(): Promise<Array<{ id: string; title: string; model: ModelSelection }>>;
     title(id: string): Promise<string>;
@@ -110,7 +111,12 @@ export function createPersonalService(dependencies: PersonalDependencies) {
         throw Object.assign(new Error('Choose a detail to update.'), { statusCode: 400 });
       return input;
     }
-    if (action === 'notification_preferences_update') return changed(preferences.validate(args));
+    if (action === 'notification_preferences_update') {
+      const input = changed(preferences.validate(args));
+      if (input.localFilesEnabled !== undefined && !dependencies.localFilesAvailable)
+        throw new Error('Local file access works only in the Nod desktop app.');
+      return input;
+    }
     if (action === 'model_select') return validateModelChoice(args);
     if (action === 'schedule_create') return schedules.validateCreate(args);
     if (action === 'schedule_update') {

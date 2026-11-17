@@ -5,18 +5,26 @@ sidebar:
   order: 5
 ---
 
-Local files lets Nod work with files on your computer, for example to tidy your Downloads folder, rename invoices by their content or save a report it made next to your other documents. It works in the desktop app on macOS and Windows, and in the Linux Flatpak preview, with nothing to set up. A source install or a self-hosted server doesn't offer it.
+Local files lets Nod work with files on your computer. For example, ask it to organize Downloads, rename invoices, or save a report in Documents. It works in the desktop app on macOS and Windows, and in the Linux Flatpak preview. A source install or a self-hosted server does not offer it.
 
 ## Start with a request
 
-Open chat in the desktop app and tell Nod what to do. You do not need to add a folder in **Apps**.
+Open chat in the desktop app and tell Nod what to do. Local file access starts off. You do not need to open Settings first.
 
 - "List the files in my Downloads folder."
 - "Read invoice.pdf in Downloads and summarize it."
 - "Save this report as report.md in Documents."
 - "Show me the screenshot on my Desktop." Nod copies it into its workspace and attaches it to the reply, so you can open its preview.
 
-If Nod asks for confirmation, review the file path and proposed action before you approve it.
+When access is off, Nod asks to turn it on in chat before it opens your files. Reply "yes" or select the approval button. Nod saves the setting, then continues your request. If you decline, access stays off.
+
+Work Nod starts on its own cannot request local file access. A schedule you create can ask you to enable access in chat.
+
+This setting covers allowed locations in your home folder and on external drives. It does not give access to one folder only. The file checks below still apply to each action.
+
+You can tell Nod to turn local file access on or off. You can also change **Local file access** in **Settings → Privacy & data**.
+
+If Nod asks for confirmation of a file action, review the file path and proposed action before you approve it.
 
 ## Where Nod can work
 

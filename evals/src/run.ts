@@ -77,7 +77,7 @@ export function select(
     'tier' | 'scenarioIds' | 'capability' | 'ignoreWindow' | 'includePending'
   >,
 ) {
-  const chosen = scenarios.filter(
+  let chosen = scenarios.filter(
     (item) =>
       (options.scenarioIds
         ? options.scenarioIds.includes(item.id)
@@ -105,6 +105,16 @@ export function select(
       timeZone: 'Europe/Madrid',
     }).format(Date.now()),
   );
+  const unsupported =
+    process.platform === 'win32'
+      ? chosen.filter((item) => item.world({ now: Date.now }).localFiles)
+      : [];
+  if (unsupported.length) {
+    console.log(
+      `Skipping ${unsupported.map((item) => item.id).join(', ')}: local-file evals need macOS or Linux.`,
+    );
+    chosen = chosen.filter((item) => !unsupported.includes(item));
+  }
   const outside = chosen.filter(
     (item) => item.window && (hour < item.window.from || hour >= item.window.to),
   );

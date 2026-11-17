@@ -15,8 +15,12 @@ import { createCommunication } from '../src/server/communication.ts';
 import { createVault } from '../src/server/vault.ts';
 import { locksTable } from '../src/server/locks.ts';
 import { createChatSdkTransport } from '../src/providers/chat-sdk/index.ts';
-import type { MessagingTransport } from '../src/ports/messaging.ts';
-import { createWhatsAppLinkedTransport } from '../src/providers/chat-sdk/whatsapp.ts';
+import { MessagingAttachmentError, type MessagingTransport } from '../src/ports/messaging.ts';
+import { telegramAttachments, telegramMessage } from '../src/providers/chat-sdk/telegram.ts';
+import {
+  createWhatsAppLinkedTransport,
+  type WhatsAppDrop,
+} from '../src/providers/chat-sdk/whatsapp.ts';
 import { combineMessagingTransports } from '../src/providers/chat-sdk/combined.ts';
 import { createChannelSessionStore } from '../src/server/channel-session.ts';
 import { createChannelMedia } from '../src/server/channel-media.ts';
@@ -215,18 +219,80 @@ test('contact previews read vCard 2.1, 3.0 and 4.0 without treating field values
   assert.equal(cards[2].name, 'Synthetic <Contact>');
   assert.deepEqual(cards[2].phones, ['+34600000001']);
   assert.deepEqual(cards[2].emails, ['other@example.test']);
-  const start = performance.now();
-  assert.equal(
-    contactCards(
-      'BEGIN:VCARD\r\nX-BAD' + '\r\n A'.repeat(100_000) + '\r\nFN:Synthetic\r\nEND:VCARD',
-    )[0].name,
-    'Synthetic',
-  );
-  assert.ok(performance.now() - start < 5000);
+  for (const field of [
+    'X-BAD' + '\r\n A'.repeat(100_000) + '\r\nFN:Synthetic',
+    'FN;X-LABEL="Desk:' + '\r\n A:'.repeat(100_000) + '":Synthetic',
+  ]) {
+    const start = performance.now();
+    assert.equal(contactCards(`BEGIN:VCARD\r\n${field}\r\nEND:VCARD`)[0].name, 'Synthetic');
+    assert.ok(performance.now() - start < 5000);
+  }
   assert.deepEqual(
     contactCards('BEGIN:VCARD\r\nFN:First\r\nBEGIN:VCARD\r\nFN:Second\r\nEND:VCARD'),
     [],
   );
+});
+
+const vcardOf = (...lines: string[]) => ['BEGIN:VCARD', ...lines, 'END:VCARD'].join('\r\n');
+
+test('contact previews read LF-only exports and unfold folded lines', () => {
+  assert.equal(contactCards('BEGIN:VCARD\nFN:Synthetic Lf\nEND:VCARD')[0].name, 'Synthetic Lf');
+  const [folded] = contactCards(vcardOf('FN:Synthetic', '  Folded', 'TEL:+3460', ' 0000000'));
+  assert.equal(folded.name, 'Synthetic Folded');
+  assert.deepEqual(folded.phones, ['+34600000000']);
+});
+
+test('contact previews keep quoted parameters out of field values', () => {
+  const text = vcardOf(
+    'VERSION:4.0',
+    'FN;ALTID="urn:synthetic:1":Synthetic "Contact": West',
+    'TEL;TYPE="voice,home";X-SOURCE="https://example.test/a;b";VALUE=uri:tel:+34600000000',
+    'item1.EMAIL;X-SOURCE="https://example.test/a;b":fixture@example.test',
+    'ADR;GEO="geo:12.3457,78.910";LABEL="Desk: west; floor 2":;;1 Example Street;Town;;;Country',
+    'URL;X-LABEL="Site: work":https://example.test/contact',
+  );
+  const [card] = contactCards(text);
+  assert.equal(card.name, 'Synthetic "Contact": West');
+  assert.deepEqual(card.phones, ['+34600000000']);
+  assert.deepEqual(card.emails, ['fixture@example.test']);
+  assert.deepEqual(card.addresses, ['1 Example Street, Town, Country']);
+  assert.deepEqual(card.urls, ['https://example.test/contact']);
+  assert.equal(card.vcard, text);
+});
+
+test('contact previews read encoding parameters outside quoted text and folded headers', () => {
+  const cards = contactCards(
+    [
+      vcardOf(
+        'VERSION:2.1',
+        'FN;X-LABEL="Desk:',
+        ' west;ENCODING=QUOTED-PRINTABLE;CHARSET=ISO-8859-1";CHARSET="UTF-8";',
+        ' ENCODING="QUOTED-PRINTABLE":Synthetic =C3=',
+        '=85ngstr=C3=B6m',
+      ),
+      vcardOf('VERSION:3.0', 'FN;X-LABEL="Desk: west;ENCODING=QUOTED-PRINTABLE":Synthetic =41'),
+    ].join('\r\n'),
+  );
+  assert.deepEqual(
+    cards.map((card) => card.name),
+    ['Synthetic Ångström', 'Synthetic =41'],
+  );
+});
+
+test('contact previews take only whole BEGIN and END lines as card boundaries', () => {
+  const cards = contactCards(
+    vcardOf('FN:Synthetic', 'X-NOTE:BEGIN:VCARD', 'X-NOTE:END:VCARD', 'BEGIN:VCARDX', 'END:VCARDX'),
+  );
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].name, 'Synthetic');
+});
+
+test('contact previews refuse the whole set when any card is unterminated, unopened, nameless or holds a NUL byte', () => {
+  assert.equal(contactCards(vcardOf('FN:One') + '\r\n' + vcardOf('FN:Two')).length, 2);
+  assert.deepEqual(contactCards(vcardOf('FN:One') + '\r\nEND:VCARD'), []);
+  assert.deepEqual(contactCards(vcardOf('FN:One') + '\r\nBEGIN:VCARD\r\nFN:Unterminated'), []);
+  assert.deepEqual(contactCards(vcardOf('FN:One') + '\r\n' + vcardOf('TEL:+34600000000')), []);
+  assert.deepEqual(contactCards('BEGIN:VCARD\r\nFN:Synthetic\0\r\nEND:VCARD'), []);
 });
 
 test('audio waveform reads refuse foreign URLs, oversized streams, redirects and cancelled work', async (t) => {
@@ -605,6 +671,7 @@ test(
             quoted: unknown;
           }[] = [];
           const collected: InboundMessage[] = [];
+          const dropped: WhatsAppDrop[] = [];
           const reacted: string[] = [];
           const presence: string[][] = [];
           let downloads = 0;
@@ -622,6 +689,7 @@ test(
           const accountId = `linked:${own}`;
           const jid = `${owner}@s.whatsapp.net`;
           const store = createChannelSessionStore({ pool, ownerId: `fixture-${mode}`, keyStore });
+          let lidLookups = 0;
           const createSocket: Factory = (config) => {
             if (failConnect)
               throw Object.assign(new Error('synthetic-private-connect-error'), {
@@ -634,8 +702,14 @@ test(
               user: { id: `${own}:1@s.whatsapp.net`, lid: '55555555@lid', name: 'Fixture' },
               signalRepository: {
                 lidMapping: {
-                  getPNForLID: async (lid: string) =>
-                    ['55555555@lid', '66666666@lid'].includes(lid) ? jid : null,
+                  getPNForLID: async (lid: string) => {
+                    if (lid === '99999999@lid') throw new Error('Synthetic mapping failure.');
+                    return ['55555555@lid', '66666666@lid'].includes(lid) ? jid : null;
+                  },
+                  getLIDForPN: async (pn: string) => {
+                    if (++lidLookups === 2) throw new Error('Synthetic lookup failure.');
+                    return pn === jid ? '77777777@lid' : null;
+                  },
                 },
               },
               end: () => {},
@@ -696,6 +770,7 @@ test(
               },
               createSocket,
               download,
+              onDrop: (drop) => dropped.push(drop),
             });
           let transport = open();
           try {
@@ -756,6 +831,9 @@ test(
                   },
                 },
                 envelope('lid', '55555555@lid'),
+                envelope('unmapped-lid', '77777777@lid'),
+                envelope('unmapped-intruder', '88888888@lid', false),
+                envelope('unmapped-stranger', '99999999@lid', false),
                 ...(mode === 'self-chat'
                   ? [
                       {
@@ -787,8 +865,22 @@ test(
             );
             assert.deepEqual(
               collected.map((message) => message.messageId),
-              ['owner', 'image', 'quoted', 'lid'],
+              mode === 'bot'
+                ? ['owner', 'image', 'quoted', 'lid', 'unmapped-lid']
+                : ['owner', 'image', 'quoted', 'lid'],
             );
+            if (mode === 'bot') assert.equal(collected[4].threadId, '77777777@lid');
+            assert.deepEqual(
+              dropped.filter((drop) => drop.addressing === 'lid'),
+              mode === 'bot'
+                ? [
+                    { reason: 'lid_lookup_failed', mode: 'bot', addressing: 'lid', suppressed: 0 },
+                    { reason: 'sender_unmatched', mode: 'bot', addressing: 'lid', suppressed: 0 },
+                  ]
+                : [{ reason: 'self_chat_mismatch', mode: 'own', addressing: 'lid', suppressed: 0 }],
+            );
+            assert.ok(dropped.some((drop) => drop.reason === 'resend_ignored'));
+            assert.doesNotMatch(JSON.stringify(dropped), /\d{5,}|@/);
             assert.equal(collected[2].replyToMessageId, 'task-prompt');
             assert.deepEqual(reacted, ['task-prompt']);
             assert.equal(downloads, 0);
@@ -873,6 +965,10 @@ test(
               collected.push(message);
             });
             const shared = collected.slice(-3);
+            assert.equal(
+              new Set(dropped.map((drop) => `${drop.reason}:${drop.addressing}`)).size,
+              dropped.length,
+            );
             assert.deepEqual(
               shared.map((message) => message.attachments![0].source),
               ['sticker', 'location', 'contact'],
@@ -1401,6 +1497,57 @@ test('Telegram media keeps native replies and checks the sender before any downl
     0,
   );
   assert.equal(requests.length, 0);
+});
+
+test('Telegram downloads stop at 20 MB whatever size the sender, Bot API or file server reports', async () => {
+  const limit = 20 * 1024 * 1024;
+  const message = telegramMessage.parse({
+    message_id: 1,
+    date: 1,
+    from: { id: 1, is_bot: false, first_name: 'Fixture' },
+    chat: { id: 1, type: 'private' },
+    document: { file_id: 'fixture-document' },
+  });
+  const download = (fileSize: number | undefined, file: () => Response) =>
+    telegramAttachments(message, 'token', async (input) =>
+      String(input).endsWith('/getFile')
+        ? Response.json({
+            ok: true,
+            result: { file_path: 'documents/fixture.bin', file_size: fileSize },
+          })
+        : file(),
+    )[0].read();
+  await assert.rejects(
+    download(limit + 1, () => new Response('unrequested')),
+    MessagingAttachmentError,
+  );
+  await assert.rejects(
+    download(
+      undefined,
+      () => new Response('short', { headers: { 'content-length': String(limit + 1) } }),
+    ),
+    MessagingAttachmentError,
+  );
+  await assert.rejects(
+    download(
+      undefined,
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new Uint8Array(limit));
+              controller.enqueue(new Uint8Array(1));
+              controller.close();
+            },
+          }),
+        ),
+    ),
+    MessagingAttachmentError,
+  );
+  assert.equal(
+    (await download(undefined, () => new Response(new Uint8Array(limit)))).byteLength,
+    limit,
+  );
 });
 
 test('speech uses a bounded transcription request and generates Ogg voice output without exposing credentials', async () => {

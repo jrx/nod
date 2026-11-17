@@ -31,7 +31,8 @@ import {
   SandboxedFrame,
   sandboxedDocument,
 } from '../src/web/components/attachment-frame.tsx';
-import { runProcess } from '../src/providers/process.ts';
+import { setTimeout as delay } from 'node:timers/promises';
+import { createAgentBrowserComputer } from '../src/providers/agent-browser/index.ts';
 
 const render = (text: string) => renderToStaticMarkup(createElement(MessageText, { text }));
 
@@ -101,6 +102,12 @@ test(
       );
     });
     const profile = await mkdtemp(join(tmpdir(), 'nod-preview-browser-'));
+    const computer = createAgentBrowserComputer({
+      dataRoot: profile,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+    });
     try {
       await fetch(destination);
       assert.equal(received.length, 1);
@@ -109,33 +116,29 @@ test(
       await once(host, 'listening');
       const address = host.address();
       assert.ok(address && typeof address !== 'string');
-      const result = await runProcess(
-        process.env.NOD_TEST_BROWSER_EXECUTABLE!,
-        [
-          '--headless',
-          '--no-sandbox',
-          '--disable-gpu',
-          '--disable-background-networking',
-          '--no-first-run',
-          `--user-data-dir=${profile}`,
-          '--dump-dom',
-          '--virtual-time-budget=1500',
-          `http://127.0.0.1:${address.port}`,
-        ],
-        { signal: AbortSignal.timeout(20_000) },
-      );
-      assert.equal(result.exitCode, 0, result.stderr);
+      await computer.act('preview', {
+        action: 'open',
+        url: `http://127.0.0.1:${address.port}`,
+      });
+      await delay(1500);
+      const result = await computer.act('preview', {
+        action: 'evaluate',
+        script: 'document.documentElement.outerHTML',
+        readOnly: true,
+      });
+      const html = JSON.parse(result.text.slice(result.text.indexOf('\n') + 1)) as string;
       for (let index = 0; index < attempts.length; index++)
-        assert.match(result.stdout, new RegExp(`ran-${index}(?:&quot;|\")`));
+        assert.match(html, new RegExp(`ran-${index}(?:&quot;|\")`));
       assert.deepEqual(received, []);
-      assert.match(result.stdout, /data-closed="yes"/);
-      const blocked = /data-navigation-blocked="([^"]+)"/.exec(result.stdout);
+      assert.match(html, /data-closed="yes"/);
+      const blocked = /data-navigation-blocked="([^"]+)"/.exec(html);
       assert.ok(blocked);
       assert.deepEqual(JSON.parse(blocked[1]), [...navigations.keys(), attempts.length + 1]);
-      assert.match(result.stdout, /&quot;interactive&quot;/);
-      assert.match(result.stdout, /&quot;quoted-content&quot;/);
-      assert.doesNotMatch(result.stdout, /&quot;thumbnail-script&quot;/);
+      assert.match(html, /&quot;interactive&quot;/);
+      assert.match(html, /&quot;quoted-content&quot;/);
+      assert.doesNotMatch(html, /&quot;thumbnail-script&quot;/);
     } finally {
+      await computer.dispose();
       await Promise.all([
         new Promise<void>((resolve) => host.close(() => resolve())),
         new Promise<void>((resolve) => collector.close(() => resolve())),

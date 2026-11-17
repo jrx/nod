@@ -144,27 +144,48 @@ export function createCommandWorkspace(options: {
     input: CommandInput & { environment: Record<string, string>; cli: ConnectedCli },
   ): Promise<CommandResult>;
 }): Workspace {
-  let unavailable = false;
+  let unavailable: string | undefined;
   let disposed = false;
-  const lifecycle = new AbortController();
+  let lifecycle = new AbortController();
+  let recovery: Promise<string | undefined> | undefined;
   const pending = new Set<Promise<unknown>>();
+  function recover(error: WorkspaceCommandError) {
+    const current = (async (previous) => {
+      lifecycle.abort();
+      await Promise.allSettled([previous, ...pending]);
+      try {
+        if (!error.stop) throw new Error('Its processes cannot be checked.');
+        await error.stop();
+        lifecycle = new AbortController();
+      } catch (cause) {
+        unavailable ??= `${error.message} Nod could not confirm that its processes stopped: ${cause instanceof Error ? cause.message : String(cause)} Restart Nod before continuing.`;
+        return unavailable;
+      }
+    })(recovery);
+    recovery = current;
+    void current.finally(() => {
+      if (recovery === current) recovery = undefined;
+    });
+    return current;
+  }
   async function supervise(
     run: (signal: AbortSignal) => Promise<CommandResult>,
     signal?: AbortSignal,
   ) {
-    if (unavailable || disposed)
-      throw new Error('The workspace is unavailable. Restart Nod before continuing.');
+    while (recovery) await recovery;
+    if (disposed) throw new Error('The workspace is unavailable. Restart Nod before continuing.');
+    if (unavailable) throw new Error(unavailable);
     const operation = run(signal ? AbortSignal.any([signal, lifecycle.signal]) : lifecycle.signal);
     pending.add(operation);
     try {
       return await operation;
     } catch (error) {
-      if (error instanceof WorkspaceCommandError && error.uncertain) {
-        unavailable = true;
-        lifecycle.abort();
-        await Promise.allSettled([...pending]);
-      }
-      throw error;
+      if (!(error instanceof WorkspaceCommandError && error.uncertain)) throw error;
+      throw new WorkspaceCommandError(
+        true,
+        (await recover(error)) ??
+          `${error.message} Its processes are confirmed stopped and its result is unknown. The workspace is available.`,
+      );
     } finally {
       pending.delete(operation);
     }

@@ -114,7 +114,7 @@ test(
     const { createApplication } = await import('../src/server/composition.ts');
     const { pool } = await import('../src/server/db.ts');
     const { dataRoot, ownerId, port } = await import('../src/server/config.ts');
-    const { enqueueTurn } = await import('../src/server/thread.ts');
+    const { enqueueTurn, submitUserMessage } = await import('../src/server/thread.ts');
     const phases = new Map<string, number>();
     const results = new Map<string, AgentToolResult>();
     const plans = new Map<
@@ -172,7 +172,8 @@ test(
     let appResult: unknown;
     let changeRulesOnDraftRead = false;
     let changedRulesDuringDraftRead = 0;
-    let repeatAfterConfirm: { action: string; args: Record<string, unknown> } | undefined;
+    let repeatAfterConfirm:
+      { tool?: string; action: string; args: Record<string, unknown> } | undefined;
     const prompts = new Map<string, string>();
     const opened: Array<{ turnId: string; model?: string; helper: boolean }> = [];
     const integrationFixture = createIntegrationFixture(`http://localhost:${port}`);
@@ -244,11 +245,16 @@ test(
           : task === 'review'
             ? (() => {
                 const words = input as {
-                  userMessages?: Array<{ text: string }>;
+                  userMessages?: Array<{ text: string; canAuthorize?: boolean }>;
                   userRules?: string;
                   action?: { name?: string; arguments?: { recipient_email?: unknown } };
                 };
                 ownerWords.push(...(words.userMessages ?? []).map((message) => message.text));
+                const fileRequest = words.action?.name?.startsWith('LOCAL_FILES_')
+                  ? words.userMessages?.findLast(
+                      (message) => message.canAuthorize !== false && asked.has(message.text),
+                    )?.text
+                  : undefined;
                 const metadataRead = [
                   'GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID',
                   'GMAIL_GET_DRAFT',
@@ -257,7 +263,8 @@ test(
                   metadataRead && words.userRules === 'Ask before reading Gmail.';
                 const run =
                   !readRequiresConsent &&
-                  ((allowMethodBrowser && words.action?.name === 'NOD_browser') ||
+                  (Boolean(fileRequest) ||
+                    (allowMethodBrowser && words.action?.name === 'NOD_browser') ||
                     asked.has(words.userMessages?.at(-1)?.text ?? '') ||
                     cleared.has(String(words.action?.arguments?.recipient_email)) ||
                     metadataRead);
@@ -267,7 +274,7 @@ test(
                       because:
                         words.action?.name === 'GMAIL_FETCH_EMAILS' || metadataRead
                           ? 'read'
-                          : (words.userMessages?.at(-1)?.text ?? 'read'),
+                          : (fileRequest ?? words.userMessages?.at(-1)?.text ?? 'read'),
                     }
                   : { run, ...(readRequiresConsent ? { rule: true } : {}) };
               })()
@@ -313,7 +320,12 @@ test(
                 if (repeatAfterConfirm && text.includes('executed once by the trusted worker')) {
                   const call = repeatAfterConfirm;
                   repeatAfterConfirm = undefined;
-                  results.set(options.turnId, await tool('apps').execute(call));
+                  results.set(
+                    options.turnId,
+                    await tool(call.tool ?? 'apps').execute(
+                      call.tool === 'files' ? { action: call.action, ...call.args } : call,
+                    ),
+                  );
                   return;
                 }
                 const part = parts.get(
@@ -3654,11 +3666,45 @@ test(
               (await pool.query('SELECT error FROM turns WHERE id=$1', [task])).rows[0].error,
             /work the owner started/,
           );
-          const listText = `List the synthetic folder ${randomUUID()}`;
-          asked.add(listText);
-          const listed = await propose('list', { path: folder }, 'files', listText);
-          assert.deepEqual(await approvalsFor(listed), []);
-          assert.match(text(listed), /contract\.txt/);
+          const readText = `Summarize contract.txt ${randomUUID()}`;
+          assert.equal((await request('GET', '/api/preferences')).json().localFilesEnabled, false);
+          const opening = await propose(
+            'read',
+            { path: join(folder, 'contract.txt') },
+            'files',
+            readText,
+          );
+          const [access] = await approvalsFor(opening);
+          assert.equal(access.action, 'NOD_notification_preferences_update');
+          assert.deepEqual(access.args, { localFilesEnabled: true });
+          assert.doesNotMatch(text(opening), /Synthetic contract/);
+          asked.add(readText);
+          repeatAfterConfirm = {
+            tool: 'files',
+            action: 'read',
+            args: { path: join(folder, 'contract.txt') },
+          };
+          const accepted = await request('POST', '/api/messages', {
+            text: 'Yes',
+            replyToMessageId: access.confirmation_message_id,
+            approvalAnswer: { approvalId: access.id, approved: true },
+          });
+          assert.equal(accepted.statusCode, 200, accepted.body);
+          await waitFor(accepted.json().turnId, 'succeeded');
+          assert.equal((await request('GET', '/api/preferences')).json().localFilesEnabled, true);
+          assert.match(text(accepted.json().turnId), /Synthetic contract/);
+          await request('PATCH', '/api/preferences', { localFilesEnabled: false });
+          const enableText = `Enable local file access and read contract.txt ${randomUUID()}`;
+          asked.add(enableText);
+          plans.set(enableText, {
+            tool: 'files',
+            action: 'read',
+            args: { path: join(folder, 'contract.txt') },
+          });
+          const enabled = await submitUserMessage(enableText);
+          await waitFor(enabled.turnId, 'succeeded');
+          assert.deepEqual(await approvalsFor(enabled.turnId), []);
+          assert.equal((await request('GET', '/api/preferences')).json().localFilesEnabled, true);
           const unnamed = await propose(
             'read',
             { path: `${folder}/sorted/../contract.txt` },
@@ -3668,16 +3714,6 @@ test(
           assert.equal(held.status, 'pending');
           assert.equal(held.action, 'LOCAL_FILES_READ');
           assert.deepEqual(held.args, { path: join(folder, 'contract.txt') });
-          const readText = `Summarize contract.txt ${randomUUID()}`;
-          asked.add(readText);
-          const opened = await propose(
-            'read',
-            { path: join(folder, 'contract.txt') },
-            'files',
-            readText,
-          );
-          assert.deepEqual(await approvalsFor(opened), []);
-          assert.match(text(opened), /Synthetic contract/);
           const schedule = await reminder();
           const scheduledPrompt = `Synthetic scheduled listing ${randomUUID()}`;
           plans.set(scheduledPrompt, { tool: 'files', action: 'list', args: { path: folder } });

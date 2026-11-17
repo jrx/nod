@@ -170,6 +170,7 @@ export async function initializeDatabase() {
     ALTER TABLE preferences ADD COLUMN IF NOT EXISTS proactive_paused boolean NOT NULL DEFAULT true;
     ALTER TABLE preferences ALTER COLUMN proactive_paused SET DEFAULT true;
     ALTER TABLE preferences ADD COLUMN IF NOT EXISTS local_keep_out text[] NOT NULL DEFAULT '{}';
+    ALTER TABLE preferences ADD COLUMN IF NOT EXISTS local_files_enabled boolean NOT NULL DEFAULT false;
     CREATE INDEX IF NOT EXISTS messages_owner_time ON messages(owner_id,created_at);
     CREATE INDEX IF NOT EXISTS messages_thread_time ON messages(thread_id,created_at);
     CREATE INDEX IF NOT EXISTS messages_turn_time ON messages(turn_id,created_at);

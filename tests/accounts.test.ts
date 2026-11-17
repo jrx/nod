@@ -1340,7 +1340,10 @@ test('unavailable decisions avoid ledger reads and retain dynamic availability a
     { reads, writes, resolutions, requests },
     { reads: 0, writes: 0, resolutions: 0, requests: 0 },
   );
-  assert.deepEqual(await checkMail(emails, AbortSignal.abort()), Array.from({ length: 100 }));
+  assert.deepEqual(
+    await checkMail(emails, AbortSignal.abort()),
+    Array<string>(100).fill('the read was stopped before its check finished'),
+  );
   assert.equal(availabilityReads - beforeAvailability, 1);
   assert.equal(curatorRequests, 100);
 
@@ -1352,7 +1355,9 @@ test('unavailable decisions avoid ledger reads and retain dynamic availability a
     { reads: 1, writes: 1, resolutions: 1, requests: 1 },
   );
   spent = 1;
-  assert.deepEqual(await checkMail([request.input.email]), [undefined]);
+  assert.deepEqual(await checkMail([request.input.email]), [
+    'This month’s spending limit is reached.',
+  ]);
   assert.equal(curatorRequests, 100);
   assert.deepEqual(
     { reads, writes, resolutions, requests },
@@ -1439,7 +1444,11 @@ test('decision requests revalidate capability and cancellation after resolving c
       if (stop === 'configuration') configured = false;
       if (stop === 'cancel') controller.abort();
       release();
-      assert.deepEqual(await result, [undefined]);
+      assert.deepEqual(await result, [
+        stop === 'cancel'
+          ? 'the read was stopped before its check finished'
+          : 'the check model gave no valid answer',
+      ]);
       await new Promise((resolve) => setImmediate(resolve));
       assert.equal(calls, 0);
       assert.equal(fallback, 0);
@@ -3271,28 +3280,28 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     };
     const google = await f.create('fixture-google-default', backend);
     await google.addKey('google', 'fixture-google-key');
-    assert.equal(google.view().selection?.modelId, 'gemini-3.8-flash');
+    assert.equal(google.view().selection?.modelId, 'gemini-4-argon');
     assert.equal(google.view().selection?.effort, 'medium');
     const chosen = google.view().selection!;
     await google.addKey('mistral', 'fixture-mistral-key');
     assert.deepEqual(google.view().selection, chosen);
-    const paidGoogle = await f.create('fixture-google-paid-choice', {
+    const freeGoogle = await f.create('fixture-google-free-choice', {
       ...backend,
       catalog: async () =>
         (await backend.catalog('google')).filter(
-          (definition) => definition.choice.id === 'gemini-4-argon',
+          (definition) => definition.choice.id === 'gemini-3.8-flash',
         ),
     });
-    const paidConnection = await paidGoogle.addKey('google', 'fixture-google-paid-key');
-    assert.equal(paidGoogle.view().selection, null);
-    assert.equal(paidGoogle.configured, false);
-    await paidGoogle.select({
-      connectionId: paidConnection,
-      modelId: 'gemini-4-argon',
+    const freeConnection = await freeGoogle.addKey('google', 'fixture-google-free-key');
+    assert.equal(freeGoogle.view().selection, null);
+    assert.equal(freeGoogle.configured, false);
+    await freeGoogle.select({
+      connectionId: freeConnection,
+      modelId: 'gemini-3.8-flash',
       effort: 'medium',
     });
-    assert.equal(paidGoogle.configured, true);
-    assert.equal((await paidGoogle.resolve()).definition.choice.id, 'gemini-4-argon');
+    assert.equal(freeGoogle.configured, true);
+    assert.equal((await freeGoogle.resolve()).definition.choice.id, 'gemini-3.8-flash');
     const bedrock = await f.create('fixture-bedrock-default', backend);
     await bedrock.addKey('amazon-bedrock', 'fixture-bedrock-key', { region: 'eu-west-1' });
     assert.equal(bedrock.view().selection, null);
@@ -3657,6 +3666,36 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
       assert.equal(owner.hasClassificationModel(true), false);
       assert.equal(await owner.resolveClassification(true), undefined);
     });
+  });
+
+  test('automatic preparation names the model it cannot price until a priced model does the work', async (t) => {
+    const f = await fixture(t);
+    const original = await f.backend.catalog('openai', 'api_key', {
+      type: 'api_key',
+      key: 'fixture-preparation-price-catalog',
+    });
+    const owner = await f.create('fixture-preparation-price', {
+      ...f.backend,
+      catalog: async () =>
+        original.map((definition) =>
+          definition.choice.id === 'gpt-6.1-sol'
+            ? { ...definition, spec: { ...definition.spec, cost: { input: 0, output: 0 } } }
+            : definition,
+        ),
+    });
+    const connectionId = await owner.addKey('openai', 'fixture-preparation-price-key');
+    const unpriced = original.find((definition) => definition.choice.id === 'gpt-6.1-sol')!;
+    assert.equal(owner.view().selection?.modelId, 'gpt-6.1-sol');
+    assert.equal(owner.unpricedPreparationModel(), unpriced.choice.name);
+    assert.equal(owner.view().unpricedPreparationModel, unpriced.choice.name);
+    const priced = original.find((definition) => definition.choice.id === 'gpt-6-luna')!;
+    await owner.setRoute('background', {
+      connectionId,
+      modelId: priced.choice.id,
+      effort: priced.choice.efforts[0]!,
+    });
+    assert.equal(owner.unpricedPreparationModel(), undefined);
+    assert.equal(owner.view().unpricedPreparationModel, undefined);
   });
 
   test('classification keeps subscription access on the approved small model', async (t) => {
@@ -6301,7 +6340,8 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
       CREATE TABLE preferences(owner_id text PRIMARY KEY,notification_rule text NOT NULL DEFAULT '',rules text NOT NULL DEFAULT '',
         time_zone text,quiet_start text NOT NULL DEFAULT '22:00',quiet_end text NOT NULL DEFAULT '08:00',
         quiet_hours_enabled boolean NOT NULL DEFAULT true,locale text,hour_cycle text NOT NULL DEFAULT 'auto',
-        speech_voice text,speech_reply text NOT NULL DEFAULT 'auto',proactive_paused boolean NOT NULL DEFAULT false)`);
+        speech_voice text,speech_reply text NOT NULL DEFAULT 'auto',proactive_paused boolean NOT NULL DEFAULT false,
+        local_files_enabled boolean NOT NULL DEFAULT false)`);
     const captured: Parameters<ProductAnalytics['capture']>[0][] = [];
     const analytics = await createAnalytics({
       provider: { capture: (event) => captured.push(event), shutdown: async () => {} },

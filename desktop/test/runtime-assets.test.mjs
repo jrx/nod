@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { constants, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import {
   copyFile,
   access,
@@ -11,10 +11,12 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  readlink,
   readdir,
   realpath,
   rename,
   rm,
+  rmdir,
   stat,
   symlink,
   utimes,
@@ -3228,23 +3230,34 @@ finally:
 );
 
 async function macRuntimePrepare(home, assets, overrides = {}) {
-  const { availablePort, execute, retainStopExecutable, waitFor } =
-    await import('../runtime/index.mjs');
+  const {
+    availablePort,
+    execute,
+    retainStopExecutable,
+    waitFor,
+    stageGuestImage,
+    guestDiskIsEmpty,
+  } = await import('../runtime/index.mjs');
   const { guestConfiguration, protectGuest } = await import('../runtime/guest-config.mjs');
   const source = await readFile(new URL('../runtime/index.mjs', import.meta.url), 'utf8');
   return runInNewContext(
     `${source.slice(source.indexOf('async function prepare('), source.indexOf('export async function preloadRuntimeImages('))}; prepare`,
     {
       process: { platform: 'darwin', arch: process.arch },
+      constants,
       resolve,
       join,
       delimiter,
       createHash,
       randomBytes,
       mkdir,
+      rm,
+      rmdir,
       chmod,
       readFile,
+      readdir,
       access,
+      lstat,
       writeFile,
       rename,
       homedir: () => home,
@@ -3254,6 +3267,8 @@ async function macRuntimePrepare(home, assets, overrides = {}) {
       protectGuest,
       availablePort,
       retainStopExecutable,
+      stageGuestImage,
+      guestDiskIsEmpty,
       fileHash: assetHash,
       execute,
       waitFor,
@@ -3267,6 +3282,206 @@ async function macRuntimePrepare(home, assets, overrides = {}) {
     },
   );
 }
+
+test('guest images publish only verified complete bytes and keep the previous image after a failed or cancelled copy', async (t) => {
+  const { stageGuestImage } = await import('../runtime/index.mjs');
+  const root = await mkdtemp(join(tmpdir(), 'nod-stage-guest-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, 'guest.img');
+  const target = join(root, 'image');
+  const bytes = Buffer.alloc(2 * 1024 * 1024, 7);
+  const hash = createHash('sha256').update(bytes).digest('hex');
+  await writeFile(source, bytes);
+  await writeFile(target, 'Synthetic previous image');
+  await assert.rejects(
+    stageGuestImage(source, target, '0'.repeat(64)),
+    /does not match its manifest/,
+  );
+  assert.equal(await readFile(target, 'utf8'), 'Synthetic previous image');
+  const fs = await import('node:fs');
+  const createWriteStream = fs.default.createWriteStream;
+  const controller = new AbortController();
+  const writer = t.mock.method(fs.default, 'createWriteStream', (...args) => {
+    const stream = createWriteStream(...args);
+    stream.once('open', () => controller.abort(new Error('Synthetic copy stop')));
+    return stream;
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(stageGuestImage(source, target, hash, controller.signal), {
+      name: 'AbortError',
+    });
+  } finally {
+    writer.mock.restore();
+    syncBuiltinESMExports();
+  }
+  assert.equal(await readFile(target, 'utf8'), 'Synthetic previous image');
+  assert.deepEqual((await readdir(root)).sort(), ['guest.img', 'image']);
+  await stageGuestImage(source, target, hash);
+  assert.deepEqual(await readFile(target), bytes);
+});
+
+test('empty guest disk recovery checks all bytes and refuses links, absent disks and cancelled checks', async (t) => {
+  const { guestDiskIsEmpty } = await import('../runtime/index.mjs');
+  const root = await mkdtemp(join(tmpdir(), 'nod-empty-disk-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const disk = join(root, 'disk');
+  const bytes = Buffer.alloc(2 * 1024 * 1024 + 17);
+  await writeFile(disk, bytes);
+  assert.equal(await guestDiskIsEmpty(disk), true);
+  bytes[bytes.length - 1] = 1;
+  await writeFile(disk, bytes);
+  assert.equal(await guestDiskIsEmpty(disk), false);
+  const link = join(root, 'link');
+  await symlink(disk, link);
+  assert.equal(await guestDiskIsEmpty(link), false);
+  assert.equal(await guestDiskIsEmpty(join(root, 'missing')), false);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(guestDiskIsEmpty(disk, controller.signal), { name: 'AbortError' });
+});
+
+test('Linux first starts use verified stream copies, repair old empty disks and keep established or unknown owner data', async (t) => {
+  const { guestConfiguration } = await import('../runtime/guest-config.mjs');
+  for (const scenario of [
+    { name: 'new computer' },
+    { name: 'old incomplete image', existing: true, partial: true },
+    { name: 'old empty disk', existing: true, empty: true },
+    { name: 'old empty running disk', existing: true, empty: true, running: true },
+    { name: 'old owner data', existing: true, owner: true },
+    { name: 'completed setup', existing: true, empty: true, initializing: false },
+    { name: 'linked owner disk', existing: true, linked: true },
+    { name: 'missing local state', existing: true, owner: true, missingState: true },
+    { name: 'missing Lima configuration', owner: true, missingConfig: true },
+    { name: 'failed guest protection', protectionFails: true },
+  ]) {
+    await t.test(scenario.name, async (t) => {
+      const root = await mkdtemp(join(tmpdir(), 'nod-linux-first-start-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const assets = join(root, 'assets');
+      const dataRoot = join(root, 'profile');
+      const identity = createHash('sha256').update(dataRoot).digest('hex').slice(0, 12);
+      const limaHome = join(root, '.nod-desktop', identity);
+      const instance = join(limaHome, 'nod');
+      const configPath = join(instance, 'lima.yaml');
+      const statePath = join(dataRoot, 'desktop-runtime/state.json');
+      const guest = Buffer.from('Synthetic verified guest image');
+      const sha256 = createHash('sha256').update(guest).digest('hex');
+      await mkdir(join(assets, 'lima/bin'), { recursive: true });
+      await mkdir(join(dataRoot, 'desktop-runtime'), { recursive: true });
+      await writeFile(join(assets, 'lima/bin/limactl'), 'Synthetic Lima executable');
+      await writeFile(join(assets, 'guest.img'), guest);
+      await writeFile(
+        join(assets, 'manifest.json'),
+        JSON.stringify({
+          version: 1,
+          platform: `linux-${process.arch}`,
+          guest: { file: 'guest.img', sha256 },
+          dockerGuest: { file: 'docker-guest.tar.gz', sha256: '2'.repeat(64) },
+          images: [],
+        }),
+      );
+      if (!scenario.missingState)
+        await writeFile(
+          statePath,
+          JSON.stringify({
+            version: 1,
+            limaHome,
+            port: 54329,
+            password: '3'.repeat(64),
+            initializing: scenario.initializing,
+          }),
+        );
+      if (scenario.existing || scenario.missingConfig) await mkdir(instance, { recursive: true });
+      if (scenario.existing)
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            mounts: [{ location: assets, mountPoint: '/opt/nod-assets', writable: false }],
+          }),
+        );
+      const disk = join(instance, 'disk');
+      if (scenario.partial) await writeFile(join(instance, 'image'), Buffer.alloc(1024));
+      if (scenario.empty) await writeFile(disk, Buffer.alloc(1024));
+      if (scenario.owner) await writeFile(disk, 'Synthetic owner data');
+      const outside = join(root, 'outside-disk');
+      if (scenario.linked) {
+        await writeFile(outside, Buffer.alloc(1024));
+        await symlink(outside, disk);
+      }
+      const calls = [];
+      let running = scenario.running;
+      let protectionFails = scenario.protectionFails;
+      const prepare = await macRuntimePrepare(root, assets, {
+        process: { platform: 'linux', arch: process.arch, env: {} },
+        access: (path, ...args) =>
+          path === '/dev/kvm' ? Promise.resolve() : access(path, ...args),
+        guestConfiguration: (options) => guestConfiguration({ ...options, platform: 'linux' }),
+        execute: async (command, args) => {
+          calls.push(args[0]);
+          if (args[0] === 'list') return running ? 'Running' : 'Stopped';
+          if (args[0] === 'stop') running = false;
+          if (args[0] === 'delete') {
+            assert.equal(JSON.parse(await readFile(statePath, 'utf8')).initializing, true);
+            await rm(instance, { recursive: true });
+          }
+          if (args[0] === 'create') {
+            assert.equal(JSON.parse(await readFile(statePath, 'utf8')).initializing, true);
+            await mkdir(instance, { recursive: true });
+            await copyFile(args.at(-1), configPath);
+          }
+          if (
+            args[0] === 'start' &&
+            !(await access(disk).then(
+              () => true,
+              () => false,
+            ))
+          ) {
+            assert.deepEqual(await readFile(join(instance, 'image')), guest);
+            await rename(join(instance, 'image'), disk);
+          }
+          if (args[0] === 'shell' && protectionFails) {
+            protectionFails = false;
+            throw new Error('Synthetic protection failure');
+          }
+          return '';
+        },
+        finishRuntime: async () => {
+          assert.equal(JSON.parse(await readFile(statePath, 'utf8')).initializing, false);
+          return 'ready';
+        },
+      });
+      const attempt = () =>
+        prepare({ dataRoot, resourcesPath: root, preserveRuntimeCache: true }, () => {});
+      if (scenario.missingState || scenario.missingConfig) {
+        await assert.rejects(
+          attempt(),
+          scenario.missingState ? /configuration is missing/ : /files but no Lima configuration/,
+        );
+        assert.deepEqual(calls, []);
+        assert.equal(await readFile(disk, 'utf8'), 'Synthetic owner data');
+        return;
+      }
+      if (scenario.protectionFails) {
+        await assert.rejects(attempt(), { code: 'NOD_COMPUTER_PROTECTION_FAILED' });
+        assert.equal(JSON.parse(await readFile(statePath, 'utf8')).initializing, true);
+      }
+      assert.equal(await attempt(), 'ready');
+      assert.equal(
+        calls.includes('delete'),
+        Boolean(
+          (scenario.empty && scenario.initializing === undefined) || scenario.protectionFails,
+        ),
+      );
+      if (scenario.running) assert(calls.indexOf('stop') < calls.indexOf('delete'));
+      if (scenario.owner) assert.equal(await readFile(disk, 'utf8'), 'Synthetic owner data');
+      if (scenario.linked) {
+        assert.equal(await readlink(disk), outside);
+        assert.deepEqual(await readFile(outside), Buffer.alloc(1024));
+      }
+    });
+  }
+});
 
 test('Linux guests run under QEMU for the host architecture with only the read-only asset mount', async () => {
   const { guestConfiguration } = await import('../runtime/guest-config.mjs');
@@ -3374,6 +3589,120 @@ test('Mac startup repairs existing guests before Docker and refuses failed or st
         );
         assert.deepEqual(calls, ['starting', 'start', 'shell']);
       }
+    });
+  }
+});
+
+test('first-start recovery survives failed starts, cancellation, interrupted creation and failed cleanup without replacing owner data', async (t) => {
+  for (const scenario of [
+    { name: 'failed first start' },
+    { name: 'cancelled first start', aborted: true },
+    { name: 'interrupted creation', createFails: true },
+    { name: 'creation stopped before its configuration exists', createFails: true, noConfig: true },
+    { name: 'failed cleanup', removalFails: true },
+    { name: 'existing owner data', existing: true },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const root = await mkdtemp(join(tmpdir(), 'nod-guest-first-start-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const assets = join(root, 'assets');
+      const dataRoot = join(root, 'profile');
+      const identity = createHash('sha256').update(dataRoot).digest('hex').slice(0, 12);
+      const limaHome = join(root, '.nod-desktop', identity);
+      await mkdir(join(limaHome, 'nod'), { recursive: true });
+      await mkdir(join(assets, 'lima/bin'), { recursive: true });
+      await mkdir(join(dataRoot, 'desktop-runtime'), { recursive: true });
+      await writeFile(join(assets, 'lima/bin/limactl'), 'Synthetic Lima executable');
+      await writeFile(
+        join(assets, 'manifest.json'),
+        JSON.stringify({
+          version: 1,
+          platform: `darwin-${process.arch}`,
+          guest: { file: 'guest.img', sha256: '1'.repeat(64) },
+          dockerGuest: { file: 'docker-guest.tar.gz', sha256: '2'.repeat(64) },
+          images: [],
+        }),
+      );
+      await writeFile(
+        join(dataRoot, 'desktop-runtime/state.json'),
+        JSON.stringify({ version: 1, limaHome, port: 54329, password: '3'.repeat(64) }),
+      );
+      const configPath = join(limaHome, 'nod/lima.yaml');
+      const disk = join(limaHome, 'nod/disk');
+      if (scenario.existing) {
+        await writeFile(
+          configPath,
+          JSON.stringify({
+            mounts: [{ location: assets, mountPoint: '/opt/nod-assets', writable: false }],
+          }),
+        );
+        await writeFile(disk, 'Synthetic owner data');
+      }
+      let controller = new AbortController();
+      const calls = [];
+      let first = true;
+      let refuseRemoval = scenario.removalFails;
+      const prepare = await macRuntimePrepare(root, assets, {
+        execute: async (command, args) => {
+          calls.push(Array.from(args).slice(0, 3).join(' '));
+          if (args[0] === 'create') {
+            await mkdir(join(limaHome, 'nod'), { recursive: true });
+            if (!(first && scenario.noConfig)) await copyFile(args.at(-1), configPath);
+            if (first && scenario.createFails) {
+              first = false;
+              throw new Error('Synthetic create failure');
+            }
+          }
+          if (args[0] === 'start' && first) {
+            first = false;
+            if (!scenario.existing) await writeFile(disk, 'Synthetic incomplete disk');
+            if (scenario.aborted) {
+              controller.abort(new Error('Synthetic stop'));
+              throw controller.signal.reason;
+            }
+            throw new Error('Synthetic start failure');
+          }
+          if (args[0] === 'delete') {
+            if (refuseRemoval) {
+              refuseRemoval = false;
+              throw new Error('Synthetic removal failure');
+            }
+            await rm(join(limaHome, 'nod'), { recursive: true });
+          }
+          return '';
+        },
+        finishRuntime: async () => 'ready',
+      });
+      const attempt = () =>
+        prepare(
+          { dataRoot, resourcesPath: root, preserveRuntimeCache: true, signal: controller.signal },
+          () => {},
+        );
+      await assert.rejects(
+        attempt(),
+        scenario.createFails
+          ? /Synthetic create failure/
+          : scenario.aborted
+            ? /Synthetic stop/
+            : /Synthetic start failure/,
+      );
+      const saved = () =>
+        readFile(join(dataRoot, 'desktop-runtime/state.json'), 'utf8').then(JSON.parse);
+      assert.equal((await saved()).initializing, scenario.existing ? undefined : true);
+      controller = new AbortController();
+      if (scenario.removalFails) {
+        await assert.rejects(attempt(), /Synthetic removal failure/);
+        assert.equal((await saved()).initializing, true);
+        assert.equal(calls.filter((call) => call === 'start --tty=false nod').length, 1);
+      }
+      assert.equal(await attempt(), 'ready');
+      assert.equal(calls.includes('delete --force nod'), !scenario.existing && !scenario.noConfig);
+      assert.equal(
+        calls.filter((call) => call === 'create --name nod').length,
+        scenario.existing ? 0 : 2,
+      );
+      if (scenario.existing) assert.equal(await readFile(disk, 'utf8'), 'Synthetic owner data');
+      else assert.equal((await saved()).initializing, false);
     });
   }
 });

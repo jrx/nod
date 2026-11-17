@@ -19,6 +19,7 @@ overrides:
   set-cookie-parser@<2.7.3: 2.7.3
   sharp: 0.35.5
 allowBuilds:
+  bun: true
   agent-browser: true
   esbuild: true
   fsevents: true

@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import type { BrowserDownload, Computer } from '../../ports/computer.ts';
 import { BrowserActionError } from '../../ports/computer.ts';
 import { createAgentBrowserComputer } from '../agent-browser/index.ts';
+import { RuntimeTimeLimitError } from '../process.ts';
 import { containerBrowserOptions } from './config.ts';
 import {
   browserFrame,
@@ -306,7 +307,11 @@ export async function startContainerBrowserWorker(
               : error instanceof Error && 'statusCode' in error && error.statusCode === 423
                 ? 'locked'
                 : 'unavailable',
-          ...(error instanceof BrowserActionError && error.detail ? { detail: error.detail } : {}),
+          ...(error instanceof BrowserActionError && error.detail
+            ? { detail: error.detail }
+            : error instanceof RuntimeTimeLimitError
+              ? { detail: error.message }
+              : {}),
           metadata: metadata(await entry?.computer.catch(() => undefined), input),
         };
       } finally {

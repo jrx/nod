@@ -430,8 +430,8 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     job.signal.throwIfAborted();
     const watched = (
       await pool.query<Pick<ScheduleRow, 'watch' | 'kind'>>(
-        'SELECT watch,kind FROM schedules WHERE id=$1 AND owner_id=$2',
-        [job.data.scheduleId, ownerId],
+        'SELECT watch,kind FROM schedules WHERE id=$1 AND owner_id=$2 AND enabled AND job_id=$3 AND revision=$4 AND next_run_at=$5',
+        [job.data.scheduleId, ownerId, job.id, job.data.revision, job.data.scheduledFor],
       )
     ).rows[0];
     const marker =

@@ -1,4 +1,9 @@
-import { SessionManager, type FileEntry } from '@earendil-works/pi-coding-agent';
+import {
+  SessionManager,
+  buildSessionProjection,
+  estimateTokens,
+  type FileEntry,
+} from '@earendil-works/pi-coding-agent';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import { existsSync, statSync } from 'node:fs';
 import { readFile, readdir, stat } from 'node:fs/promises';
@@ -11,6 +16,8 @@ const rebaseAt = 8 * 1024 * 1024;
 export const keptImages = 4;
 export const removedImage =
   'An earlier image was removed from context. Take a new screenshot or read the file again if you need it.';
+export const recoveryContext =
+  'Earlier context remains in saved history or workspace files. Read the source before using missing facts. Do not repeat completed or uncertain actions.';
 const failure = () =>
   new Error(
     'The assistant session could not be saved. Stop and restore storage before continuing.',
@@ -186,6 +193,9 @@ export function dropFailedInput(manager: SessionManager) {
     (stop) => stop === 'stop' || stop === 'toolUse' || stop === 'length',
   );
   if (failed <= answered) return false;
+  const compacted = entries
+    .slice(answered + 1, failed + 1)
+    .some((entry) => entry.type === 'compaction' && projection.get(entry.id)?.length);
   let changed = false;
   for (const entry of entries.slice(answered + 1, failed + 1))
     if (
@@ -197,8 +207,24 @@ export function dropFailedInput(manager: SessionManager) {
       manager.appendContextEdit(entry.id, null);
       changed = true;
     }
-  if (changed) closeInterruptedCalls(manager);
-  return changed;
+  if (compacted) {
+    const before = entries.slice(0, answered + 1);
+    const prior = before.findLast((entry) => entry.type === 'compaction');
+    manager.appendCompaction(
+      prior?.type === 'compaction' ? prior.summary : recoveryContext,
+      prior?.type === 'compaction' ? prior.firstKeptEntryId : (entries[0]?.id ?? null),
+      prior?.type === 'compaction'
+        ? prior.tokensBefore
+        : buildSessionProjection(before).messages.reduce(
+            (total, message) => total + estimateTokens(message),
+            0,
+          ),
+      prior?.type === 'compaction' ? prior.details : undefined,
+      prior?.type === 'compaction' ? prior.fromHook : undefined,
+    );
+  }
+  if (changed || compacted) closeInterruptedCalls(manager);
+  return changed || compacted;
 }
 
 export function closeInterruptedCalls(manager: SessionManager) {

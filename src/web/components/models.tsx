@@ -149,8 +149,9 @@ export function ModelKeyHelp({
       </p>
       {provider === 'google' && (
         <p className={className}>
+          Gemini 4 Argon requires paid API access. Gemini 3.8 Flash is a lower-cost option with{' '}
           <a href="https://ai.google.dev/gemini-api/docs/pricing" target="_blank" rel="noreferrer">
-            Free tier available with limits.
+            limited free access.
           </a>{' '}
           Google sign-in and AI app plans are separate from API access.
         </p>
@@ -191,7 +192,7 @@ function providerDescription(provider: ModelProvider) {
     case 'anthropic':
       return 'API key only. Claude plans can’t be used here.';
     case 'google':
-      return 'Gemini with an AI Studio key · Free tier available';
+      return 'Gemini with an AI Studio key · Argon requires paid access';
     case 'openrouter':
       return 'Many models with one API key';
     case 'amazon-bedrock':
@@ -1461,6 +1462,14 @@ export function ModelPicker({
                             <span className="model-option-recommended">Recommended</span>
                           )}
                         </span>
+                        {source.provider === 'google' && item.id === 'gemini-4-argon' && (
+                          <span className="model-option-detail">Requires paid API access</span>
+                        )}
+                        {source.provider === 'google' && item.id === 'gemini-3.8-flash' && (
+                          <span className="model-option-detail">
+                            Lower cost · Limited free access
+                          </span>
+                        )}
                         {item.audio && (
                           <span className="model-option-detail">
                             {item.textModelName

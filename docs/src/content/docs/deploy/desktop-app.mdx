@@ -17,7 +17,7 @@ Choose **Connect to a server** on first launch. After setup, choose **Replay onb
 
 Nod checks the connection before saving it. The operating system's secure storage protects the token. The app restarts into the remote assistant without starting its local runtime. Loopback HTTP addresses work for an SSH tunnel.
 
-For a private certificate authority (CA), first trust its certificate in your operating system's certificate store. Restart Nod after you change that store. Both the desktop app and its local engine add system CAs to Node's default certificates at startup while keeping bundled certificates. The local engine does not inherit `NODE_EXTRA_CA_CERTS` from your shell.
+For a private certificate authority (CA), first trust its certificate in your operating system's certificate store. Restart Nod after you change that store. Both the desktop app and its local engine add system CAs to Node's default certificates at startup while keeping bundled certificates. They skip system certificates that have already expired, so an old copy in the Windows store can't replace the valid chain a website sends. The local engine does not inherit `NODE_EXTRA_CA_CERTS` from your shell.
 
 This applies to Node HTTPS requests in the desktop app and local engine. It includes server checks, Composio proxy calls, later API calls, update checks, and analytics. Certificate and hostname checks stay enabled. This uses Node's certificate verification rules, which can differ from the app window's Chromium rules. An operating system distrust setting does not remove a certificate that Node trusts from another source.
 
@@ -29,7 +29,34 @@ The client keeps its server address and encrypted access token, device preferenc
 
 Opening or leaving setup does not reset either assistant. **Back to Nod** returns to the current assistant; **Continue setup** replays its onboarding with existing connections and data intact.
 
-See [Host your own server](/deploy/self-host/) for setup. The remaining sections describe local mode.
+See [Host your own server](/deploy/self-host/) for setup. The runtime sections below describe local mode.
+
+## Setup state and desktop commands
+
+The server owns account onboarding. Electron owns device preferences and local setup progress. The desktop settings store does not keep a second account-completion flag.
+
+| State                                               | Owner                     |
+| --------------------------------------------------- | ------------------------- |
+| Account onboarding and model connections            | The connected server      |
+| Theme, notifications and launch at login            | The desktop app           |
+| Device setup progress and local runtime preparation | The local desktop profile |
+
+The web app selects a browser, remote desktop or local desktop adapter from the preload contract. Contract version 1 names the desktop mode. Only local mode exposes runtime preparation, device setup and setup reconciliation. Preference changes use a separate command that accepts only theme, notifications and launch at login. Native handlers check the owning main frame and mode before a command runs.
+
+```mermaid
+flowchart LR
+  ui[Finish onboarding]:::accent --> server[Save account setup on the server]
+  server --> mode{Local desktop?}
+  mode -- Yes --> check[Electron reads server state<br/>and device setup progress]
+  mode -- No --> chat[Open chat]
+  check --> chat
+```
+
+The last onboarding step saves account completion on the server. A local desktop then asks Electron to check that state and its device setup progress. Startup and an explicit retry use the same check. If the server save succeeds but the check fails, the retry keeps account completion and repeats only the native check. A remote desktop does not run that check or write local setup state.
+
+The adapter also supports the previous preload contract. Its local completion call reaches the same native check on a current desktop app. An unsupported contract version stops completion with an update message.
+
+Desktop settings format 2 stores device setup progress without account completion. Nod reads format 1 without changing the file. It uses the old completion flag to retain completed device setup. The next settings write stores format 2 and keeps the encrypted keys. Earlier desktop versions cannot read format 2.
 
 ## What runs on your computer
 
@@ -83,7 +110,7 @@ The workspace and browser have separate networks, no access to your home folder,
 
 On a new desktop profile, choose **Get started** to start a local assistant or **Connect to a server**. The private computer and its database start in the background as soon as the welcome screen opens, so they are often ready by the time you continue. On a new profile with no saved keys, Nod's own service starts then too. When the profile has saved keys, the service, and any request to unlock them, waits until you select **Get started**. If the service is still starting when you continue, Nod already shows the email step and turns on its Connect buttons when the service is ready. Choosing a server stops the local computer when the app restarts. Nod waits for PostgreSQL and the server when needed, then continues at the email step. Email is offered before model selection and can be skipped. The workspace and browser continue starting during onboarding. A model is required to finish local desktop setup, and Nod tries to turn on Open at login when setup finishes. Usage data sharing is on by default for a new profile and can be turned off in **Settings → Privacy & data**. Conversation traces, other apps, Telegram and WhatsApp are optional.
 
-Before the server starts, the native window saves only the usage data setting and whether Welcome was completed. After the ordinary account API accepts that choice, Nod records its acknowledgment. The email step preview stays visible until the main window can show its account choices or an actionable error. That handoff does not wait for the full app catalog, workspace or browser. A restart does not repeat Welcome or overwrite the saved analytics choice; the temporary marker is removed when onboarding completes. Sign-ins, keys and connections use the normal server and storage from the beginning; there is no separate setup backend or credential transfer. The first chat opens with a short greeting and idea cards, under the normal chat and memory rules.
+Before the server starts, the native window saves only the usage data setting and whether Welcome was completed. After the ordinary account API accepts that choice, Nod records its acknowledgment. The email step preview stays visible until the main window can show its account choices or an actionable error. That handoff does not wait for the full app catalog, workspace or browser. A restart does not repeat Welcome or overwrite the saved analytics choice; the temporary marker is removed when device setup progress is saved. Sign-ins, keys and connections use the normal server and storage from the beginning; there is no separate setup backend or credential transfer. The first chat opens with a short greeting and idea cards, under the normal chat and memory rules.
 
 When local setup finishes, Nod tries to turn on Open at login and checks it with the operating system. On Linux, Open at login adds `io.n8n.Nod.desktop` to your autostart folder, `$XDG_CONFIG_HOME/autostart` or `~/.config/autostart`. If the operating system blocks this setting, setup still finishes. A restart does not repeat this attempt. A settings storage error still requires a retry. You can turn it off in **Settings → General**. The first stored chat introduction offers an explicit choice to enable notifications. Rendering the introduction does not change the saved preference. macOS may ask for permission; your system settings control delivery. Existing notification choices are preserved. Enabling delivery does not authorize app monitoring or scheduled work. If alerts are blocked, allow Nod in the computer’s notification settings. The web app uses the same onboarding. A completed installation keeps its choices and skips onboarding after an update.
 
@@ -177,7 +204,7 @@ flowchart TD
   confirm -- Later --> menu
   confirm -- Restart --> busy{{Work running?}}
   notice -- Later --> menu
-  notice -- Restart --> confirm
+  notice -- Restart --> busy
   menu -- Select --> confirm
   busy -- no --> restart[Restart]:::go
   busy -- yes --> ask[Ask you first]:::accent
@@ -188,7 +215,7 @@ Restarting stops a running reply, scheduled task or background check, and you ca
 
 Nod downloads the update ZIP on a Mac or the installer on Windows, plus any changed local runtime pack, before it offers the restart. The Mac DMG is for installation, not in-app updates. While the runtime pack or Windows installer downloads, the update item in the menu shows progress. If the Mac's local computer is running, Nod tries to load the new container images before restart. Windows still runs the installer and applies a changed WSL runtime after restart. Starting the local computer, database and browser also takes time, so a ready notice means the downloads are complete, not that launch will be instant.
 
-Newer builds show an in-app notice when the update is ready, with its version and **Restart to update** and **Later** actions. Later dismisses the notice for that version during the current app session; the menu still offers **Restart to update**. Older builds may show only the menu action. An automatic check also announces a ready update with a system notification when Nod is in the background, notifications are on and quiet hours allow it. Background checks never open a dialog. On a Mac, an update must be signed by n8n, and Nod refuses one with a lower version number, so an update feed can't roll Nod back to an older build. On Windows, the restart runs the installer in the background and opens Nod again. While Nod shuts down to install the update, its window stays open and shows **Updating Nod…** until it quits to install. If the window was closed, Nod opens it.
+Newer builds show an in-app notice when the update is ready, with its version and **Restart to update** and **Later** actions. Later dismisses the notice for that version during the current app session; the menu still offers **Restart to update**. **Restart to update** in the notice restarts without another Restart or Later dialog. The menu item and a clicked system notification ask first. Older builds may show only the menu action. An automatic check also announces a ready update with a system notification when Nod is in the background, notifications are on and quiet hours allow it. Background checks never open a dialog. On a Mac, an update must be signed by n8n, and Nod refuses one with a lower version number, so an update feed can't roll Nod back to an older build. On Windows, the restart runs the installer in the background and opens Nod again. While Nod shuts down to install the update, its window stays open and shows **Updating Nod…** until it quits to install. If the window was closed, Nod opens it.
 
 When a newer release appears, Nod prepares it before offering restart. It reuses an already downloaded version when a check finds nothing newer. A failed release lookup keeps the downloaded update available. Once replacement staging begins, restart is available only after the new installer or app is verified. Checks and restarts cannot run together.
 

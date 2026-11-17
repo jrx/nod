@@ -11,11 +11,26 @@ export type SharedLocation = z.infer<typeof sharedLocation>;
 
 export function contactCards(text: string) {
   if (text.includes('\0')) return [];
+  const separator = (line: string, state = { quoted: false }) => {
+    for (let index = 0; index < line.length; index++) {
+      if (line[index] === '"') state.quoted = !state.quoted;
+      else if (line[index] === ':' && !state.quoted) return index;
+    }
+    return -1;
+  };
+  const fieldHeader = /^(?:[\w-]+\.)?([A-Z][A-Z0-9-]*)(;.*)?$/i;
+  const parameter = (header: string | undefined, name: string) =>
+    header
+      ?.match(/(?:[^;"]+|"[^"]*")+/g)
+      ?.find((part) => part.slice(0, name.length + 1).toUpperCase() === `${name}=`)
+      ?.slice(name.length + 1)
+      .replace(/^"|"$/g, '');
   const cards: string[] = [];
   let current: string[] | undefined;
   const logical: string[][] = [];
   let quotedPrintable = false;
   let headerComplete = false;
+  const headerState = { quoted: false };
   for (const line of text.replace(/^\uFEFF/, '').split(/\r?\n/)) {
     const previous = logical.at(-1);
     const end = previous?.at(-1);
@@ -26,10 +41,13 @@ export function contactCards(text: string) {
     else {
       logical.push([line]);
       quotedPrintable = headerComplete = false;
+      headerState.quoted = false;
     }
-    if (!headerComplete && line.includes(':')) {
+    if (!headerComplete && separator(line, headerState) >= 0) {
       headerComplete = true;
-      quotedPrintable = /^[^:]*;ENCODING=QUOTED-PRINTABLE[;:]/i.test(logical.at(-1)!.join(''));
+      const unfolded = logical.at(-1)!.join('');
+      const header = fieldHeader.exec(unfolded.slice(0, separator(unfolded)))?.[2];
+      quotedPrintable = parameter(header, 'ENCODING')?.toUpperCase() === 'QUOTED-PRINTABLE';
     }
   }
   for (const parts of logical) {
@@ -51,17 +69,19 @@ export function contactCards(text: string) {
       .trim();
   const parsed = cards.flatMap((vcard) => {
     const fields = vcard.split(/\r?\n/).flatMap((line) => {
-      const match = /^(?:[\w-]+\.)?([A-Z][A-Z0-9-]*)(;[^:]*)?:(.*)$/i.exec(line);
+      const end = separator(line);
+      if (end < 0) return [];
+      const match = fieldHeader.exec(line.slice(0, end));
       if (!match) return [];
-      let value = match[3];
-      if (/;ENCODING=QUOTED-PRINTABLE(?:;|$)/i.test(match[2] ?? '')) {
+      let value = line.slice(end + 1);
+      if (parameter(match[2], 'ENCODING')?.toUpperCase() === 'QUOTED-PRINTABLE') {
         const bytes: number[] = [];
         for (const part of value.match(/=[\da-f]{2}|[^=]+|=/gi) ?? []) {
           if (/^=[\da-f]{2}$/i.test(part)) bytes.push(Number.parseInt(part.slice(1), 16));
           else for (const byte of new TextEncoder().encode(part)) bytes.push(byte);
         }
         try {
-          value = new TextDecoder(/;CHARSET="?([^;" ]+)/i.exec(match[2])?.[1] ?? 'utf-8', {
+          value = new TextDecoder(parameter(match[2], 'CHARSET') ?? 'utf-8', {
             fatal: true,
           }).decode(new Uint8Array(bytes));
         } catch {}

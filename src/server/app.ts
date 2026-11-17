@@ -250,6 +250,10 @@ export async function createApp(dependencies: AppDependencies = {}) {
     forceCloseConnections: true,
   });
   const streams = new Set<ServerResponse>();
+  const browserFrameAcks = new Map<
+    string,
+    { turnId: string; browserId: string; acknowledge(): void }
+  >();
   if (dependencies.failureLog)
     app.addHook('onRequest', (_request, _reply, done) =>
       withFailureLog(dependencies.failureLog!, done),
@@ -757,7 +761,9 @@ export async function createApp(dependencies: AppDependencies = {}) {
   app.get('/api/browser-handoff/stream', async (request, reply) => {
     const view = dependencies.computer?.view;
     if (!view) return reply.code(404).send({ error: 'The browser is unavailable.' });
-    const { turnId } = z.object({ turnId: z.uuid() }).parse(request.query);
+    const { turnId, view: viewId } = z
+      .object({ turnId: z.uuid(), view: z.string().min(1).max(120).optional() })
+      .parse(request.query);
     const browserId = await handoffBrowser(turnId);
     if (!browserId) return reply.code(423).send({ error: handoffClosed });
     const controller = new AbortController();
@@ -822,12 +828,28 @@ export async function createApp(dependencies: AppDependencies = {}) {
       while (!next.done && !controller.signal.aborted) {
         const length = Buffer.alloc(4);
         length.writeUInt32BE(next.value.length);
+        let acknowledge: Promise<void> | undefined;
+        if (viewId) {
+          acknowledge = new Promise<void>((resolve) => {
+            const finish = () => {
+              if (browserFrameAcks.get(viewId)?.acknowledge === finish)
+                browserFrameAcks.delete(viewId);
+              controller.signal.removeEventListener('abort', finish);
+              resolve();
+            };
+            browserFrameAcks.set(viewId, { turnId, browserId, acknowledge: finish });
+            controller.signal.addEventListener('abort', finish, { once: true });
+            if (controller.signal.aborted) finish();
+          });
+        }
         reply.raw.write(length);
         if (!reply.raw.write(next.value))
           await new Promise((resolve) => {
             reply.raw.once('drain', resolve);
             reply.raw.once('close', resolve);
           });
+        await acknowledge;
+        if (controller.signal.aborted) break;
         next = await frames.next();
         if (next.done && !controller.signal.aborted) {
           frames = open();
@@ -842,6 +864,19 @@ export async function createApp(dependencies: AppDependencies = {}) {
       void frames.return?.().catch(() => {});
       if (reply.raw.headersSent) reply.raw.end();
     }
+  });
+  app.post('/api/browser-handoff/frame-ack', async (request, reply) => {
+    const { turnId, view } = z
+      .object({ turnId: z.uuid(), view: z.string().min(1).max(120) })
+      .strict()
+      .parse(request.body);
+    const pending = browserFrameAcks.get(view);
+    if (!pending || pending.turnId !== turnId)
+      return reply.code(409).send({ error: 'The browser frame is no longer waiting.' });
+    if ((await handoffBrowser(turnId)) !== pending.browserId)
+      return reply.code(423).send({ error: handoffClosed });
+    pending.acknowledge();
+    return { ok: true };
   });
   app.post('/api/browser-handoff', async (request, reply) => {
     const body = z

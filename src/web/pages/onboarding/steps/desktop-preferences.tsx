@@ -3,7 +3,7 @@ import type { OnboardingStep } from '../../../../shared/onboarding';
 import { OnboardingFrame } from '../frame';
 import { Button, Notice } from '../../../components/ui';
 import { errorMessage } from '../../../lib/api';
-import { getDesktopSettings, saveDesktopSettings } from '../../../lib/desktop';
+import { desktopSetup, completeDesktopPreferences } from '../../../lib/desktop';
 import { Messages } from '../motion';
 
 export function DesktopPreferencesSetup({
@@ -22,18 +22,11 @@ export function DesktopPreferencesSetup({
 
   useEffect(() => {
     let current = true;
-    void getDesktopSettings()
-      .then((value) =>
-        value.onboardingPreferenceStep === 'complete'
-          ? value
-          : saveDesktopSettings({
-              launchAtLogin: true,
-              onboardingPreferenceStep: 'complete',
-            }),
-      )
+    void desktopSetup()
+      .then((value) => (value.preferenceStep === 'complete' ? value : completeDesktopPreferences()))
       .then((value) => {
         if (!current) return;
-        if (value.onboardingPreferenceStep !== 'complete')
+        if (value.preferenceStep !== 'complete')
           throw new Error('Nod couldn’t finish setup. Try again.');
         ready.current();
       })

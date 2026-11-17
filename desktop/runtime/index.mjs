@@ -1,10 +1,11 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { constants, createReadStream } from 'node:fs';
+import { constants, createReadStream, createWriteStream } from 'node:fs';
 import {
   access,
   chmod,
   copyFile,
+  lstat,
   mkdir,
   readdir,
   readFile,
@@ -36,6 +37,54 @@ async function fileHash(path) {
   const hash = createHash('sha256');
   for await (const chunk of createReadStream(path)) hash.update(chunk);
   return hash.digest('hex');
+}
+
+export async function stageGuestImage(source, target, sha256, signal) {
+  signal?.throwIfAborted();
+  const temporary = `${target}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    const hash = createHash('sha256');
+    const input = createReadStream(source);
+    input.on('data', (chunk) => hash.update(chunk));
+    await pipeline(input, createWriteStream(temporary, { flags: 'wx', mode: 0o600, flush: true }), {
+      signal,
+    });
+    if (hash.digest('hex') !== sha256)
+      throw new Error('The Nod guest image does not match its manifest.');
+    signal?.throwIfAborted();
+    await rename(temporary, target);
+  } catch (error) {
+    await rm(temporary, { force: true }).catch((cleanupError) => {
+      error.details = [error.details, cleanupError.stack || cleanupError.message]
+        .filter(Boolean)
+        .join('\n');
+    });
+    throw error;
+  }
+}
+
+export async function guestDiskIsEmpty(path, signal) {
+  const before = await lstat(path).catch((error) => {
+    if (error.code !== 'ENOENT') throw error;
+  });
+  if (!before?.isFile()) return false;
+  const zero = Buffer.alloc(1024 * 1024);
+  let bytes = 0;
+  for await (const chunk of createReadStream(path, { signal, highWaterMark: zero.length })) {
+    bytes += chunk.length;
+    if (!chunk.equals(zero.subarray(0, chunk.length))) return false;
+  }
+  signal?.throwIfAborted();
+  const after = await lstat(path);
+  return (
+    after.isFile() &&
+    before.dev === after.dev &&
+    before.ino === after.ino &&
+    before.mtimeMs === after.mtimeMs &&
+    before.ctimeMs === after.ctimeMs &&
+    before.size === after.size &&
+    bytes === after.size
+  );
 }
 
 export async function retainStopExecutable(lima, controlRoot) {
@@ -256,11 +305,9 @@ async function prepare(options, onComputerStart) {
       () => false,
     );
     if (orphaned)
-      await execute(lima, ['delete', '--force', 'nod'], {
-        env: hostEnvironment,
-        signal,
-        timeout: 120_000,
-      });
+      throw new Error(
+        'The Nod local computer configuration is missing for an existing private computer.',
+      );
   }
   if (
     saved &&
@@ -269,6 +316,7 @@ async function prepare(options, onComputerStart) {
       !Number.isInteger(saved.port) ||
       saved.port < 1 ||
       saved.port > 65535 ||
+      (saved.initializing !== undefined && typeof saved.initializing !== 'boolean') ||
       !/^[a-f0-9]{64}$/.test(saved.password))
   )
     throw new Error('The Nod local computer configuration needs recovery.');
@@ -279,9 +327,16 @@ async function prepare(options, onComputerStart) {
     password: randomBytes(32).toString('hex'),
   };
   saved.stopExecutableSha256 = await retainStopExecutable(lima, controlRoot);
-  const temporaryState = `${configPath}.${randomBytes(6).toString('hex')}.tmp`;
-  await writeFile(temporaryState, JSON.stringify(saved), { mode: 0o600, flag: 'wx' });
-  await rename(temporaryState, configPath);
+  const saveState = async () => {
+    const temporaryState = `${configPath}.${randomBytes(6).toString('hex')}.tmp`;
+    await writeFile(temporaryState, JSON.stringify(saved), {
+      mode: 0o600,
+      flag: 'wx',
+      flush: true,
+    });
+    await rename(temporaryState, configPath);
+  };
+  await saveState();
   const vm = 'nod';
   const dockerSocket = join(limaHome, vm, 'sock/docker.sock');
   const dockerConfig = join(controlRoot, 'docker-config');
@@ -299,9 +354,47 @@ async function prepare(options, onComputerStart) {
   try {
     await access(join(limaHome, vm, 'lima.yaml'));
     exists = true;
-  } catch {}
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  if (
+    exists &&
+    process.platform === 'linux' &&
+    saved.initializing === undefined &&
+    (await guestDiskIsEmpty(join(limaHome, vm, 'disk'), signal))
+  ) {
+    status('preparing', 'Checking your private computer…');
+    if ((await runLima(['list', '--format', '{{.Status}}', vm])).trim() !== 'Stopped') {
+      await runLima(['stop', '--tty=false', vm], { timeout: 90_000 });
+      if ((await runLima(['list', '--format', '{{.Status}}', vm])).trim() !== 'Stopped')
+        throw new Error('Nod could not confirm that its empty private computer stopped.');
+    }
+    if (await guestDiskIsEmpty(join(limaHome, vm, 'disk'), signal)) {
+      saved.initializing = true;
+      await saveState();
+    }
+  }
+  if (saved.initializing) {
+    status('preparing', 'Replacing your unfinished private computer…');
+    if (exists) await runLima(['delete', '--force', vm], { timeout: 120_000 });
+    else await rm(join(limaHome, vm), { recursive: true, force: true });
+    exists = false;
+  }
   if (!exists) {
+    if (!saved.initializing) {
+      const entries = await readdir(join(limaHome, vm)).catch((error) => {
+        if (error.code !== 'ENOENT') throw error;
+        return [];
+      });
+      if (entries.length)
+        throw new Error('The Nod private computer has files but no Lima configuration.');
+      await rmdir(join(limaHome, vm)).catch((error) => {
+        if (error.code !== 'ENOENT') throw error;
+      });
+    }
     status('preparing', 'Preparing your private computer…');
+    saved.initializing = true;
+    await saveState();
     const config = guestConfiguration({
       assets,
       imageDigest: manifest.guest.sha256,
@@ -357,6 +450,29 @@ async function prepare(options, onComputerStart) {
       await rename(temporary, vmConfigPath);
     }
   }
+  if (process.platform === 'linux') {
+    let hasDisk = false;
+    for (const name of ['disk', 'diffdisk']) {
+      try {
+        await lstat(join(limaHome, vm, name));
+        hasDisk = true;
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+    if (!hasDisk) {
+      if (!saved.initializing) {
+        saved.initializing = true;
+        await saveState();
+      }
+      await stageGuestImage(
+        join(assets, manifest.guest.file),
+        join(limaHome, vm, 'image'),
+        manifest.guest.sha256,
+        signal,
+      );
+    }
+  }
   status('starting', 'Starting your private computer…');
   onComputerStart();
   await runLima(['start', '--tty=false', vm], { timeout: 600_000 });
@@ -368,6 +484,11 @@ async function prepare(options, onComputerStart) {
       new Error('Nod could not apply its container protection. Keep your app data and retry.'),
       { code: 'NOD_COMPUTER_PROTECTION_FAILED', details: error.details || error.stack },
     );
+  }
+  if (saved.initializing !== false) {
+    signal?.throwIfAborted();
+    saved.initializing = false;
+    await saveState();
   }
   if (!options.preserveRuntimeCache) await removeUnmountedRuntimes(assets).catch(() => {});
   await waitFor(() => runDocker(['info', '--format', '{{.ServerVersion}}']), { signal });

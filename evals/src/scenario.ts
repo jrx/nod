@@ -34,6 +34,7 @@ export interface World {
   notificationRule?: string;
   rules?: string;
   apps?: AppsWorld;
+  localFiles?: Record<string, string | Buffer>;
   sites?: Record<string, Site>;
   logins?: Array<{
     label: string;

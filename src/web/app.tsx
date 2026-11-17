@@ -37,10 +37,10 @@ import type { AccountControls, AccountTab } from './components/account-menu';
 import { usePageData } from './hooks/use-page-data';
 import { resolveBrowserRegion, setDateFormat } from './lib/date-format';
 import { useBrowserTimeZone } from './hooks/use-browser-time-zone';
+import { finishOnboarding } from './lib/onboarding';
 import {
   desktopSettingsAvailable,
   desktopRendererReady,
-  saveDesktopSettings,
   onFeedbackRequested,
   subscribeDesktopFocusMessage,
   subscribeDesktopSettings,
@@ -564,10 +564,9 @@ function AuthenticatedApp({
           onTraces={account.onTraces}
           onComplete={async () => {
             setFinishingOnboarding(true);
-            if (!session.settings!.onboardingCompleted)
-              await onAccountUpdate({ onboardingCompleted: true });
-            if (desktopSettingsAvailable())
-              await saveDesktopSettings({ onboardingCompleted: true });
+            await finishOnboarding(session.settings!.onboardingCompleted, () =>
+              onAccountUpdate({ onboardingCompleted: true }),
+            );
             pendingDesktopPage.current = null;
             replaceNavigation('/');
             setFinishingOnboarding(false);

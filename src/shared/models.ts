@@ -142,6 +142,12 @@ export function routeModel(
   return models.selection ? { selection: models.selection, follows: 'chat' } : null;
 }
 
+export function boundedPrice(cost: ModelChoice['pricing']) {
+  if (!cost || cost === 'variable') return false;
+  const prices = [cost.input, cost.output, cost.cacheRead ?? 0, cost.cacheWrite ?? 0];
+  return prices.every((price) => Number.isFinite(price) && price >= 0) && Math.max(...prices) > 0;
+}
+
 export function repriceUsd(usage: WorkUsage, pricing: ModelChoice['pricing']) {
   if (!pricing || pricing === 'variable' || pricing.input + pricing.output <= 0) return null;
   return (
@@ -175,6 +181,7 @@ export interface ModelsResponse {
   selection: ModelSelection | null;
   routes: ModelRoutes;
   light: ModelSelection | null;
+  unpricedPreparationModel?: string;
 }
 
 export interface ModelWorkspace {

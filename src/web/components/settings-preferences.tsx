@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import type { AccountPreferences, AccountTheme } from '../../shared/account';
+import type { ModelsResponse } from '../../shared/models';
 import type { HourCycle } from '../../shared/contracts';
 import type { AccountControls } from './account-menu';
 import type { useDesktopSettings } from './desktop-settings';
@@ -415,6 +416,7 @@ export function QuietHours() {
     error: loadError,
     refresh,
   } = usePageData<AccountPreferences>('/api/preferences');
+  const unpriced = usePageData<ModelsResponse>('/api/models').data?.unpricedPreparationModel;
   const [draft, setDraft] = useState<AccountPreferences | null>(null);
   const previous = useRef<AccountPreferences | null>(null);
   const [busy, setBusy] = useState(false);
@@ -537,6 +539,12 @@ export function QuietHours() {
           Prepare useful work from app changes. Spends from a $5 monthly allowance by default.
           Change it in Usage. Turning this off also pauses automatic email checks.
         </p>
+        {!draft.proactivePaused && unpriced && (
+          <Notice kind="info">
+            {unpriced} has no price, so automatic preparation can't stay within its allowance and
+            doesn't run. Choose a priced model in Models.
+          </Notice>
+        )}
       </section>
       <section className="account-region account-quiet-hours" aria-labelledby={`${id}-heading`}>
         <div className="account-preference-row">

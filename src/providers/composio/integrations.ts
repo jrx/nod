@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { APIError } from '@composio/client';
 import type { Composio, ToolRouterSession } from '@composio/core';
 import { z } from 'zod';
 import { composioActivity } from './activity.ts';
@@ -8,12 +9,15 @@ import type { createComposioProxy } from './proxy.ts';
 import { readInboxSnippets, readInboxThreads, readSentEmails } from './sent-email.ts';
 import { readVerificationEmails } from './verification-email.ts';
 import {
+  connectionCode,
+  connectionReason,
   IntegrationCatalogAccessDenied,
   IntegrationCatalogFailure,
   IntegrationConnectionError,
   IntegrationInboxCursorExpired,
   IntegrationInboxTransientError,
   IntegrationPermissionError,
+  integrationCatalogProxyErrorCodes,
   type IntegrationProvider,
   type IntegrationSession,
 } from '../../ports/integrations.ts';
@@ -203,26 +207,21 @@ function proxyRequestFailure(
       code?: unknown;
     }
   | undefined {
+  const refused =
+    error instanceof IntegrationConnectionError
+      ? error
+      : error instanceof Error && error.cause instanceof IntegrationConnectionError
+        ? error.cause
+        : undefined;
+  if (refused) return { reason: refused.reason, status: refused.status, code: refused.code };
   const status = error && typeof error === 'object' && 'status' in error ? error.status : undefined;
   const kind = error instanceof Error ? error.constructor.name : '';
-  const reason =
-    status === 401
-      ? 'authorization'
-      : status === 403
-        ? 'permission'
-        : status === 429
-          ? 'rate_limit'
-          : status === 408 ||
-              status === 504 ||
-              kind === 'APIConnectionTimeoutError' ||
-              (signal?.aborted && signal.reason?.name === 'TimeoutError')
-            ? 'timeout'
-            : (typeof status === 'number' && status >= 500 && status <= 599) ||
-                kind === 'APIConnectionError'
-              ? 'unavailable'
-              : typeof status === 'number' && status >= 400 && status <= 499
-                ? 'invalid_request'
-                : undefined;
+  const reason = connectionReason(
+    status,
+    kind === 'APIConnectionTimeoutError' ||
+      (signal?.aborted === true && signal.reason?.name === 'TimeoutError'),
+    kind === 'APIConnectionError',
+  );
   if (!reason) return;
   const body = error && typeof error === 'object' && 'error' in error ? error.error : undefined;
   const code = body && typeof body === 'object' && 'error' in body ? body.error : undefined;
@@ -236,22 +235,13 @@ function proxyRequestFailure(
 function connectionFailure(phase: IntegrationConnectionError['phase'], signal?: AbortSignal) {
   return (error: unknown): never => {
     const failure = proxyRequestFailure(error, signal);
-    if (failure) {
-      const code = z
-        .enum([
-          'installation_busy',
-          'public_budget_exceeded',
-          'service_unavailable',
-          'security_service_unavailable',
-        ])
-        .safeParse(failure.code);
+    if (failure)
       throw new IntegrationConnectionError(
         failure.reason,
         phase,
         failure.status,
-        code.success ? code.data : undefined,
+        connectionCode(failure.code),
       );
-    }
     throw error;
   };
 }
@@ -375,24 +365,7 @@ export function createComposioProvider(options: {
         throw new IntegrationCatalogAccessDenied(code.success ? code.data : undefined);
       }
       if (failure) {
-        const code = z
-          .enum([
-            'rate_limited',
-            'installation_busy',
-            'public_budget_exceeded',
-            'provider_rate_limited',
-            'service_unavailable',
-            'security_service_unavailable',
-            'public_access_unavailable',
-            'provider_unavailable',
-            'provider_request_failed',
-            'catalog_unavailable',
-            'operation_timeout',
-            'invalid_limit_configuration',
-            'invalid_provider_response',
-            'unsafe_provider_response',
-          ])
-          .safeParse(failure.code);
+        const code = z.enum(integrationCatalogProxyErrorCodes).safeParse(failure.code);
         throw new IntegrationCatalogFailure(
           failure.reason,
           failure.status,
@@ -653,6 +626,21 @@ export function createComposioProvider(options: {
             maxRetries: 0,
           } as Parameters<typeof value.execute>[3])
           .catch((error: unknown) => {
+            if (
+              error instanceof APIError &&
+              error.status === 403 &&
+              error.headers?.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() ===
+                'text/html'
+            ) {
+              const ray = error.headers?.get('cf-ray');
+              const rayId = ray && /^[0-9a-f]{16}-[A-Z]{3}$/i.test(ray) ? ray : undefined;
+              throw Object.assign(
+                new Error(
+                  `The app request received HTTP 403 at ${new Date().toISOString()}${rayId ? ` (Cloudflare Ray ID 0x${rayId})` : ''}.`,
+                ),
+                { status: 403 },
+              );
+            }
             const kind = error instanceof Error ? error.constructor.name : '';
             const reason =
               kind === 'APIConnectionTimeoutError'
@@ -749,6 +737,7 @@ export function createComposioProvider(options: {
           .enum([
             'installation_busy',
             'public_budget_exceeded',
+            'rate_limited',
             'service_unavailable',
             'security_service_unavailable',
           ])
@@ -809,7 +798,13 @@ export function createComposioProvider(options: {
             const transient =
               error instanceof IntegrationInboxTransientError ? error : transientFailure(error);
             if (!transient) throw error;
-            if (!retriesRemaining || transient.code === 'public_budget_exceeded') throw transient;
+            if (
+              !retriesRemaining ||
+              (transient.code &&
+                (transient.code === 'public_budget_exceeded' ||
+                  !(error instanceof IntegrationInboxTransientError)))
+            )
+              throw transient;
             const attempt = 2 - retriesRemaining;
             retriesRemaining--;
             await delay(350 * 2 ** attempt + Math.floor(Math.random() * 150), undefined, {

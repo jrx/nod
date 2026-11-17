@@ -21,7 +21,7 @@ import {
   Switch,
 } from './ui';
 import { DataSharing } from './data-sharing';
-import { LocalFilesKeepOut } from './local-files-keep-out';
+import { LocalFilesSettings } from './local-files-settings';
 import { ModelSettings } from './models';
 import { VoiceSettings } from './voice-settings';
 import { Memory, type MemoryNavigationState } from '../pages/memory';
@@ -514,7 +514,7 @@ export function AccountSettings({
                         </p>
                       </section>
                     )}
-                    <LocalFilesKeepOut />
+                    <LocalFilesSettings />
                     {desktopRuntimeAvailable() && (
                       <section className="account-region">
                         <div className="account-preference-row">
