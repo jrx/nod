@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { classifyVerificationReply, securityCodeIn } from '../shared/verification-code.ts';
 import { isMessageReaction } from '../shared/emoji.ts';
 import { transaction } from './transaction.ts';
-import { logFailure } from './failure-log.ts';
+import { logFailure, logRepeatedFailure } from './failure-log.ts';
 import { languageText } from './communication.ts';
 import { ChannelMediaFailure, type ChannelMedia } from './channel-media.ts';
 import type { WorkAdmission } from './work-admission.ts';
@@ -21,13 +21,13 @@ import type {
   MessagingAttachment,
   MessagingTransport,
 } from '../ports/messaging.ts';
-import { loopbackHost } from '../shared/loopback.ts';
 import type { ChatConfirmationInput } from './approvals.ts';
-import { appPagePath, appPages, appPageUrl } from '../shared/app-links.ts';
+import { channelText } from './channel-text.ts';
+import { appPages } from '../shared/app-links.ts';
 import { pendingAnswerChoicesSql } from './answer-choices.ts';
 
 const replyCommand = /^\/(memory|context|usage)(?:@[A-Za-z0-9_]+)?$/i;
-const taskCommand = /^\/(tasks|status|stop)(?:@[A-Za-z0-9_]+)?$/i;
+const taskCommand = /^\/(tasks|status|stop|clear)(?:@[A-Za-z0-9_]+)?$/i;
 
 export type ChannelPresentation =
   | {
@@ -121,9 +121,10 @@ interface ChannelOptions {
   ) => Promise<{ text: string; attachments: Artifact[]; presentation?: ChannelPresentation }>;
   taskCommand?: (
     client: PoolClient,
-    command: 'tasks' | 'status' | 'stop',
+    command: 'tasks' | 'status' | 'stop' | 'clear',
     replyToMessageId?: string,
     hasReply?: boolean,
+    channel?: string,
   ) => Promise<{
     threadId: string;
     replies: Array<{ text: string; replyToMessageId?: string; presentation?: ChannelPresentation }>;
@@ -210,55 +211,6 @@ function inboundMessageId(ownerId: string, sourceId: string) {
   return `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`;
 }
 
-function channelText(text: string) {
-  let secureAction = false;
-  let artifact = false;
-  const privateUrl = (value: string) => {
-    let url: URL;
-    try {
-      url = new URL(value, 'https://nod.invalid');
-    } catch {
-      return false;
-    }
-    if (url.pathname.startsWith('/api/artifacts/')) {
-      artifact = true;
-      return true;
-    }
-    if (loopbackHost(url.hostname)) {
-      secureAction = true;
-      return true;
-    }
-    if (
-      /^\/(?:vault|credentials|payments|approvals)\//.test(url.pathname) ||
-      url.pathname === '/browser' ||
-      (['/vault', '/trust'].includes(url.pathname) && url.searchParams.has('add'))
-    ) {
-      if (!/^https?:\/\//.test(value)) {
-        secureAction = true;
-        return true;
-      }
-    }
-    return false;
-  };
-  const safe = text
-    .replace(
-      /\[((?:\\.|[^\]\\])*)\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g,
-      (match, label: string, url: string) => {
-        const path = appPagePath(url);
-        if (path) {
-          const page = appPages[path as keyof typeof appPages];
-          return `${page && label !== page ? `${label} (${page})` : label}: ${appPageUrl(path)}`;
-        }
-        return privateUrl(url) ? label : match;
-      },
-    )
-    .replace(
-      /https?:\/\/[^\s)]+|\/(?:api\/artifacts|vault|trust|browser|credentials|payments|approvals)[^\s)]*/g,
-      (url) => (privateUrl(url) ? '' : url),
-    );
-  return { text: safe.trim(), secureAction, artifact };
-}
-
 async function presentChannelText(
   threadId: string | null,
   input: ChannelPresentation,
@@ -340,9 +292,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         channel.error &&
         channel.error !== channels.find((previous) => previous.id === channel.id)?.error
       )
-        logFailure('channel_connection_failed', new MessagingConnectionError(channel.error), {
-          provider: channel.id,
-        });
+        logRepeatedFailure(
+          'channel_connection_failed',
+          `${channel.id}:${channel.error}`,
+          new MessagingConnectionError(channel.error),
+          { provider: channel.id },
+        );
     channels = transport.channels.map((channel) => ({
       ...channel,
       allowedSenderIds: [...channel.allowedSenderIds],
@@ -407,7 +362,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   ) {
     const replyId = randomUUID();
     await client.query(
-      "INSERT INTO messages(id,owner_id,role,text,thread_id,attachments,reply_to_message_id) VALUES($1,$2,'assistant',$3,$4,$5,$6)",
+      "INSERT INTO messages(id,owner_id,role,text,thread_id,attachments,reply_to_message_id,created_at) VALUES($1,$2,'assistant',$3,$4,$5,$6,clock_timestamp())",
       [
         replyId,
         ownerId,
@@ -586,12 +541,18 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   async function acceptMessage(message: InboundMessage, channelId: string) {
     const receiveSignal = receiving.signal;
     const parsed = messageSchema.safeParse(message);
-    if (!parsed.success || parsed.data.channelId !== channelId) return;
+    const dropped = (reason: string) =>
+      logRepeatedFailure('channel_inbound_dropped', `${channelId}:${reason}`, undefined, {
+        provider: channelId,
+        reason,
+      });
+    if (!parsed.success || parsed.data.channelId !== channelId) return dropped('invalid_message');
     const { accountId, senderId, messageId, threadId, sentAt, replyToMessageId } = parsed.data;
     let { text } = parsed.data;
     const identity = { provider: channelId, account_id: accountId, sender_id: senderId };
-    if (closed || replacing || !permitted(identity) || sentAt.getTime() > Date.now() + 300000)
-      return;
+    if (closed || replacing) return;
+    if (!permitted(identity)) return dropped('not_linked');
+    if (sentAt.getTime() > Date.now() + 300000) return dropped('future_timestamp');
     let media: Awaited<ReturnType<ChannelMedia['prepare']>> | undefined;
     try {
       const sourceId = `channel:${channelId}:${accountId}:${messageId}`;
@@ -634,7 +595,9 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           await replyWithoutTurn(
             client,
             { ...identity, sourceId, threadId, sentAt, text: '' },
-            () => ({ text: 'Connect a model service and choose a model in Settings → Models.' }),
+            () => ({
+              text: `Connect a model service and choose a model in ${appPages['/settings/models']}.`,
+            }),
           );
         }, pool);
         options.refresh?.();
@@ -665,6 +628,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           if (text.length > 100_000) throw new ChannelMediaFailure('text_too_long');
         } catch (error) {
           if (closed || replacing || receiveSignal.aborted || !permitted(identity)) return;
+          if (error instanceof ChannelMediaFailure && error.cause)
+            logFailure('channel_attachment_unavailable', error.cause);
           if (modelMissingAtIntake || options.modelConfigured?.() === false) {
             await requestModelSetup();
             return;
@@ -978,7 +943,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     const command =
       !pending.attachments?.length && options.taskCommand
         ? (taskCommand.exec(pending.text.trim())?.[1]?.toLowerCase() as
-            'tasks' | 'status' | 'stop' | undefined)
+            'tasks' | 'status' | 'stop' | 'clear' | undefined)
         : undefined;
     const retiredAnswer =
       permittedBeforeAnswer && retiredBeforeAnswer && hiddenBeforeAnswer && !command
@@ -1060,6 +1025,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           command,
           retiredBeforeAnswer ? undefined : replyToMessageId,
           retiredBeforeAnswer ? command === 'stop' : Boolean(row.provider_reply_id),
+          channel,
         );
         for (const message of reply.replies)
           await saveReply(client, row.source_id, reply.threadId, message);
@@ -1728,7 +1694,11 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
               cause instanceof MessagingConnectionError
                 ? cause.message
                 : 'Channels could not check for new messages. Check the channel setup.';
-            logFailure('channel_poll_failed', cause);
+            logRepeatedFailure(
+              'channel_poll_failed',
+              cause instanceof Error ? cause.message : String(cause),
+              cause,
+            );
           }
           const attempt = async (step: () => Promise<unknown>) => {
             try {
@@ -1883,6 +1853,14 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     drain,
     close,
     replaceTransport,
+    canDeliverLiteral(channel: string, text: string, literal: string) {
+      const channelId = channel.split(':')[0]!;
+      return (
+        !closed &&
+        !replacing &&
+        (transport.canDeliverLiteral?.({ channelId, text, literal }) ?? false)
+      );
+    },
     announcePairing,
     react,
     async pairing() {

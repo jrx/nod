@@ -8,3 +8,7 @@ GPL-3.0-or-later. Its source file src/providers/local-speech/phonemizer-worker.t
 is distributed under GPL-3.0-or-later. See desktop/licenses/speech.md for component
 attribution and corresponding source. Desktop builds include the license and
 verified source archives under engine/licenses/speech.
+
+Agent Plugins 1.0.0 JSON Schemas
+Source: https://github.com/agentplugins/agent-plugins-spec
+Schemas in src/server/agent-plugins/ are distributed under Apache-2.0.

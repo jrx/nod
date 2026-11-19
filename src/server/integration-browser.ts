@@ -231,7 +231,19 @@ export function createIntegrationBrowser(options?: {
       }
       origin = `http://127.0.0.1:${address.port}`;
       const url = `${origin}/${capability}`;
-      const timer = setTimeout(() => finish(id), expiresAt - Date.now());
+      const timer = setTimeout(() => {
+        if (attempts.has(id))
+          logFailure('app_connection_expired', undefined, {
+            step: returned
+              ? 'callback'
+              : attempts.get(id)!.remote
+                ? 'consent'
+                : bootstrapped
+                  ? 'start'
+                  : 'open',
+          });
+        finish(id);
+      }, expiresAt - Date.now());
       timer.unref();
       attempts.set(id, { url, server, expiresAt, timer });
       return url;

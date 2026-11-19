@@ -1,0 +1,17 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "linear",
+  "version": "1.0.0",
+  "description": "Find and work with your projects and issues.",
+  "homepage": "https://linear.app",
+  "license": "Apache-2.0",
+  "extensions": {
+    "io.n8n.nod": {
+      "app": "./io.n8n.nod/app.json"
+    }
+  },
+  "author": {
+    "name": "n8n",
+    "url": "https://github.com/n8n-io/nod"
+  }
+}

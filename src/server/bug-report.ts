@@ -1,3 +1,7 @@
+import { constants, existsSync } from 'node:fs';
+import { open } from 'node:fs/promises';
+import os from 'node:os';
+import { join } from 'node:path';
 import type { Pool } from 'pg';
 import { feedbackLimits, type FeedbackContext } from '../shared/feedback.ts';
 import { parseFeedbackActivity, type FeedbackActivity } from '../shared/feedback-activity.ts';
@@ -16,6 +20,22 @@ export interface FeedbackClientError {
   ageMs: number;
 }
 
+export interface FeedbackClientState {
+  online?: boolean;
+  visibility?: 'visible' | 'hidden';
+  stream?: 'open' | 'connecting' | 'closed' | 'unknown';
+  lastEventAgeMs?: number | null;
+  streamReconnects?: number;
+  savedMessages?: number | null;
+  renderedMessages?: number | null;
+  pendingTurn?: boolean | null;
+  viewport?: { width: number; height: number };
+  locale?: string;
+  timeZone?: string;
+  clockOffsetMs?: number | null;
+  uptimeMs?: number;
+}
+
 export interface FeedbackReportOptions {
   pool: Pool;
   ownerId: string;
@@ -26,6 +46,11 @@ export interface FeedbackReportOptions {
   secrets?: string[];
   profile?: () => Promise<PersonalProfile>;
   logs?: () => Promise<FeedbackLogSnapshot>;
+  failures?: () => Promise<FeedbackLogSnapshot>;
+  dataRoot?: string;
+  trustModel?: string;
+  client?: FeedbackClientState;
+  environment?: NodeJS.ProcessEnv;
   errors?: FeedbackClientError[];
   errorsAvailable?: boolean;
 }
@@ -43,12 +68,23 @@ const providers = [
 ];
 const tools = [
   'apps',
+  'codemode',
+  'files',
+  'history_search',
+  'limits_update',
+  'memory_learn',
+  'nod_docs',
+  'prepared_list',
+  'prepared_update',
+  'proactive_issue',
+  'read_source',
+  'tool_search',
+  'usage_get',
   'ask_user',
   'browser',
   'browser_session',
   'create_audio',
   'delegate',
-  'files',
   'follow_up',
   'manage_apps',
   'manage_personal_context',
@@ -60,7 +96,33 @@ const tools = [
   'skills',
   'task',
 ];
+const usageCategories = ['agent', 'memory', 'review', 'tasks', 'analytics', 'task_classification'];
+const usageOperations = [
+  'request',
+  'compaction',
+  'cache_warm',
+  'auxiliary',
+  'models',
+  'attention',
+  'review',
+  'access',
+  'trust',
+  'read_only',
+  'approval_reply',
+  'reflect',
+  'style',
+  'plan',
+  'classify',
+  'vision',
+  'recall',
+  'remember',
+  'skill',
+  'transcribe',
+  'synthesize',
+];
+const protectedLists = ['failures', 'startupLog', 'settings', 'modelSettings', 'channelSettings'];
 const channels = ['web', 'telegram', 'whatsapp'];
+const efforts = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 const outcomes = ['succeeded', 'failed', 'cancelled'];
 const choice = (value: unknown, allowed: readonly string[], fallback = 'unknown') =>
   typeof value === 'string' && allowed.includes(value) ? value : fallback;
@@ -84,8 +146,37 @@ function modelFamily(value: unknown) {
   return family?.toLowerCase() ?? 'custom';
 }
 
+const modelWords = new Set(
+  `gpt claude gemini gemma llama deepseek qwen qwq mistral mixtral codestral devstral phi grok kimi glm
+  minimax command nova titan sonnet opus haiku fable mythos mini nano pro max flash lite turbo preview
+  latest instruct chat coder code codex reasoner thinking vision large medium small tiny base plus ultra
+  exp experimental it gguf openai anthropic google meta mistralai xai ai microsoft amazon cohere
+  moonshotai zai nvidia bedrock vertex us eu global oss free nitro online high low compatible`.split(
+    /\s+/,
+  ),
+);
+
+function modelName(value: unknown) {
+  return typeof value === 'string' &&
+    value.length <= 120 &&
+    /^[A-Za-z0-9][\w.:/@-]*$/.test(value) &&
+    (value.toLowerCase().match(/[a-z]+/g) ?? []).every(
+      (word) => word.length <= 2 || modelWords.has(word),
+    )
+    ? value
+    : null;
+}
+
+function clip(value: unknown) {
+  const encoded = typeof value === 'string' ? value : JSON.stringify(value ?? null);
+  return encoded.length <= 6000
+    ? value
+    : { preview: encoded.slice(0, 4000), tail: encoded.slice(-1500), truncated: true };
+}
+
 function tool(value: unknown) {
   const name = typeof value === 'string' ? value.replaceAll(' ', '_') : '';
+  if (name.startsWith('mcp__')) return 'mcp';
   if (['read', 'bash', 'edit', 'write', 'find', 'ls', 'grep'].includes(name)) return 'workspace';
   if (['web_search', 'fetch_content', 'get_search_content', 'code_search'].includes(name))
     return 'web';
@@ -116,6 +207,10 @@ export async function buildFeedbackReport(options: FeedbackReportOptions) {
   } finally {
     clearTimeout(profileTimer);
   }
+  const modelId = (value: unknown) => {
+    const id = modelName(value);
+    return id && redact?.text(id) === id ? id : null;
+  };
   const recent = [options.ownerId, new Date(now - 86_400_000), new Date(now)];
   const aliases = new Map<string, Map<unknown, string>>();
   function alias(kind: string, value: unknown) {
@@ -264,37 +359,9 @@ export async function buildFeedbackReport(options: FeedbackReportOptions) {
           ...references(row),
           provider: choice(details.provider, providers, 'other'),
           modelFamily: modelFamily(details.model),
-          category: choice(details.category, [
-            'agent',
-            'memory',
-            'review',
-            'tasks',
-            'analytics',
-            'task_classification',
-          ]),
-          operation: choice(details.operation, [
-            'request',
-            'compaction',
-            'cache_warm',
-            'auxiliary',
-            'models',
-            'attention',
-            'review',
-            'access',
-            'trust',
-            'read_only',
-            'approval_reply',
-            'reflect',
-            'style',
-            'plan',
-            'classify',
-            'vision',
-            'recall',
-            'remember',
-            'skill',
-            'transcribe',
-            'synthesize',
-          ]),
+          model: modelId(details.model),
+          category: choice(details.category, usageCategories),
+          operation: choice(details.operation, usageOperations),
           status: choice(details.status, outcomes),
           durationMs: amount(details.durationMs),
           inputTokens: amount(details.inputTokens),
@@ -383,9 +450,25 @@ export async function buildFeedbackReport(options: FeedbackReportOptions) {
     ),
     collect(
       'modelConnections',
-      `SELECT provider,method,status,managed,created_at FROM model_connections
-       WHERE owner_id=$1 ORDER BY created_at DESC,id DESC`,
+      `SELECT id,provider,method,status,managed,created_at,
+       to_jsonb(model_connections)->'models' AS models,
+       to_jsonb(model_connections)->'request_failures' AS request_failures
+       FROM model_connections WHERE owner_id=$1 ORDER BY created_at DESC,id DESC`,
       (row) => ({
+        id: alias('modelConnection', row.id),
+        models: (Array.isArray(row.models) ? row.models : []).slice(0, 30).map((item) => {
+          const model = record(item);
+          return {
+            id: modelId(model.id),
+            contextWindow: amount(model.contextWindow),
+            images: model.images === true,
+            efforts: Array.isArray(model.efforts)
+              ? model.efforts.map((effort) => choice(effort, efforts))
+              : [],
+          };
+        }),
+        modelCount: Array.isArray(row.models) ? row.models.length : null,
+        requestFailures: Object.keys(record(row.request_failures)).length,
         provider: choice(row.provider, providers, 'other'),
         method: choice(row.method, ['api_key', 'subscription', 'oauth']),
         status: choice(row.status, ['connected', 'reconnect', 'loading']),
@@ -453,37 +536,233 @@ export async function buildFeedbackReport(options: FeedbackReportOptions) {
         deliveryAgeMs: age(row.updated_at),
       }),
     ),
+    collect(
+      'modelSettings',
+      `SELECT selection,to_jsonb(model_settings)->'routes' AS routes FROM model_settings WHERE owner_id=$1`,
+      (row) => {
+        const selected = (value: unknown) => {
+          if (value === 'light') return 'light';
+          const selection = record(value);
+          return typeof selection.modelId === 'string'
+            ? {
+                connection: alias('modelConnection', selection.connectionId),
+                model: modelId(selection.modelId),
+                effort: choice(selection.effort, efforts),
+              }
+            : null;
+        };
+        const routes = record(row.routes);
+        return {
+          selection: selected(row.selection),
+          schedule: selected(routes.schedule),
+          background: selected(routes.background),
+        };
+      },
+      [options.ownerId],
+    ),
+    collect(
+      'modelUsageSummary',
+      `SELECT u.details->>'provider' AS provider,u.details->>'model' AS model,u.details->>'category' AS category,
+       u.details->>'operation' AS operation,u.details->>'status' AS status,count(*)::int AS requests,
+       sum(u.cost_usd)::float8 AS cost_usd,max(u.created_at) AS created_at
+       FROM model_usage u WHERE u.owner_id=$1 AND u.created_at BETWEEN $2 AND $3
+       GROUP BY 1,2,3,4,5 ORDER BY max(u.created_at) DESC`,
+      (row) => ({
+        provider: choice(row.provider, providers, 'other'),
+        model: modelId(row.model),
+        category: choice(row.category, usageCategories),
+        operation: choice(row.operation, usageOperations),
+        status: choice(row.status, outcomes),
+        requests: amount(row.requests),
+        costUsd: cost(row.cost_usd),
+        lastAgeMs: age(row.created_at),
+      }),
+      recent,
+      100,
+    ),
+    collect(
+      'settings',
+      `SELECT p.time_zone,p.locale,p.hour_cycle,p.quiet_hours_enabled,p.quiet_start,p.quiet_end,
+       to_jsonb(p)->'proactive_paused' AS proactive_paused,
+       to_jsonb(p)->'local_files_enabled' AS local_files_enabled,
+       to_jsonb(p)->>'speech_reply' AS speech_reply,
+       p.notification_rule<>'' AS notification_rule_set,
+       COALESCE(to_jsonb(p)->>'rules','')<>'' AS rules_set,
+       l.monthly_usd,to_jsonb(l)->'task_usd' AS task_usd,to_jsonb(l)->'preparation_usd' AS preparation_usd
+       FROM preferences p LEFT JOIN spending_limits l ON l.owner_id=p.owner_id WHERE p.owner_id=$1`,
+      (row) => ({
+        timeZone:
+          typeof row.time_zone === 'string' && /^[A-Za-z0-9_+/-]{1,64}$/.test(row.time_zone)
+            ? row.time_zone
+            : null,
+        locale:
+          typeof row.locale === 'string' && /^[A-Za-z0-9-]{1,35}$/.test(row.locale)
+            ? row.locale
+            : null,
+        hourCycle: choice(row.hour_cycle, ['auto', 'h12', 'h23']),
+        quietHours: row.quiet_hours_enabled === true,
+        quietStart: /^\d{2}:\d{2}$/.test(String(row.quiet_start)) ? row.quiet_start : null,
+        quietEnd: /^\d{2}:\d{2}$/.test(String(row.quiet_end)) ? row.quiet_end : null,
+        proactivePaused: row.proactive_paused === true,
+        localFiles: row.local_files_enabled === true,
+        speechReply: choice(row.speech_reply, ['auto', 'voice', 'always', 'never']),
+        notificationRuleSet: row.notification_rule_set === true,
+        rulesSet: row.rules_set === true,
+        monthlyLimitUsd: cost(row.monthly_usd),
+        taskCheckInUsd: cost(row.task_usd),
+        preparationAllowanceUsd: cost(row.preparation_usd),
+      }),
+      [options.ownerId],
+    ),
+    collect(
+      'channelSettings',
+      `SELECT provider,enabled,summary,updated_at FROM channel_settings WHERE owner_id=$1 ORDER BY provider`,
+      (row) => {
+        const summary = record(row.summary);
+        return {
+          provider: choice(row.provider, channels, 'other'),
+          enabled: row.enabled === true,
+          managed: summary.managed === true,
+          mode: choice(summary.mode, ['polling', 'webhook', 'linked']),
+          linkMode: choice(summary.linkMode, ['bot', 'self-chat']),
+          connectionState: choice(summary.connectionState, [
+            'connecting',
+            'awaiting_scan',
+            'connected',
+            'disconnected',
+            'logged_out',
+            'expired',
+            'failed',
+          ]),
+          webhookStatus: choice(summary.webhookStatus, [
+            'registered',
+            'manual_setup',
+            'registration_pending',
+          ]),
+          updatedAgeMs: age(row.updated_at),
+        };
+      },
+      [options.ownerId],
+    ),
   ]);
-  let logCoverage: FeedbackLogSnapshot['coverage'] = {
-    hours: 24,
-    dropped: 0,
-    truncated: false,
-    unavailable: true,
-  };
-  lists.logs = [];
-  if (redact && options.logs) {
-    try {
-      const snapshot = await options.logs();
-      logCoverage = snapshot.coverage;
-      lists.logs = snapshot.entries
-        .filter((entry) => entry.at <= now && entry.at >= now - 86_400_000)
-        .map((entry) => ({
-          event: entry.event,
-          ageMs: amount(now - entry.at),
-          turnId: alias('t', entry.scope.turnId),
-          sessionId: alias('s', entry.scope.sessionId),
-          runId: alias('r', entry.scope.runId),
-          parentRunId: alias('r', entry.scope.parentRunId),
-          callId: alias('c', entry.scope.callId),
-          data: redact!.value(entry.data),
-        }));
-    } catch {}
+  let database: string | null = null;
+  try {
+    const result = await options.pool.query<{ version: string }>(
+      `SELECT current_setting('server_version') AS version`,
+    );
+    database = String(result.rows[0]?.version ?? '').slice(0, 40) || null;
+  } catch {}
+  const unavailableCoverage = { hours: 24, dropped: 0, truncated: false, unavailable: true };
+  async function journal(name: string, read?: () => Promise<FeedbackLogSnapshot>) {
+    let coverage: FeedbackLogSnapshot['coverage'] = unavailableCoverage;
+    let entries: FeedbackLogSnapshot['entries'] = [];
+    if (redact && read) {
+      try {
+        const snapshot = await read();
+        coverage = snapshot.coverage;
+        entries = snapshot.entries.filter(
+          (entry) => entry.at <= now && entry.at >= now - 86_400_000,
+        );
+      } catch {}
+    }
+    sections[name] = {
+      status: coverage.unavailable ? 'unavailable' : 'collected',
+      scope: 'recent',
+      rows: entries.length,
+      truncated: coverage.truncated || coverage.dropped > 0,
+    };
+    return { coverage, entries };
   }
-  sections.logs = {
-    status: logCoverage.unavailable ? 'unavailable' : 'collected',
+  const entryRow = (entry: FeedbackLogSnapshot['entries'][number]) => ({
+    event: entry.event,
+    ageMs: amount(now - entry.at),
+    turnId: alias('t', entry.scope.turnId),
+    sessionId: alias('s', entry.scope.sessionId),
+    runId: alias('r', entry.scope.runId),
+    parentRunId: alias('r', entry.scope.parentRunId),
+    callId: alias('c', entry.scope.callId),
+  });
+  const recorded = await journal('logs', options.logs);
+  const failed = await journal('failures', options.failures);
+  const logCoverage = recorded.coverage;
+  lists.logs = recorded.entries
+    .filter((entry) => entry.event !== 'failure')
+    .map((entry) => {
+      const data = record(redact!.value(entry.data));
+      return {
+        ...entryRow(entry),
+        data: entry.event === 'tool_end' ? { ...data, output: clip(data.output) } : data,
+      };
+    });
+  const repeated = new Map<string, Row>();
+  for (const entry of [
+    ...recorded.entries.filter((entry) => entry.event === 'failure'),
+    ...failed.entries,
+  ].sort((a, b) => a.at - b.at)) {
+    const data = record(redact!.value(entry.data));
+    const error = record(data.error);
+    const key = JSON.stringify([
+      data.event,
+      error.name,
+      error.message,
+      error.code,
+      error.status,
+      record(data.context).reason,
+    ]);
+    const previous = repeated.get(key);
+    repeated.delete(key);
+    repeated.set(key, {
+      ...entryRow(entry),
+      count:
+        ((previous?.count as number) ?? 0) + Math.max(1, amount(record(data.context).count) ?? 1),
+      firstAgeMs: previous?.firstAgeMs ?? amount(now - entry.at),
+      data,
+    });
+  }
+  lists.failures = [...repeated.values()].slice(-150);
+  sections.failures.rows = lists.failures.length;
+  sections.failures.truncated ||= repeated.size > lists.failures.length;
+  lists.startupLog = [];
+  let startupLog: 'collected' | 'unavailable' = 'unavailable';
+  let startupTruncated = false;
+  if (redact && options.dataRoot) {
+    try {
+      const handle = await open(
+        join(options.dataRoot, 'logs', 'startup.log'),
+        constants.O_RDONLY | constants.O_NOFOLLOW,
+      );
+      try {
+        const stat = await handle.stat();
+        if (!stat.isFile() || stat.nlink !== 1) throw new Error('Unsafe startup log.');
+        const { size } = stat;
+        const bytes = Buffer.alloc(Math.min(size, 48_000));
+        await handle.read(bytes, 0, bytes.length, size - bytes.length);
+        const lines = bytes
+          .toString('utf8')
+          .split('\n')
+          .slice(size > bytes.length ? 1 : 0)
+          .filter(Boolean);
+        startupTruncated = size > bytes.length || lines.length > 200;
+        lists.startupLog = lines.slice(-200).map((line) => {
+          const stamp = /^(\d{4}-\d{2}-\d{2}T[\d:.]+Z) /.exec(line);
+          return {
+            ageMs: stamp ? amount(now - Date.parse(stamp[1])) : null,
+            line: redact!.text(line.slice(stamp?.[0].length ?? 0)).slice(0, 4000),
+          };
+        });
+        startupLog = 'collected';
+      } finally {
+        await handle.close();
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') startupLog = 'collected';
+    }
+  }
+  sections.startupLog = {
+    status: startupLog,
     scope: 'recent',
-    rows: lists.logs.length,
-    truncated: logCoverage.truncated || logCoverage.dropped > 0,
+    rows: lists.startupLog.length,
+    truncated: startupTruncated,
   };
   lists.clientErrors = [];
   const errorsAvailable = options.errorsAvailable ?? options.errors !== undefined;
@@ -499,14 +778,40 @@ export async function buildFeedbackReport(options: FeedbackReportOptions) {
     rows: lists.clientErrors.length,
     truncated: false,
   };
+  const environment = options.environment ?? process.env;
+  const bounded = (value: unknown, pattern: RegExp) =>
+    typeof value === 'string' && pattern.test(value) ? value : null;
+  const megabytes = (value: number) => Math.round(value / 1_048_576);
   const report = {
     format: 'nod-feedback-report-v3',
+    revision: 2,
     purpose: 'support-debugging-and-product-improvement',
+    generatedAt: new Date(now).toISOString(),
     ...(options.context ? { environment: feedbackTechnicalContext(options.context) } : {}),
+    system: {
+      os: bounded(os.type(), /^[\w .-]{1,40}$/),
+      osRelease: bounded(os.release(), /^[\w .+~-]{1,80}$/),
+      osVersion: bounded(environment.NOD_OS_VERSION, /^[\w .+~-]{1,80}$/),
+      arch: bounded(os.arch(), /^[\w-]{1,20}$/),
+      cpus: os.cpus().length,
+      memoryMb: megabytes(os.totalmem()),
+      freeMemoryMb: megabytes(os.freemem()),
+      processMemoryMb: megabytes(process.memoryUsage.rss()),
+      node: bounded(process.versions.node, /^[\w.+-]{1,40}$/),
+      electron: bounded(environment.NOD_ELECTRON_VERSION, /^[\w.+-]{1,40}$/),
+      database,
+      container: existsSync('/.dockerenv'),
+      uptimeSeconds: Math.round(process.uptime()),
+      timeZone: bounded(Intl.DateTimeFormat().resolvedOptions().timeZone, /^[\w+/-]{1,64}$/),
+      utcOffsetMinutes: -new Date(now).getTimezoneOffset(),
+    },
     runtime: {
       provider: choice(options.provider, providers, 'other'),
       modelFamily: modelFamily(options.model),
+      model: modelId(options.model),
+      trustModel: choice(options.trustModel, ['selected', 'llm', 'decision']),
     },
+    ...(options.client ? { client: options.client } : {}),
     coverage: {
       hours: 24,
       contentIncluded: Boolean(redact),
@@ -524,9 +829,12 @@ export async function buildFeedbackReport(options: FeedbackReportOptions) {
   };
   let encoded = JSON.stringify(report, null, 2);
   while (Buffer.byteLength(encoded) > feedbackLimits.reportBytes) {
-    const largest = Object.entries(lists)
-      .filter(([, rows]) => rows.length)
-      .sort((a, b) => JSON.stringify(b[1]).length - JSON.stringify(a[1]).length)[0];
+    const filled = Object.entries(lists).filter(([, rows]) => rows.length);
+    const largest = (
+      filled.some(([name]) => !protectedLists.includes(name))
+        ? filled.filter(([name]) => !protectedLists.includes(name))
+        : filled
+    ).sort((a, b) => JSON.stringify(b[1]).length - JSON.stringify(a[1]).length)[0];
     if (!largest) throw new Error('The diagnostic report is too large.');
     largest[1].shift();
     sections[largest[0]].truncated = true;

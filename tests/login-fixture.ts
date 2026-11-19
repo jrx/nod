@@ -148,6 +148,10 @@ export function stagedLoginBrowser() {
       });
       inspectors.set(id, inspector);
     }
+    if (command[0] === 'is' && command[1] === 'enabled') {
+      const node = page.nodes(command[2])[0];
+      data = { enabled: Boolean(node && !node.matches(':disabled')) };
+    }
     if (command[0] === 'focus')
       page.nodes(command[1])[0]?.dispatchEvent(new page.dom.window.Event('focus'));
     if (command[0] === 'focus') (page.nodes(command[1])[0] as HTMLElement | undefined)?.focus();

@@ -1,10 +1,22 @@
+import assert from 'node:assert/strict';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import {
+  browserNamespace,
+  createContainerBrowserComputer,
+  type BrowserBridgeLauncher,
+} from '../src/providers/container-browser/index.ts';
+import { runBrowserBridge } from '../src/providers/container-browser/bridge.ts';
+import { startContainerBrowserWorker } from '../src/providers/container-browser/worker.ts';
+import { fakeComputer } from './runtime-fixtures.ts';
 import { createHash } from 'node:crypto';
-import { stat } from 'node:fs/promises';
+import { stat, mkdtemp, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import type { Socket } from 'node:net';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
 import { runInNewContext } from 'node:vm';
-import { BrowserActionError } from '../src/ports/computer.ts';
+import { BrowserActionError, type Computer } from '../src/ports/computer.ts';
 import { createAgentBrowserComputer } from '../src/providers/agent-browser/index.ts';
 import {
   DaemonCommandError,
@@ -190,7 +202,13 @@ export function createBrowserFixture(options: Options, preferRealSocket = false)
                                                               String(command.action),
                                                               String(command.selector),
                                                             ]
-                                                          : null;
+                                                          : command.action === 'isenabled'
+                                                            ? [
+                                                                'is',
+                                                                'enabled',
+                                                                String(command.selector),
+                                                              ]
+                                                            : null;
       if (!args) throw new Error('Unsupported synthetic browser action.');
       const result = await run(session.executable, [...session.args, ...args], {
         ...session.options,
@@ -397,6 +415,139 @@ export async function fakeDevtools(model: DevtoolsModel) {
     async close() {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+function workerComputer() {
+  const calls: Array<{ method: string; input?: unknown }> = [];
+  let act: Computer['act'] = async (_id, input) => {
+    return {
+      text: input.text ?? 'Synthetic page',
+      url: input.url ?? 'https://example.com/',
+    };
+  };
+  const computer: Computer = {
+    ...fakeComputer(),
+    screenStatus: () => ({ state: 'live', capturedAt: '2026-09-25T12:00:00.000Z' }),
+    act: (id, input, signal) => {
+      calls.push({ method: 'act', input });
+      return act(id, input, signal);
+    },
+    screenshot: async () => Buffer.from('masked synthetic image'),
+    injectCredentials: async (input) => {
+      calls.push({ method: 'injectCredentials', input });
+      return { status: 'submitted' };
+    },
+    currentPage: async () => {
+      calls.push({ method: 'currentPage' });
+      return { origin: 'https://example.com', url: 'https://example.com/login' };
+    },
+    bindProfile: async (_id, profileId) => {
+      calls.push({ method: 'bindProfile', input: profileId });
+    },
+    hold: async () => {},
+    close: async () => {
+      calls.push({ method: 'close' });
+    },
+    clear: async (id) => {
+      calls.push({ method: 'clear', input: id });
+    },
+    discard: async (id) => {
+      calls.push({ method: 'discard', input: id });
+    },
+    fillCard: async (input) => {
+      calls.push({ method: 'fillCard', input });
+    },
+    cardDestinations: async (id, fields) => {
+      calls.push({ method: 'cardDestinations', input: { id, fields } });
+      return { document: 'loader-1', destinations: { number: 'https://pay.fixture.test' } };
+    },
+    checkoutImage: async (id) => {
+      calls.push({ method: 'checkoutImage', input: id });
+      return new Uint8Array([255, 216, 255]);
+    },
+    dispose: async () => {
+      calls.push({ method: 'dispose' });
+    },
+  };
+  return {
+    computer,
+    calls,
+    setAct(value: Computer['act']) {
+      act = value;
+    },
+  };
+}
+
+export async function createBrowserWorkerFixture(
+  control: {
+    beforeFirstBridge?: Promise<void>;
+    computer?: Computer | (() => Computer);
+  } = {},
+) {
+  const root = await mkdtemp('/tmp/sk-browser-');
+  const socketPath = join(root, 'control.sock');
+  const instances = new Map<string, ReturnType<typeof workerComputer>>();
+  const worker = await startContainerBrowserWorker({
+    socketPath,
+    dataRoot: root,
+    createComputer: async (path) => {
+      if (typeof control.computer === 'function') return control.computer();
+      if (control.computer) return control.computer;
+      const value = workerComputer();
+      instances.set(path, value);
+      return value.computer;
+    },
+  });
+  const launches: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv | undefined }> =
+    [];
+  const bridges: ChildProcessWithoutNullStreams[] = [];
+  const launch: BrowserBridgeLauncher = (command, args, options) => {
+    launches.push({ command, args, env: options.env });
+    const process = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      kill() {
+        this.stdin.destroy();
+        return true;
+      },
+    });
+    void Promise.resolve(launches.length === 1 ? control.beforeFirstBridge : undefined)
+      .then(() => runBrowserBridge({ input: process.stdin, output: process.stdout, socketPath }))
+      .then((code) => {
+        process.stdout.end();
+        process.stderr.end();
+        process.emit('close', code);
+      });
+    const bridge = process as unknown as ChildProcessWithoutNullStreams;
+    bridges.push(bridge);
+    return bridge;
+  };
+  const clients: Computer[] = [];
+  function client(dataRoot: string, options: { timeoutMs?: number; drainTimeoutMs?: number } = {}) {
+    const value = createContainerBrowserComputer({ dataRoot, spawn: launch, ...options });
+    clients.push(value);
+    return value;
+  }
+  return {
+    root,
+    socketPath,
+    worker,
+    launches,
+    bridges,
+    instances,
+    client,
+    instance(dataRoot: string) {
+      const value = instances.get(join(root, browserNamespace(dataRoot)));
+      assert.ok(value);
+      return value;
+    },
+    async close() {
+      await Promise.allSettled(clients.map((client) => client.dispose()));
+      await worker.close();
+      await rm(root, { recursive: true, force: true });
     },
   };
 }

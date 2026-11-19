@@ -17,7 +17,7 @@ Choose **Connect to a server** on first launch. After setup, choose **Replay onb
 
 Nod checks the connection before saving it. The operating system's secure storage protects the token. The app restarts into the remote assistant without starting its local runtime. Loopback HTTP addresses work for an SSH tunnel.
 
-For a private certificate authority (CA), first trust its certificate in your operating system's certificate store. Restart Nod after you change that store. Both the desktop app and its local engine add system CAs to Node's default certificates at startup while keeping bundled certificates. The local engine does not inherit `NODE_EXTRA_CA_CERTS` from your shell.
+For a private certificate authority (CA), first trust its certificate in your operating system's certificate store. Restart Nod after you change that store. Both the desktop app and its local engine add system CAs to Node's default certificates at startup while keeping bundled certificates. They skip system certificates that have already expired, so an old copy in the Windows store can't replace the valid chain a website sends. The local engine does not inherit `NODE_EXTRA_CA_CERTS` from your shell.
 
 This applies to Node HTTPS requests in the desktop app and local engine. It includes server checks, Composio proxy calls, later API calls, update checks, and analytics. Certificate and hostname checks stay enabled. This uses Node's certificate verification rules, which can differ from the app window's Chromium rules. An operating system distrust setting does not remove a certificate that Node trusts from another source.
 
@@ -185,14 +185,18 @@ The profile holds the only key to the private computer's database. When Nod star
 Your installation is the VM disks, database, workspace files, browser profiles, Nod sessions and encrypted settings together. Copying only the database isn't a backup.
 
 :::caution[No tested backup yet]
-There's no supported backup, restore or downgrade. Don't delete the profile, VM or runtime cache to fix a problem. Retry first, then [send feedback](/deploy/troubleshooting/#send-feedback-with-a-diagnostic-report).
+There's no supported backup, restore or downgrade. Don't delete the profile, VM or runtime cache to fix a problem. Retry first, then [report a bug](/deploy/troubleshooting/#report-a-bug-with-a-diagnostic-report).
 :::
 
 ## Updates
 
+Nod keeps one desktop process for its profile. A second launch notifies that process, then exits before Windows prepares another encryption key.
+
 On Linux, install the next release bundle to update the app and its runtime pack. These bundles have no update repository. Nod's own update checks are off. The rest of this section is about Mac and Windows.
 
-Nod checks for updates when it starts, every six hours while open, and after your computer wakes if a check is due. Checks continue while a downloaded update waits for restart. Public builds read published releases and download assets from GitHub. Older builds keep their embedded n8n update source until they are replaced. **Check for Updates…** stays available in the Nod menu, menu bar, or tray alongside **Restart to update**.
+Nod checks for updates when it starts, every six hours while open, and after your computer wakes if a check is due. Checks continue while a downloaded update waits for restart. On a Mac, Nod first asks macOS whether the updater is still running. If the previous Nod quit to install a newer version, Nod closes again before it opens a window, so the install can finish. If the updater is running after a plain quit, or Nod can't tell, Nod opens as usual and waits 15 minutes before its first check, because a new check deletes the downloaded update the installer is copying. Public builds read published releases and download assets from GitHub. Older builds keep their embedded n8n update source until they are replaced. **Check for Updates…** stays available in the Nod menu, menu bar, or tray alongside **Restart to update**.
+
+A failed background check retries after one minute. Further failures double the wait, up to 15 minutes. Wake retries a failed check at once. A successful check restores the six-hour interval. Background failures do not open a dialog.
 
 ```mermaid
 flowchart TD
@@ -204,7 +208,7 @@ flowchart TD
   confirm -- Later --> menu
   confirm -- Restart --> busy{{Work running?}}
   notice -- Later --> menu
-  notice -- Restart --> confirm
+  notice -- Restart --> busy
   menu -- Select --> confirm
   busy -- no --> restart[Restart]:::go
   busy -- yes --> ask[Ask you first]:::accent
@@ -215,9 +219,15 @@ Restarting stops a running reply, scheduled task or background check, and you ca
 
 Nod downloads the update ZIP on a Mac or the installer on Windows, plus any changed local runtime pack, before it offers the restart. The Mac DMG is for installation, not in-app updates. While the runtime pack or Windows installer downloads, the update item in the menu shows progress. If the Mac's local computer is running, Nod tries to load the new container images before restart. Windows still runs the installer and applies a changed WSL runtime after restart. Starting the local computer, database and browser also takes time, so a ready notice means the downloads are complete, not that launch will be instant.
 
-Newer builds show an in-app notice when the update is ready, with its version and **Restart to update** and **Later** actions. Later dismisses the notice for that version during the current app session; the menu still offers **Restart to update**. Older builds may show only the menu action. An automatic check also announces a ready update with a system notification when Nod is in the background, notifications are on and quiet hours allow it. Background checks never open a dialog. On a Mac, an update must be signed by n8n, and Nod refuses one with a lower version number, so an update feed can't roll Nod back to an older build. On Windows, the restart runs the installer in the background and opens Nod again. While Nod shuts down to install the update, its window stays open and shows **Updating Nod…** until it quits to install. If the window was closed, Nod opens it.
+Newer builds show an in-app notice when the update is ready, with its version and **Restart to update** and **Later** actions. Later dismisses the notice for that version during the current app session; the menu still offers **Restart to update**. **Restart to update** in the notice restarts without another Restart or Later dialog. The menu item and a clicked system notification ask first. Older builds may show only the menu action. An automatic check also announces a ready update with a system notification when Nod is in the background, notifications are on and quiet hours allow it. Background checks never open a dialog. On a Mac, an update must be signed by n8n, and Nod refuses one with a lower version number, so an update feed can't roll Nod back to an older build. On Windows, the restart runs the installer in the background and opens Nod again. While Nod shuts down to install the update, its window stays open and shows **Updating Nod…** until it quits to install. If the window was closed, Nod opens it. On a Mac, the updater then copies and checks the new app before it opens it, which can take a minute or two with nothing on screen. If you open Nod during that time, it closes again at once, keeps the saved window state for the new version and lets the install finish.
 
 When a newer release appears, Nod prepares it before offering restart. It reuses an already downloaded version when a check finds nothing newer. A failed release lookup keeps the downloaded update available. Once replacement staging begins, restart is available only after the new installer or app is verified. Checks and restarts cannot run together.
+
+On Windows, update downloads keep partial files across retries and app launches. Each complete file must match its size and SHA-256 hash before reuse. The installer must also pass the n8n publisher check each time Nod stages it. A stalled transfer stops after five minutes without data and keeps its saved bytes. A corrupt file is removed. Nod removes cached versions after they are installed or replaced by another update download.
+
+Choosing **Quit Nod** installs a ready update after normal shutdown. The app stays closed. On Windows, the update launcher runs the installer without opening Nod again. A quit request from an installer or uninstaller skips this automatic install, so two installers cannot run together. On a Mac, [Squirrel stages the update without a relaunch](https://github.com/Squirrel/Squirrel.Mac/blob/fffea30e4a339a7f7d69a3391314b72548d209bd/Squirrel/SQRLUpdater.m#L965-L982) and applies it after exit. **Restart to update** still installs and opens the app again. Closing a window keeps the app running.
+
+If Windows cannot start the update launcher during a normal quit, Nod records the failure and closes. The cached update stays available for another attempt after the next launch.
 
 Nod keeps its profile, credentials and container volumes. A runtime update replaces tools and images without resetting the database.
 

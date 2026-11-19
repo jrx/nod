@@ -12,4 +12,5 @@ export interface AnalyticsConfiguration {
   environment: 'development' | 'production';
   appVersion?: string;
   surveys?: boolean;
+  seenSurveys?: string[];
 }

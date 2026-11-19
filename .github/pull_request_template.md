@@ -18,4 +18,5 @@
 - [ ] New tests would catch a real regression ([test policy](https://github.com/n8n-io/nod/blob/main/AGENTS.md#tests)), or none are needed.
 - [ ] No keys, credentials, real accounts, private conversations or other people's data in code, tests, fixtures, logs or screenshots.
 - [ ] Docs are updated where setup or behaviour changed.
+- [ ] For an app connector, I ran `pnpm check:apps`, included separate provider acceptance results, and completed the [app approval requirements](https://nod.n8n.io/docs/contribute/apps/approval/).
 - [ ] Changes to approvals, the trust check, Vault, sign-in, the sandbox or owner isolation are called out in the summary.

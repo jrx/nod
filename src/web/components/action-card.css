@@ -409,3 +409,37 @@ button.choice-card-row[aria-disabled='true'] {
   background: none;
   font: inherit;
 }
+.bug-report-card-icon {
+  flex: none;
+  color: var(--text-secondary);
+}
+.bug-report-card-summary {
+  margin: 0;
+  font-size: 15px;
+  line-height: 24px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.bug-report-card-summary + .feedback-diagnostics {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--surface-subtle);
+}
+.bug-report-card-note {
+  flex: 1 1 12rem;
+  min-width: 0;
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+.action-card-footer:has(.bug-report-card-link) {
+  justify-content: space-between;
+  gap: 12px;
+}
+.bug-report-card-link {
+  color: var(--link);
+  font-size: 14px;
+  line-height: 20px;
+}

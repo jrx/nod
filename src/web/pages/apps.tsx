@@ -2,7 +2,7 @@ import { PageTitle } from '../components/page-title';
 import { useEffect, useId, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { AlertCircle, ListFilter, MessageCircle, Plus, Users, X } from '../components/icons';
-import type { AppSetupStatus, Configuration, Connection } from '../../shared/contracts';
+import type { Configuration, Connection } from '../../shared/contracts';
 import { SetupNotice } from '../components/setup-notice';
 import { ServiceLogo } from '../components/service-logo';
 import { AppConnectionDialog, type AppSignIn } from '../components/app-connection-dialog';
@@ -14,8 +14,9 @@ import { Tabs } from '../components/tabs';
 import { Tooltip } from '../components/tooltip';
 import { AppAccountManager } from '../components/app-account-manager';
 import { api, ApiError, errorMessage } from '../lib/api';
-import { connectionUrl, setupLinkHash } from '../lib/connection-url';
+import { connectionUrl, readSetup } from '../lib/connection-url';
 import { searchApps } from '../lib/app-search';
+import { navigate } from '../lib/navigation';
 import { desktopLinksAvailable, openConnection } from '../lib/desktop';
 import {
   connectionGroups,
@@ -101,6 +102,7 @@ export function Apps({
   const [visibleCount, setVisibleCount] = useState(24);
   const [error, setError] = useState('');
   const [announcement, setAnnouncement] = useState('');
+  const [connectedApp, setConnectedApp] = useState('');
   const [busy, setBusy] = useState('');
   const [signIn, setSignIn] = useState<
     AppSignIn & {
@@ -117,6 +119,7 @@ export function Apps({
   const manualMcpOrigin = useRef<HTMLButtonElement | null>(null);
   const manualMcpAnalytics = useRef<ReturnType<typeof appConnectionAnalytics> | null>(null);
   function openManualMcp(trigger: HTMLButtonElement) {
+    setConnectedApp('');
     captureAnalytics('app_connect_clicked', { entry: 'apps', result: 'opened' });
     manualMcpAnalytics.current = appConnectionAnalytics('apps');
     manualMcpOrigin.current = trigger;
@@ -181,7 +184,7 @@ export function Apps({
     actionRequest.current?.abort();
     actionRequest.current = null;
     setBusy('');
-    if (signIn?.outcome === 'connected') setAnnouncement(`${signIn.name} connected.`);
+    if (signIn?.outcome === 'connected') setConnectedApp(signIn.name);
     setSignIn(undefined);
   }
   useEffect(() => {
@@ -224,7 +227,8 @@ export function Apps({
     let checking: Promise<boolean> | undefined;
     let poll: number | undefined;
     let pairingConfirmed = signIn.pairingConfirmed === true;
-    const settle = (outcome: NonNullable<AppSignIn['outcome']>) => {
+    let failed = false;
+    const settle = (outcome: NonNullable<AppSignIn['outcome']>, error?: string) => {
       if (controller.signal.aborted) return;
       controller.abort();
       if (outcome === 'connected') signIn.report();
@@ -235,23 +239,16 @@ export function Apps({
         current?.url === url &&
         current.service === signIn.service &&
         current.attempt === signIn.attempt
-          ? { ...current, outcome }
+          ? { ...current, outcome, ...(error ? { error } : {}) }
           : current,
       );
       void refresh();
     };
     const read = async () => {
       try {
-        const hash = await setupLinkHash(url);
-        const result = await api<AppSetupStatus>('/api/apps/setup-status', {
-          method: 'POST',
-          body: JSON.stringify({ hashes: [hash], pairingUrl: url }),
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
-          cache: 'no-store',
-        });
+        const { completed, app } = await readSetup(url, controller.signal);
         if (controller.signal.aborted) return false;
-        if (!result.completed.includes(hash)) {
-          const app = result.apps.find((app) => app.hash === hash);
+        if (!completed) {
           if (app && app.available !== false) {
             if (app.pairingConfirmed === true && !pairingConfirmed) {
               pairingConfirmed = true;
@@ -266,7 +263,7 @@ export function Apps({
             }
             return false;
           }
-          settle('unavailable');
+          settle(app?.error || failed ? 'failed' : 'unavailable', app?.error);
           return true;
         }
         settle('connected');
@@ -320,13 +317,12 @@ export function Apps({
           void check();
           return;
         }
-        settle(
-          event.data.connection === 'cancelled'
-            ? 'cancelled'
-            : event.data.connection === 'expired'
-              ? 'unavailable'
-              : 'failed',
-        );
+        if (event.data.connection === 'failed') {
+          failed = true;
+          void read().then((settled) => settled || settle('failed'));
+          return;
+        }
+        settle(event.data.connection === 'cancelled' ? 'cancelled' : 'unavailable');
       };
     return () => {
       controller.abort();
@@ -369,6 +365,7 @@ export function Apps({
     );
     setError('');
     setAnnouncement('');
+    setConnectedApp('');
     const context = {
       service: connection.slug,
       name: connection.name,
@@ -460,6 +457,7 @@ export function Apps({
   }
   async function disconnect(connection: Connection) {
     if (!connection.connectionId || actionRequest.current || busy) return;
+    setConnectedApp('');
     const capture = analyticsForCurrentSession();
     const request = new AbortController();
     actionRequest.current = request;
@@ -509,13 +507,6 @@ export function Apps({
     return (
       <div className={catalogCards ? 'app-grid app-catalog-grid' : 'app-grid'}>
         {items.map(({ key, service, accounts }) => {
-          const addAccount =
-            accounts.find(
-              (account) => account.slug === service.slug && account.status !== 'not_configured',
-            ) ??
-            (service.direct ? service : undefined) ??
-            accounts.find((account) => account.status !== 'not_configured') ??
-            service;
           const usableNotion =
             service.slug === 'notion' &&
             accounts.some((account) => account.slug === 'notion' && !connectionIssue(account));
@@ -523,10 +514,6 @@ export function Apps({
             (account) =>
               !(usableNotion && account.slug === 'notion_mcp') && connectionIssue(account),
           );
-          const connectLabel =
-            service.slug === 'notion' && !usableNotion
-              ? `Connect ${service.name}`
-              : `Connect another ${service.name} account`;
           return (
             <IntegrationCard
               key={key}
@@ -546,44 +533,30 @@ export function Apps({
               }
               actions={
                 accounts.length ? (
-                  <>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className="app-manage"
-                      data-manage-service={key}
-                      data-pointer-restored={pointerRestoredService === key || undefined}
-                      aria-label={`Manage ${service.name} accounts (${accounts.length})${issue ? ', sign-in required' : ''}`}
-                      title={`${accounts.length} ${accounts.length === 1 ? 'account' : 'accounts'}${issue ? ' · Sign-in required' : ''} · Manage accounts`}
-                      onKeyDown={() => setPointerRestoredService(null)}
-                      onBlur={() => setPointerRestoredService(null)}
-                      onClick={(event) => {
-                        dialogService.current = key;
-                        manageKeyboard.current = event.detail === 0;
-                        setPointerRestoredService(null);
-                        setError('');
-                        setManageService(key);
-                      }}
-                    >
-                      <Users size={16} aria-hidden="true" />
-                      <span className="app-account-count" aria-hidden="true">
-                        {accounts.length > 99 ? '99+' : accounts.length}
-                      </span>
-                      {issue && <span className="app-account-attention" aria-hidden="true" />}
-                    </Button>
-                    {!addAccount.browserUrl && !addAccount.savedLogin && (
-                      <Button
-                        variant="outline"
-                        size="icon"
-                        aria-label={connectLabel}
-                        title={connectLabel}
-                        disabled={locked || addAccount.status === 'not_configured'}
-                        onClick={() => void connect(addAccount, 'apps', true)}
-                      >
-                        <Plus size={16} aria-hidden="true" />
-                      </Button>
-                    )}
-                  </>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="app-manage"
+                    data-manage-service={key}
+                    data-pointer-restored={pointerRestoredService === key || undefined}
+                    aria-label={`Manage ${service.name} accounts (${accounts.length})${issue ? ', sign-in required' : ''}`}
+                    title={`${accounts.length} ${accounts.length === 1 ? 'account' : 'accounts'}${issue ? ' · Sign-in required' : ''} · Manage accounts`}
+                    onKeyDown={() => setPointerRestoredService(null)}
+                    onBlur={() => setPointerRestoredService(null)}
+                    onClick={(event) => {
+                      dialogService.current = key;
+                      manageKeyboard.current = event.detail === 0;
+                      setPointerRestoredService(null);
+                      setError('');
+                      setManageService(key);
+                    }}
+                  >
+                    <Users size={16} aria-hidden="true" />
+                    <span className="app-account-count" aria-hidden="true">
+                      {accounts.length > 99 ? '99+' : accounts.length}
+                    </span>
+                    {issue && <span className="app-account-attention" aria-hidden="true" />}
+                  </Button>
                 ) : (
                   <Button
                     variant="outline"
@@ -623,6 +596,23 @@ export function Apps({
         </Button>
       </header>
       {configuration && <SetupNotice configuration={configuration} />}
+      {connectedApp && (
+        <Notice kind="success" onDismiss={() => setConnectedApp('')}>
+          {connectedApp} connected.
+          <div className="notice-actions">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                captureAnalytics('app_connection_chat_requested');
+                navigate('/');
+              }}
+            >
+              Open chat
+            </Button>
+          </div>
+        </Notice>
+      )}
       {error && <Notice onDismiss={() => setError('')}>{error}</Notice>}
       {loadError && (
         <Notice>
@@ -902,7 +892,7 @@ export function Apps({
           onConnected={(name) => {
             window.history.replaceState(null, '', '/apps');
             setDiscoveryId(null);
-            setAnnouncement(`${name} connected.`);
+            setConnectedApp(name);
             void refresh();
             void refreshCatalog();
           }}

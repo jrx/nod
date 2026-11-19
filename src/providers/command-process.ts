@@ -5,6 +5,6 @@ export interface CommandProcess {
   stdout: Readable;
   stderr: Readable;
   on(event: 'error', listener: (error: Error) => void): this;
-  on(event: 'close', listener: (code: number | null) => void): this;
+  on(event: 'close', listener: (code: number | null, signal?: NodeJS.Signals | null) => void): this;
   kill(signal?: NodeJS.Signals): boolean;
 }

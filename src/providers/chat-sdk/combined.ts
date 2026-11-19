@@ -35,6 +35,9 @@ export function combineMessagingTransports(
       if (!transport) throw new Error('Channel is not configured.');
       return transport.post(input);
     },
+    canDeliverLiteral(input) {
+      return forChannel(input.channelId)?.canDeliverLiteral?.(input) ?? false;
+    },
     async react(input) {
       return (await forChannel(input.channelId)?.react?.(input)) ?? 'unsupported';
     },

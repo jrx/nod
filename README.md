@@ -277,6 +277,8 @@ See [Install from source](https://nod.n8n.io/docs/get-started/install-from-sourc
 
 <p align="center">Nod is open source, from the team behind <a href="https://n8n.io">n8n</a>.<br />Read <a href="CONTRIBUTING.md">CONTRIBUTING</a> to send your first change.</p>
 
+<p align="center"><a href="https://nod.n8n.io/docs/contribute/apps/">Creating your own connectors</a><br />Use MCP, an HTTP API, or a CLI. Add an app folder, run the required tests, and submit a PR.<br />The guide includes an AI builder skill, approval requirements, and shareable app pages.<br /><a href="https://nod.n8n.io/docs/connect/community-apps/">Browse custom connections</a></p>
+
 <p align="center">
   <a href="https://github.com/n8n-io/nod/issues/new/choose">Report a bug</a> · <a href="https://github.com/n8n-io/nod/discussions">Share an idea</a> · <a href="https://discord.gg/n8n">Discord</a> · <a href="https://community.n8n.io/c/n8n-labs/48">Forum</a> · <a href="SECURITY.md">Security</a>
 </p>

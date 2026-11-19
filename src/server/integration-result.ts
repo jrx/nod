@@ -58,7 +58,7 @@ export type Mail = { from: string; subject: string; text: string };
 export type MailCheck = (
   emails: Mail[],
   signal?: AbortSignal,
-) => Promise<Array<boolean | undefined>>;
+) => Promise<Array<boolean | string | undefined>>;
 
 const mailCheckChars = 8000;
 
@@ -113,7 +113,9 @@ export async function privateEmailResult(
   signal?: AbortSignal,
 ): Promise<unknown> {
   const emails: Mail[] = [];
-  type Render = (checks: Array<boolean | undefined>) => unknown;
+  type Checks = Awaited<ReturnType<MailCheck>>;
+  const withheld = new Map<string, number>();
+  type Render = (checks: Checks) => unknown;
   function prepare(value: unknown): Render {
     if (typeof value === 'string' && /^[\s]*[\[{]/.test(value)) {
       let parsed: unknown;
@@ -183,6 +185,10 @@ export async function privateEmailResult(
         const metadata = headers
           .filter((entry) => emailMetadataHeaders.has(entry.name.toLowerCase()))
           .map(({ name, value }) => ({ name, value }));
+        if (checks[index] !== true) {
+          const reason = String(checks[index] ?? 'the check gave no answer').slice(0, 300);
+          withheld.set(reason, (withheld.get(reason) ?? 0) + 1);
+        }
         return {
           ...safe,
           ...(metadata.length && { headers: metadata }),
@@ -193,8 +199,25 @@ export async function privateEmailResult(
     };
   }
   const render = prepare(value);
-  const checks = emails.length ? await check(emails, signal).catch(() => []) : [];
-  return render(checks);
+  const checks = emails.length
+    ? await check(emails, signal).catch((error: unknown) =>
+        emails.map(() => (error instanceof Error ? error.message : String(error))),
+      )
+    : [];
+  const result = render(checks);
+  if (!withheld.size) return result;
+  const count = [...withheld.values()].reduce((sum, value) => sum + value, 0);
+  const contentWithheld = {
+    emails: count,
+    message: `The read succeeded, but Nod withheld the subject and content of ${count} ${count === 1 ? 'email' : 'emails'} because it could not check whether they are for signing in: ${[
+      ...withheld,
+    ]
+      .map(([reason, emails]) => `${reason} (${emails})`)
+      .join('; ')}. Their content is unknown, not empty. Tell the owner what was withheld and why.`,
+  };
+  return result && typeof result === 'object' && !Array.isArray(result)
+    ? Object.assign({ contentWithheld }, result, { contentWithheld })
+    : { contentWithheld, result };
 }
 
 export async function inlineAppResult(

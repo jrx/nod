@@ -44,7 +44,7 @@ flowchart LR
 - **The browser.** Nod's browser runs in its own container. The workspace can't read its saved sign-ins.
 
 :::caution
-The workspace can reach the internet. Code that Nod runs there can download files and call websites.
+The workspace can reach the internet. Code that Nod runs there can download files and call websites. [Trust checks each command](/trust/approvals/#workspace-commands) before it runs. A command that needs approval is refused. This model check can make mistakes and is not a network firewall.
 :::
 
 ## Watch Nod's commands
@@ -88,7 +88,7 @@ The panel remembers reading state for up to eight recently viewed files, with a 
 
 - **Use in message** adds an existing file to your draft.
 - **Copy image** copies raster image data where the clipboard supports it. **Download** keeps the original file format.
-- In the desktop app, drag a file card, image, or preview file icon to a folder to copy the file. **Save to Downloads** shows **Open** and **Show in folder** after the save completes. The file menu uses the system menu.
+- In the desktop app, drag a file card, image, or preview file icon to a folder to copy the file. **Save to Downloads** shows **Open** and **Show in folder** after the save completes. The file menu uses the system menu. Right-click a file card, a preview in chat, or an image, video or PDF in the panel to show the file menu. Links, fields and selected text keep their own menu.
 
 Desktop file actions prepare private copies in the system temporary folder, up to eight files. They're removed when the cache needs room or the app quits. A forced stop can leave one behind. Saving creates a separate file in Downloads.
 
@@ -109,7 +109,7 @@ HTML files run in a sandbox, apart from Nod. Their scripts work, but they can't 
 
 Previews have size limits: 4 MB for text, Markdown, HTML and spreadsheets, 25 MB for Word documents and 60 MB for presentations. Download larger files to open them.
 
-When Nod puts a full workspace file path in a link or inline code in a reply, the server checks the file and attaches it. The link opens the attachment. A missing or unavailable file prevents that reply from being saved. File paths in code blocks remain examples.
+When Nod puts a full workspace file path in a link or inline code in a reply, the server checks the file and attaches it. The link opens the attachment. A path the server can't attach, such as a folder, a missing file or a location outside this conversation's workspace, stays as plain text and the rest of the reply still arrives. File paths in code blocks remain examples.
 
 Files Nod saves along the way stay private in the workspace until it shares them. Ask for one by name if you want it. Telegram and the WhatsApp QR connection receive shared files up to 50 MB each. With the WhatsApp Cloud API, open Nod to get files. See [Telegram and WhatsApp](/use/channels/).
 

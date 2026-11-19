@@ -1,6 +1,6 @@
 ---
 title: Contribute to Nod
-description: Report a problem, set up a development copy of Nod, find your way around the code and get a change merged.
+description: Choose a contribution path, set up Nod or the docs site, and prepare a change for review.
 sidebar:
   label: Overview
   order: 1
@@ -14,14 +14,36 @@ Everyone taking part follows the [code of conduct](https://github.com/n8n-io/nod
 
 ## Ways to help
 
-| You want to                     | Do this                                                                                                                     |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| Report a bug                    | Fill in the [bug report form](https://github.com/n8n-io/nod/issues/new/choose).                                             |
-| Ask a question or share an idea | Start a thread in [Discussions](https://github.com/n8n-io/nod/discussions).                                                 |
-| Report a vulnerability          | [Report it privately](https://github.com/n8n-io/nod/security/advisories/new). Never in a public issue.                      |
-| Fix or build something          | Send a [pull request](/contribute/pull-requests/). For anything larger than a small fix, open an issue or discussion first. |
+To add an app connection, start with [Creating your own connectors](/contribute/apps/). The guide covers the format, scaffold, AI skill, required tests, and approval process.
 
-Agreeing on the approach first saves you from building something that can't merge.
+| You want to                     | Do this                                                                                                                                                                              |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Report a bug                    | Fill in the [bug report form](https://github.com/n8n-io/nod/issues/new/choose).                                                                                                      |
+| Ask a question or share an idea | Start a thread in [Discussions](https://github.com/n8n-io/nod/discussions).                                                                                                          |
+| Report a vulnerability          | [Report it privately](https://github.com/n8n-io/nod/security/advisories/new). Never in a public issue.                                                                               |
+| Improve the documentation       | Follow [Write docs](/contribute/write-docs/) to edit, preview and build the docs site without running Nod.                                                                           |
+| Fix or build something          | Send a [pull request](/contribute/pull-requests/). Use the [app guide](/contribute/apps/) for app folders. Open an issue or discussion first for other work larger than a small fix. |
+
+App-only contributions that use the supported profile follow the [app guide](/contribute/apps/). Other work larger than a small fix starts with an issue or discussion. Agreeing on the approach first saves you from building something that can't merge.
+
+## Work on documentation only
+
+You do not need to install or run the Nod app, start Docker, or connect a model to change the docs. The docs site has its own lockfile. Use Node.js 24.21.0 or newer and pnpm 10.34.5.
+
+From the repository root, install the docs dependencies and start the site:
+
+```sh title="Terminal"
+pnpm --dir docs install --frozen-lockfile
+pnpm --dir docs dev
+```
+
+Open `http://localhost:4321/docs/` in your browser. Before you open a pull request, build the site. The build checks internal links and heading anchors:
+
+```sh title="Terminal"
+pnpm --dir docs build
+```
+
+See [Write docs](/contribute/write-docs/) for the page template, house style, components and diagrams. Use the full development setup below only when your change needs the Nod application.
 
 ## Set up a development copy
 
@@ -107,6 +129,14 @@ Each arrow means "may import". Every layer may also import `src/shared`.
 | Capability evals                | `evals/`                                                                                                                               | `evals/tests/`                                                                                                   |
 
 For how a request moves through these parts, read [Architecture](/how-it-works/architecture/).
+
+### Diagnostic data that leaves Nod
+
+Diagnostic reports and the failure and startup logs behind them are redacted in the owner's Nod runtime before they are sent to the configured feedback recipient: the Nod team by default, or an operator's collector. Redaction masks recognized names, addresses, account and device identifiers, paths, links and known secrets. It can miss details, so the owner reviews the report before sending. When triage needs a detail, add a bounded technical field such as a fixed choice, count, version, error class or status code. Don't loosen a redaction rule to keep it. Add a test that a private value stays out.
+
+Analytics events carry bounded values only, with the exceptions that [Change analytics](/contribute/analytics/) lists. Conversation traces are pseudonymised, not anonymous.
+
+The report builder is `src/server/bug-report.ts` and its redactor is `src/server/feedback-redaction.ts`.
 
 ## Coding agents
 

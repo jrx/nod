@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import type { BrowserDownload, Computer } from '../../ports/computer.ts';
 import { BrowserActionError } from '../../ports/computer.ts';
 import { createAgentBrowserComputer } from '../agent-browser/index.ts';
+import { RuntimeTimeLimitError } from '../process.ts';
 import { containerBrowserOptions } from './config.ts';
 import {
   browserFrame,
@@ -87,9 +88,9 @@ async function dispatch(
       await computer.selectSignInMethod(request.threadId, request.input, signal);
       return null;
     case 'injectCredentials':
-      return computer.injectCredentials(request.input);
+      return computer.injectCredentials(request.input, signal);
     case 'fillCard':
-      await computer.fillCard(request.input);
+      await computer.fillCard(request.input, signal);
       return null;
     case 'cardDestinations':
       return computer.cardDestinations(request.threadId, request.fields);
@@ -306,7 +307,11 @@ export async function startContainerBrowserWorker(
               : error instanceof Error && 'statusCode' in error && error.statusCode === 423
                 ? 'locked'
                 : 'unavailable',
-          ...(error instanceof BrowserActionError && error.detail ? { detail: error.detail } : {}),
+          ...(error instanceof BrowserActionError && error.detail
+            ? { detail: error.detail }
+            : error instanceof RuntimeTimeLimitError
+              ? { detail: error.message }
+              : {}),
           metadata: metadata(await entry?.computer.catch(() => undefined), input),
         };
       } finally {

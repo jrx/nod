@@ -69,7 +69,7 @@ export default defineConfig({
       features: { smartPunctuation: false },
     }),
   },
-  vite: { server: { fs: { allow: ['.', '../public/fonts', '../public/logos'] } } },
+  vite: { server: { fs: { allow: ['.', '../public/fonts', '../public/logos', '../src/apps'] } } },
   integrations: [
     sitemap({
       filter: (page) => !/\/docs\/(next|open)\/$/.test(page),

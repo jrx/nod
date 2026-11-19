@@ -1,11 +1,6 @@
 import { createHash } from 'node:crypto';
 import { estimateTokens } from '@earendil-works/pi-coding-agent';
-import {
-  getCurrentSystemMessage,
-  type ImageContent,
-  type TextContent,
-  type TranscriptContext,
-} from '@earendil-works/pi-ai';
+import type { ImageContent, TextContent } from '@earendil-works/pi-ai';
 import type { WorkspaceSession } from '../../ports/computer.ts';
 import { untrustedBlock, untrustedParts } from '../../shared/untrusted.ts';
 import { writeWorkspaceFile } from './sandbox.ts';
@@ -18,10 +13,6 @@ const imageExtensions: Record<string, string> = {
   'image/gif': 'gif',
   'image/bmp': 'bmp',
 };
-
-export function contextTokens(context: Pick<TranscriptContext, 'messages'>) {
-  return context.messages.reduce((total, message) => total + estimateTokens(message), 0);
-}
 
 export function toolOutputReference(
   name: string,
@@ -105,59 +96,36 @@ export function createContextOutput(
   };
   return {
     save,
-    async fit(context: TranscriptContext, limit: number, signal?: AbortSignal) {
-      if (contextTokens(context) <= limit) return context;
-      const system = getCurrentSystemMessage(context.messages);
-      const messages = [
-        ...(system ? [system] : []),
-        ...context.messages.filter((message) => message.role !== 'system'),
-      ];
-      let tokens = contextTokens({ messages });
-      const candidates = messages.flatMap((message, index) => {
-        if (message.role === 'system') return [];
-        const content =
-          typeof message.content === 'string'
-            ? [{ type: 'text' as const, text: message.content }]
-            : message.content.filter((part) => part.type === 'text' || part.type === 'image');
-        return content.length ? [{ index, message, content, tokens: estimateTokens(message) }] : [];
-      });
-      const fixed = tokens - candidates.reduce((total, item) => total + item.tokens, 0);
-      const allowance = Math.max(128, Math.floor((limit - fixed) / Math.max(1, candidates.length)));
-      for (const item of candidates.sort((a, b) => b.tokens - a.tokens)) {
-        if (tokens <= limit) break;
-        if (item.tokens <= allowance) continue;
-        const pointer = await save(
-          item.content,
-          Math.max(0, Math.min(1000, (allowance - 128) * 3)),
-          signal,
-        );
-        const text =
-          item.message.role === 'toolResult' && !item.message.isError
-            ? toolOutputReference(item.message.toolName, item.content, pointer)
-            : item.message.role === 'user' &&
-                ownerHeader &&
-                item.content.some(
-                  (part) => part.type === 'text' && part.text.startsWith(ownerHeader),
-                )
-              ? `${ownerHeader}\n${pointer}`
-              : pointer;
-        const content = [{ type: 'text' as const, text }];
-        const next =
-          item.message.role === 'assistant'
-            ? {
-                ...item.message,
-                content: [
-                  ...item.message.content.filter((part) => part.type !== 'text'),
-                  ...content,
-                ],
-              }
-            : { ...item.message, content };
-        const size = estimateTokens(next);
-        if (size >= item.tokens) continue;
-        messages[item.index] = next;
-        tokens += size - item.tokens;
-      }
-      return { ...context, messages };
+    async bound(
+      message: Parameters<typeof estimateTokens>[0],
+      limit: number,
+      signal?: AbortSignal,
+    ) {
+      if (message.role === 'system' || !('content' in message) || estimateTokens(message) <= limit)
+        return message;
+      const content =
+        typeof message.content === 'string'
+          ? [{ type: 'text' as const, text: message.content }]
+          : message.content.filter((part) => part.type === 'text' || part.type === 'image');
+      if (!content.length) return message;
+      const pointer = await save(content, 1000, signal);
+      const text =
+        message.role === 'toolResult' && !message.isError
+          ? toolOutputReference(message.toolName, content, pointer)
+          : (message.role === 'user' || message.role === 'custom') &&
+              ownerHeader &&
+              content.some((part) => part.type === 'text' && part.text.startsWith(ownerHeader))
+            ? `${ownerHeader}\n${pointer}`
+            : pointer;
+      const replacement = [{ type: 'text' as const, text }];
+      const next =
+        message.role === 'assistant'
+          ? {
+              ...message,
+              content: [...message.content.filter((part) => part.type !== 'text'), ...replacement],
+            }
+          : { ...message, content: replacement };
+      return estimateTokens(next) < estimateTokens(message) ? next : message;
     },
   };
 }

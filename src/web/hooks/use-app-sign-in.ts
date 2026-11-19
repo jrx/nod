@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
-import type { AppSetupStatus } from '../../shared/contracts';
 import { api, ApiError, errorMessage } from '../lib/api';
 import { analyticsForCurrentSession, appConnectionAnalytics } from '../lib/analytics';
-import { cancelSetup, connectionUrl, setupLinkHash } from '../lib/connection-url';
+import { cancelSetup, connectionUrl, readSetup, setupLinkHash } from '../lib/connection-url';
 import { desktopLinksAvailable, openConnection } from '../lib/desktop';
 
 const outcomes = ['connected', 'continued', 'cancelled', 'failed', 'expired'];
@@ -76,24 +75,21 @@ export function useAppSignIn({
         )
           return;
         const selected = attempt.current;
-        if (connection === 'connected') {
+        const message = outcomeMessage(latest.current.name(selected.service), connection);
+        if (connection === 'connected' || connection === 'failed') {
           void (async () => {
             try {
-              const hash = await setupLinkHash(selected.url);
-              const result = await api<AppSetupStatus>('/api/apps/setup-status', {
-                method: 'POST',
-                body: JSON.stringify({ hashes: [hash], pairingUrl: selected.url }),
-                signal: AbortSignal.timeout(10_000),
-                cache: 'no-store',
-              });
-              if (result.completed.includes(hash)) selected.report();
+              const { completed, app } = await readSetup(selected.url);
+              if (connection === 'connected' && completed) selected.report();
+              const reason = connection === 'failed' && app?.error;
+              if (reason) setError((current) => (current === message ? reason : current));
             } catch {}
           })();
         }
         clearAttempt();
         const success = connection === 'connected' || connection === 'continued';
         setCompleted(success ? selected : undefined);
-        setError(outcomeMessage(latest.current.name(selected.service), connection));
+        setError(message);
         setPending((current) => (current === 'waiting' ? undefined : current));
         latest.current.onSettled();
       };
@@ -116,7 +112,7 @@ export function useAppSignIn({
     let failures = 0;
     let confirmed = false;
     const current = () => !controller.signal.aborted && attempt.current === currentAttempt;
-    const settle = (result: 'connected' | 'failed' | 'expired') => {
+    const settle = (result: 'connected' | 'failed' | 'expired', reason?: string) => {
       if (!current()) return;
       controller.abort();
       window.clearTimeout(poll);
@@ -125,28 +121,21 @@ export function useAppSignIn({
       if (result === 'connected') currentAttempt.report();
       setCompleted(result === 'connected' ? currentAttempt : undefined);
       setPending(undefined);
-      setError(outcomeMessage(latest.current.name(currentAttempt.service), result));
+      setError(reason || outcomeMessage(latest.current.name(currentAttempt.service), result));
       latest.current.onSettled();
     };
     const read = async () => {
       try {
-        const hash = await setupLinkHash(signInUrl);
-        const result = await api<AppSetupStatus>('/api/apps/setup-status', {
-          method: 'POST',
-          body: JSON.stringify({ hashes: [hash], pairingUrl: signInUrl }),
-          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]),
-          cache: 'no-store',
-        });
+        const { completed, app } = await readSetup(signInUrl, controller.signal);
         if (!current()) return false;
         failures = 0;
         setPollFailing(false);
-        if (result.completed.includes(hash)) {
+        if (completed) {
           settle('connected');
           return true;
         }
-        const app = result.apps.find((app) => app.hash === hash);
         if (!app || app.available === false) {
-          settle('expired');
+          settle(app?.error ? 'failed' : 'expired', app?.error);
           return true;
         }
         if (app.pairingConfirmed === true && !confirmed) {

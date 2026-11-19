@@ -6,7 +6,7 @@ import {
 } from '@earendil-works/pi-ai';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { retryAssistantCall } from '@earendil-works/pi-ai/utils/retry';
-import { createPiModelRuntime } from './models.ts';
+import { createPiModelRuntime, localModelSilenceMs } from './models.ts';
 import type { ModelAccess } from '../../ports/models.ts';
 import { lightestEffort } from '../../shared/models.ts';
 import type { MemoryCurator } from '../../ports/memory-curator.ts';
@@ -135,6 +135,7 @@ export function createPiMemoryCurator(options: {
     async curate({ task, instructions, input, images, automatic = true }, signal, report) {
       signal?.throwIfAborted();
       const bounded = task === 'classify' || task === 'attention' || task === 'check';
+      const review = signal !== undefined && (task === 'review' || task === 'access');
       if (options.resolve) loaded = undefined;
       loaded ??= load(automatic).catch((error) => {
         loaded = undefined;
@@ -173,13 +174,18 @@ export function createPiMemoryCurator(options: {
                     : {}),
                 }
               : {}),
-            signal: AbortSignal.any([
-              AbortSignal.timeout(bounded ? 10_000 : 45_000),
-              ...(signal ? [signal] : []),
-            ]),
+            signal: review
+              ? signal
+              : AbortSignal.any([
+                  AbortSignal.timeout(bounded ? 10_000 : 45_000),
+                  ...(signal ? [signal] : []),
+                ]),
             maxTokens: bounded ? 512 : 8192,
             ...(sessionId ? { sessionId } : {}),
             ...(bounded ? { maxRetries: 0, timeoutMs: 10_000 } : {}),
+            ...(review && model.provider === 'compatible'
+              ? { timeoutMs: localModelSilenceMs }
+              : {}),
             reasoning: effort === 'off' ? undefined : effort,
           });
         } finally {
@@ -238,7 +244,11 @@ export function createPiMemoryCurator(options: {
             : reply.stopReason === 'length'
               ? ' The reply stopped at the token limit.'
               : '';
-        throw new Error(`${label} Task: ${task}. Model: ${model.provider}/${model.id}.${detail}`);
+        const status = [...(reply.errorMessage ?? '').matchAll(/\(HTTP (\d{3})\)/g)].at(-1)?.[1];
+        throw Object.assign(
+          new Error(`${label} Task: ${task}. Model: ${model.provider}/${model.id}.${detail}`),
+          status ? { providerStatus: Number(status) } : {},
+        );
       }
       return json(
         reply.content.flatMap((block) => (block.type === 'text' ? [block.text] : [])).join(''),

@@ -2,6 +2,9 @@ import type { TurnRef } from './thread.ts';
 
 export const browserOf = (turn: TurnRef) => turn.browserId ?? turn.threadId;
 
+export const taskMessageSql =
+  '(t.message_id=m.id OR mt.task_id=t.id OR m.reply_to_message_id=t.message_id OR pt.task_id=t.id)';
+
 export function supersededSql(alias: string, newer: string) {
   return `EXISTS(SELECT 1 FROM turns newer WHERE newer.owner_id=${alias}.owner_id AND newer.session_id=${alias}.session_id
     AND newer.id<>${alias}.id AND ${newer})`;
@@ -21,6 +24,11 @@ export const laterSupersedingTurnSql = `EXISTS(SELECT 1 FROM turns n WHERE n.own
 export const withdrawnSql = (message: string) =>
   `EXISTS(SELECT 1 FROM turns w WHERE w.owner_id=${message}.owner_id AND w.withdrawn
     AND (w.id=${message}.turn_id OR w.message_id=${message}.id))`;
+
+export const reactionReplySql = (message: string) =>
+  `EXISTS (SELECT 1 FROM turns reaction_turn
+    WHERE reaction_turn.owner_id=${message}.owner_id AND reaction_turn.message_id=${message}.id
+      AND starts_with(reaction_turn.source_id,'reaction-reply:'))`;
 
 export function turnChainSql() {
   return `WITH RECURSIVE chain(id,next,thread_id) AS (

@@ -17,16 +17,20 @@
     "desktop:windows:prepare": "node desktop/scripts/prepare-windows-runtime.mjs",
     "desktop:windows:build": "node desktop/scripts/build-windows.mjs",
     "desktop:test": "pnpm --dir desktop test",
-    "build": "tsc --noEmit && vite build && node desktop/scripts/build-ui.mjs",
-    "check": "pnpm run lint && pnpm run format:check",
-    "lint": "tsc --noEmit && node scripts/check-architecture.mjs",
+    "build": "pnpm run typecheck && vite build && node desktop/scripts/build-ui.mjs",
+    "check": "pnpm run check:apps && pnpm run typecheck && pnpm run lint && pnpm run format:check",
+    "lint": "oxlint && node scripts/check-architecture.mjs",
+    "create:app": "tsx scripts/create-app.ts",
+    "check:apps": "tsx scripts/check-apps.ts",
     "test": "tsx --test tests/*.test.ts",
     "start": "node scripts/start.mjs --production",
     "test:integration": "node scripts/test-integration.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "eval:voice": "tsx scripts/voice-eval.ts",
-    "eval:capability": "tsx evals/src/cli.ts"
+    "eval:capability": "tsx evals/src/cli.ts",
+    "typecheck": "bun check --no-script",
+    "generate:app-schemas": "tsx scripts/app-schemas.ts"
   },
   "dependencies": {
     "@1password/sdk": "0.5.0",
@@ -101,6 +105,7 @@
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
     "@vitejs/plugin-react": "^6.1.2",
+    "bun": "1.4.4",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "emoji-picker-react": "4.22.3",
@@ -112,6 +117,7 @@
     "linkify-it": "6.1.0",
     "lucide-react": "^1.72.0",
     "mammoth": "1.13.0",
+    "oxlint": "1.94.0",
     "posthog-js": "1.438.5",
     "prettier": "3.9.10",
     "qrcode.react": "4.2.0",
@@ -127,6 +133,7 @@
     "typescript": "^6.0.3",
     "unist-util-visit": "^5.2.0",
     "vite": "^8.3.5",
+    "vitest": "5.1.0",
     "yaml": "2.9.1"
   },
   "packageManager": "pnpm@10.34.5"

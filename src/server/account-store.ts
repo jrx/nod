@@ -6,6 +6,8 @@ export interface AccountStore {
   readConsent(ownerId: string): Promise<{ enabled: boolean; revision: string }>;
   read(ownerId: string): Promise<AccountSettings>;
   activeDays(ownerId: string, limit: number): Promise<number>;
+  seenSurveys(ownerId: string): Promise<string[]>;
+  markSurveySeen(ownerId: string, survey: string): Promise<void>;
   update(
     ownerId: string,
     input: AccountUpdate,
@@ -51,7 +53,23 @@ export function createAccountStore(
       );
       ALTER TABLE account_settings ADD COLUMN IF NOT EXISTS usage_data boolean NOT NULL DEFAULT false;
       ALTER TABLE account_settings ADD COLUMN IF NOT EXISTS usage_data_revision bigint NOT NULL DEFAULT 0;
-      ALTER TABLE account_settings ADD COLUMN IF NOT EXISTS traces boolean NOT NULL DEFAULT false`);
+      ALTER TABLE account_settings ADD COLUMN IF NOT EXISTS traces boolean NOT NULL DEFAULT false;
+      ALTER TABLE account_settings ADD COLUMN IF NOT EXISTS seen_surveys text[] NOT NULL DEFAULT '{}'`);
+    },
+    async seenSurveys(ownerId) {
+      const result = await database.query<{ seen: string[] }>(
+        'SELECT seen_surveys AS seen FROM account_settings WHERE owner_id=$1',
+        [ownerId],
+      );
+      return result.rows[0]?.seen ?? [];
+    },
+    async markSurveySeen(ownerId, survey) {
+      await database.query(
+        `UPDATE account_settings
+         SET seen_surveys=(array_append(seen_surveys,$2))[greatest(cardinality(seen_surveys)-98,1):]
+         WHERE owner_id=$1 AND NOT $2=ANY(seen_surveys)`,
+        [ownerId, survey],
+      );
     },
     async readConsent(ownerId) {
       const result = await database.query<{ enabled: boolean; revision: string }>(

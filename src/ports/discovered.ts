@@ -1,4 +1,5 @@
 import type { IntegrationFile } from './integrations.ts';
+import type { AppOAuthMetadata } from '../shared/app-definitions.ts';
 export class DiscoveredSignInRequired extends Error {
   constructor() {
     super('Connect this account again.');
@@ -62,6 +63,7 @@ export interface DiscoveredOAuth {
     state: string,
     scope?: string,
     clientId?: string,
+    metadata?: AppOAuthMetadata,
   ): Promise<{ url: string; saved: DiscoveredOAuthState }>;
   finish(
     endpoint: string,

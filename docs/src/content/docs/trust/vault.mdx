@@ -11,6 +11,8 @@ import { Steps } from '@astrojs/starlight/components';
 
 While Vault is empty, it lists the ways to fill it: import passwords, add a login or a card, or sign in to a website.
 
+If you stop the task while a private form waits for its submit button, Nod stops the private entry too. This applies to saved logins, private forms and card entry. **Stopped before entry** means that no values were entered in that step. An interrupted private operation may have reached the website. Nod does not repeat it. Check the result on the website before you start a new attempt.
+
 ## Add a login
 
 <Steps>
@@ -33,9 +35,11 @@ If the website address or authenticator key is not valid, the error explains wha
 
 Select the sign-in action in chat to open the private form beside the conversation. On a narrow window it fills the chat area. Close it with **Escape** or the close button; unsent values are cleared. Reopen the action to read the current status. Closing the panel does not cancel an entry already submitted to the website. Browser handoff links still open a standalone private form.
 
-When a website offers several sign-in methods, Nod uses the method you chose or, if one saved login uniquely applies, that login with the website's password method. If the method remains ambiguous, Nod shows the choices it found on that page. Select one to continue in Nod's browser. Email, password and verification-code steps appear in the same private panel as the website asks for them. A choice opens the website's real control; it does not mean sign-in succeeded.
+When a website offers several sign-in methods, Nod uses the method you chose or, if one saved login uniquely applies, that login with the website's password method. If the method remains ambiguous, Nod shows the choices it found on that page. Each choice is one of the website's own buttons or links. A button that another website draws inside the page, such as an embedded Google button, is never a choice. Nod can still click it in its browser after the usual check. Select one to continue in Nod's browser. Email, password and verification-code steps appear in the same private panel as the website asks for them. A choice opens the website's real control; it does not mean sign-in succeeded.
 
 Each method choice expires 30 minutes after Nod issues its link. If the page or control changes, Nod refuses the old choice. A result that cannot be confirmed stays **unknown** and is never replayed automatically. Select **Check sign-in result**. If you return to chat, ask Nod to inspect the website before another private entry. A used link cannot submit again. The panel follows fresh steps from the same task and browser for up to 30 minutes; a new task needs its own private link.
+
+If a browser check stops a saved login, the error keeps its safe reason and recovery step. For example, after a page script runs, Nod must reload the page before a new private entry. The previous entry cannot run again.
 
 A private form stays available while its task waits for you. It stops accepting input once used, when Nod asks for a newer one, when Nod starts on a newer message in the same conversation, or when you select **Stop**. A scheduled run or background task has its own session, so chatting with Nod never closes its form.
 
@@ -71,6 +75,8 @@ sequenceDiagram
 
 Nod picks the account, the fields and the submit button. The server enters and submits in one private step that Nod can't watch, then Nod carries on with the live page.
 
+Some websites disable the submit button while they check a field. Nod waits up to 30 seconds for the button to become enabled. If it stays disabled, the page changes or the browser closes, Nod stops the private step. It does not activate the disabled control or repeat the submission. A failed private entry can keep the page unreadable until you reload it.
+
 | Item               | What the model receives                                                                |
 | ------------------ | -------------------------------------------------------------------------------------- |
 | Saved login        | Its name, its website and the first two characters of the username                     |
@@ -81,16 +87,23 @@ Nod picks the account, the fields and the submit button. The server enters and s
 
 The private sign-in page shows you the full username of each saved login it can open, so you can pick the right account.
 
-## Exact website origins
+## Website matching
 
-A login works only on its exact origin: the protocol, host and port. The browser checks the real origin of each field, including fields inside frames, so a lookalike page can't receive your password. For a login saved for `https://reports.example.com`:
+A login works on its saved origin: the protocol, host and port. It also works on the matching root or `www` host, with the same protocol and port. For a login saved for `https://example.com`:
 
-| Page                                 | Can use the login?           |
-| ------------------------------------ | ---------------------------- |
-| `https://reports.example.com/weekly` | Yes, the path doesn't matter |
-| `https://login.example.com`          | No, a different host         |
-| `http://reports.example.com`         | No, a different protocol     |
-| `https://reports.example.com:8443`   | No, a different port         |
+| Page                         | Can use the login?           |
+| ---------------------------- | ---------------------------- |
+| `https://example.com/weekly` | Yes, the path doesn't matter |
+| `https://www.example.com`    | Yes, the matching `www` host |
+| `https://login.example.com`  | No, a different subdomain    |
+| `http://example.com`         | No, a different protocol     |
+| `https://example.com:8443`   | No, a different port         |
+
+Only domains with a known public or private suffix get this match. Other subdomains, repeated `www` prefixes, local addresses, IP addresses and unknown suffixes keep exact matching.
+
+The private panel shows the destination host and port. Your approval stays bound to the destination and account shown. An approval for `example.com` does not approve `www.example.com`.
+
+The browser checks the real origin of each field against the current sign-in request, including fields inside frames. The saved entry keeps its original address.
 
 ## When Nod asks first
 

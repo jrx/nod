@@ -163,8 +163,11 @@ export interface Computer {
     state: 'live' | 'last_known' | 'unavailable';
     capturedAt?: string;
   };
-  injectCredentials(input: CredentialInput): Promise<CredentialSubmission | void>;
-  fillCard(input: CardEntry): Promise<void>;
+  injectCredentials(
+    input: CredentialInput,
+    signal?: AbortSignal,
+  ): Promise<CredentialSubmission | void>;
+  fillCard(input: CardEntry, signal?: AbortSignal): Promise<void>;
   cardDestinations(
     threadId: string,
     fields: CardFields,
@@ -201,6 +204,12 @@ export interface ConnectedCli {
   command: string;
   source: CliSource;
 }
+export interface ConnectedCliResult {
+  exitCode: number;
+  output: string;
+  stdout?: string;
+  stderr?: string;
+}
 export interface WorkspaceSession {
   path: string;
   instructions: string;
@@ -210,7 +219,7 @@ export interface WorkspaceSession {
     args: string[],
     environment: Record<string, string>,
     timeoutSeconds?: number,
-  ): Promise<{ exitCode: number; output: string }>;
+  ): Promise<ConnectedCliResult>;
 }
 export interface Workspace {
   connectedCliAvailable?: boolean;

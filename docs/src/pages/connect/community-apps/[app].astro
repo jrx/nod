@@ -1,0 +1,73 @@
+---
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import { apps } from '../../../data/apps';
+
+export function getStaticPaths() {
+  return apps.map((app) => ({ params: { app: app.slug }, props: { app } }));
+}
+
+const { app } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const path = `${base}/connect/community-apps/${app.slug}/`;
+const url = new URL(path, Astro.site).href;
+const image = new URL(`${path}social.png`, Astro.site).href;
+const share = `Use ${app.name} with Nod. ${app.description}`;
+const headings = [
+  ['try-asking-nod', 'Try asking Nod'], ['connect', `Connect ${app.name}`],
+  ['requirements', 'Requirements'], ['limits', 'Limits'], ['share', 'Share this app'],
+  ['source-and-checks', 'Source and checks'],
+].map(([slug, text]) => ({ depth: 2, slug, text }));
+const head = [
+  { tag: 'meta', attrs: { property: 'og:image', content: image } },
+  { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
+  { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
+  { tag: 'meta', attrs: { property: 'og:image:alt', content: `${app.name} app for Nod` } },
+  { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
+  { tag: 'meta', attrs: { name: 'twitter:image', content: image } },
+] as const;
+---
+
+<StarlightPage frontmatter={{ title: `${app.name} app for Nod`, description: app.description, head: [...head] }} headings={headings}>
+  <div class="app-intro">
+    {app.icon && <img src={`${path}icon.png`} alt="" width="72" height="72" />}
+    <p>{app.description}</p>
+  </div>
+  <p>Included in Nod{app.categories.length ? ` · ${app.categories.join(' · ')}` : ''}</p>
+  <h2 id="try-asking-nod">Try asking Nod</h2>
+  <ul>{app.prompts.map((prompt) => <li>{prompt}</li>)}</ul>
+  <h2 id="connect">Connect {app.name}</h2>
+  <ol>
+    <li>Open <strong>Apps</strong> in Nod and select <strong>Connect</strong> on {app.name}.</li>
+    {app.instance && <li>Enter your {app.name} instance address.</li>}
+    <li>Complete the private connection setup and review the access you grant.</li>
+    <li>Return to Nod and ask it to read a record you can access.</li>
+  </ol>
+  <p>Authentication: {app.authentication.map((method) => method === 'oauth2' ? 'OAuth browser sign-in' : method === 'bearer' ? 'access token' : method === 'env' ? 'private credentials' : 'API key').join(' or ')}.</p>
+  <h2 id="requirements">Requirements</h2>
+  <ul>{app.requirements.map((item) => <li>{item}</li>)}</ul>
+  <h2 id="limits">Limits</h2>
+  <ul>{app.limitations.map((item) => <li>{item}</li>)}</ul>
+  <p>Nod checks each app call through Trust. App permissions still limit what the connection can do.</p>
+  <h2 id="share">Share this app</h2>
+  <p>Share <a href={url}>this page</a> or <a href={`${path}social.png`} download={`${app.slug}-nod.png`}>download the social preview image</a>.</p>
+  <p class="app-links">
+    <a href={`https://twitter.com/intent/tweet?${new URLSearchParams({ text: share, url })}`} target="_blank" rel="noopener noreferrer">Share on X</a>
+    <a href={`https://www.linkedin.com/sharing/share-offsite/?${new URLSearchParams({ url })}`} target="_blank" rel="noopener noreferrer">Share on LinkedIn</a>
+  </p>
+  <h2 id="source-and-checks">Source and checks</h2>
+  <p>App definition version {app.version}. This listing comes from the app folder shipped with Nod. It does not report a live provider health check.</p>
+  <ul>
+    <li><a href={app.source}>Provider documentation</a></li>
+    <li><a href={`https://github.com/n8n-io/nod/tree/main/src/apps/${app.slug}`}>App files and required test fixture</a></li>
+    <li><a href={`${base}/contribute/apps/approval/`}>Approval requirements</a></li>
+    <li><a href={`${base}/contribute/apps/`}>Build an app for Nod</a></li>
+    <li><a href={`${base}/connect/community-apps/`}>Browse custom apps</a></li>
+  </ul>
+</StarlightPage>
+
+<style>
+  .app-intro { display: flex; align-items: center; gap: 1.5rem; margin-block: 1rem 1.5rem; }
+  .app-intro img { flex: none; margin: 0; border-radius: .5rem; }
+  .app-intro p { margin: 0; font-size: 1.2rem; line-height: 1.5; }
+  .app-links { display: flex; flex-wrap: wrap; gap: 1.5rem; }
+</style>

@@ -9,6 +9,9 @@ pre-commit:
         - run: '! command -v gitleaks'
 
 pre-push:
+  parallel: true
   jobs:
+    - name: types
+      run: pnpm run typecheck
     - name: lint
       run: pnpm run lint

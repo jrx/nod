@@ -21,6 +21,7 @@ export class ChannelSetupFailure extends Error {
       | 'activation_pending'
       | 'server_managed'
       | 'pairing_unavailable',
+    readonly details?: string,
   ) {
     super(reason);
   }

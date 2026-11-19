@@ -28,5 +28,4 @@ export interface Turn {
   confirm(result: unknown): Promise<unknown>;
   visited(browserId: string, url: string): void;
   delegate?(title: string, instruction: string): Promise<string>;
-  setStatus?(text: string): Promise<string>;
 }

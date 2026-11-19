@@ -4,6 +4,8 @@ import { api, errorMessage, post } from '../lib/api';
 import { initialStreamState, streamReducer } from '../lib/streams';
 import { pageDataCache } from '../lib/page-data-cache';
 import { subscribeAppEvents } from '../lib/app-events';
+import { feedbackClient } from '../lib/feedback-client';
+import { recordFeedbackError } from '../lib/feedback-errors';
 
 export function useAppState(accountId?: string) {
   const [state, setState] = useState<AppState | null>(null);
@@ -38,6 +40,7 @@ export function useAppState(accountId?: string) {
             hiddenMessageIds: [],
             turns: [],
             activity: [],
+            chatRecovery: undefined,
           }
         : current,
     );
@@ -162,6 +165,7 @@ export function useAppState(accountId?: string) {
             });
           }
         } catch {
+          recordFeedbackError('error', 'stream message could not be read');
           setError('An update could not be read. Refresh the page to reconnect.');
         }
       },
@@ -174,6 +178,17 @@ export function useAppState(accountId?: string) {
       closeEvents();
     };
   }, [refresh, advanceThread, accountId]);
+
+  useEffect(() => {
+    feedbackClient.savedMessages = state ? state.messages.length : null;
+    feedbackClient.pendingTurn = state
+      ? state.turns.some((turn) => turn.status === 'queued' || turn.status === 'running')
+      : null;
+    return () => {
+      feedbackClient.savedMessages = null;
+      feedbackClient.pendingTurn = null;
+    };
+  }, [state]);
 
   const streams = Object.fromEntries(
     Object.entries(streamState.active).map(([id, stream]) => [id, stream.text]),

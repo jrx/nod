@@ -30,7 +30,7 @@ The connected apps, schedules and watches, artifacts, and video links guides use
 
 ## The task guides
 
-The library has 27 task guides in [`src/runtime/skills`](https://github.com/n8n-io/nod/tree/main/src/runtime/skills).
+The library combines task guides in [`src/runtime/skills`](https://github.com/n8n-io/nod/tree/main/src/runtime/skills) with app guides in [`src/apps`](https://github.com/n8n-io/nod/tree/main/src/apps). The table includes both sources. The n8n guide lives with its app definition.
 
 | Home and life             | Work                    | Mail, files and research |
 | ------------------------- | ----------------------- | ------------------------ |
@@ -60,6 +60,8 @@ The system prompt tells the model to pick a guide by the task's purpose, the use
 
 ## Add or change a guide
 
+For an app-specific guide, use `src/apps/<app-id>/skills/<name>/SKILL.md`. See [Build an app for Nod](/contribute/apps/). General task guides use the path below.
+
 1. Create `src/runtime/skills/<name>/SKILL.md`, using a lowercase name with hyphens.
 2. Add front matter with `name`, which must match the folder, and `description`, which says when the model must use the guide.
 3. In the body, write the task decisions, the failure cases and the evidence needed to check the result.
@@ -78,7 +80,7 @@ Restart after you change the catalog or any metadata. Task guide bodies and refe
 
 ## File and permission limits
 
-The library reads only its own folder in the server source tree. Pi's default skill discovery is off, so it never searches the workspace, the home folder, `.pi` folders or connected accounts.
+The library reads only the task-guide folder and the app-guide folders loaded from the server source tree. Pi's default skill discovery is off. It never searches the workspace, the home folder, `.pi` folders, or connected accounts.
 
 - Hidden folders and folder symlinks are ignored.
 - Each read must stay inside the selected skill folder after the real path is resolved.

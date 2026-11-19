@@ -1,0 +1,23 @@
+{
+  "$schema": "https://nod.n8n.io/docs/schemas/apps/v1/app.schema.json",
+  "displayName": "n8n",
+  "icon": "./io.n8n.nod/icon.svg",
+  "categories": ["Automation"],
+  "connection": {
+    "type": "mcp",
+    "endpoint": {
+      "source": "owner",
+      "path": "/mcp-server/http"
+    },
+    "authentication": ["oauth2", "bearer"]
+  },
+  "prompts": [
+    "Find my workflows that handle support requests.",
+    "Build a draft workflow that records a sample form submission."
+  ],
+  "requirements": ["An n8n account with instance-level MCP access enabled."],
+  "limitations": [
+    "Workflow access follows the permissions and MCP settings in your n8n instance.",
+    "Publishing and running a workflow can change other services."
+  ]
+}

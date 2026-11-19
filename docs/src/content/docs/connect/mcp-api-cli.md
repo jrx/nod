@@ -7,9 +7,11 @@ sidebar:
 
 Besides [Composio apps](/connect/apps/), Nod connects to Notion, Linear and n8n through their own MCP servers. For other services, it can set up an MCP server, an HTTP API or a command-line tool (CLI).
 
+These built-in MCP apps use the same folder format as community apps. Browse their [app pages](/connect/community-apps/), or follow [Creating your own connectors](/contribute/apps/) to add one.
+
 ## Notion and Linear
 
-Notion and Linear connect through their own hosted MCP servers, the same way as any [other MCP server](#connect-another-service). Open **Apps**, select **Connect** and sign in.
+Notion and Linear connect through their own hosted MCP servers, the same way as any [other MCP server](#connect-another-service). Open **Apps**, select **Connect** and sign in. If the service ends sign-in with an error, Nod shows that error, with secrets removed.
 
 If an older **Notion MCP** account appears in **Apps** but cannot read pages, connect **Notion** again. After the new connection works, disconnect the old **Notion MCP** account. Its earlier sign-in does not transfer to the direct connection.
 
@@ -27,21 +29,29 @@ If n8n answers at `http://localhost:5678` from Nod's server, the form opens with
 
 If n8n doesn't answer, turn on MCP access in n8n under **Settings**, **Instance-level MCP**, and try again.
 
-The address can be on Nod's computer or its local network, such as a self-hosted n8n. Inside Docker, `localhost` refers to Nod's container. Only an address you enter or confirm yourself can be local, never one the model proposes. Nod sends that connection's requests and its token only to that address. `localhost` and `127.0.0.1` count as the same address when the port matches, because n8n can name itself either way.
+The address can be on Nod's computer or its local network, such as a self-hosted n8n. Inside Docker, `localhost` refers to Nod's container. Only an address you enter or confirm yourself can be local, never one the model proposes. Nod sends that connection's requests and its token only to that address. Browser sign-in can also use a sign-in service at another address when that address is public and uses HTTPS on the standard port. `localhost` and `127.0.0.1` count as the same address when the port matches, because n8n can name itself either way.
 
 Nod loads n8n's tools only when a task needs them and follows n8n's own guide for its tools, plus a short [n8n task guide](/how-it-works/skills/). It writes workflow code to a file in its workspace, checks it with n8n, then creates and tests the workflow with sample data before it reports back. A test doesn't run the steps that send or write to another service, so Nod checks the data each of those steps would have sent. Each n8n action goes through the [trust check](/trust/approvals/), like every app action. See [Build with n8n](/use/n8n/) for what to ask.
 
 ## Connect another service
 
-To connect an MCP server yourself, open **Apps** and select **Connect MCP**. Enter a name and the public HTTPS server URL, then choose browser sign-in, an access token or an API key. Select **Continue** to finish authentication in the private setup dialog. **Connection details** shows any extra setup instructions. Tokens stay outside the chat.
+To connect an MCP server yourself, open **Apps** and select **Connect MCP**. Enter a name of up to 80 characters, such as `Work email (n8n)`, and the server URL, then choose browser sign-in, an access token or an API key. Select **Continue** to finish authentication in the private setup dialog. For any MCP server, including Notion, Linear and n8n, the dialog shows the service's reason if sign-in can't start. When the server ends sign-in with an error, the dialog shows that error, with secrets removed. Only a sign-in you decline counts as cancelled. **Connection details** shows any extra setup instructions. Tokens stay outside the chat.
+
+The URL can be a public HTTPS address or, when you type it yourself, an address on your own computer or network, such as `http://127.0.0.1:8080/mcp` or a Tailscale name. Without `http://` or `https://`, Nod uses HTTPS. A public HTTPS address you type can also use a port other than 443. In the desktop app, `localhost` is your computer. Inside Docker, it is Nod's container. A private address stays bound to the origin you entered, also when you reconnect. HTTP is allowed only for private addresses. With browser sign-in, the server's sign-in service can be at another address only when that address is public and uses HTTPS on the standard port. Connections that Nod proposes in chat must use a public HTTPS address.
+
+Nod connects to MCP servers over Streamable HTTP. When a server refuses it with a client error other than 401 or 403, Nod tries the older HTTP+SSE transport at the same address, with the same checks. If that also fails, the error shows the Streamable HTTP reason.
+
+A failed tool request keeps the server's status and reason. Nod does not retry it. If the SSE stream closes, the next request opens a new connection.
 
 Ask Nod to connect a service it can't find in the app catalog. Nod proposes a way in, called an access path, and sends you a link to a private setup page. There, you paste a token or sign in. The model never sees the token.
 
-| Access path | What Nod calls                     | How it signs in                       |
-| ----------- | ---------------------------------- | ------------------------------------- |
-| MCP server  | Tools on a public HTTPS MCP server | A token in a header, or OAuth sign-in |
-| HTTP API    | A method and path on the API       | A token in a header                   |
-| CLI         | A command with arguments           | Tokens in environment variables       |
+| Access path | What Nod calls                                                 | How it signs in                       |
+| ----------- | -------------------------------------------------------------- | ------------------------------------- |
+| MCP server  | Tools on a public HTTPS MCP server, or a private one you enter | A token in a header, or OAuth sign-in |
+| HTTP API    | A method and path on the API                                   | A token in a header                   |
+| CLI         | A command with arguments                                       | Tokens in environment variables       |
+
+Some services give each region or workspace its own MCP address, such as a separate EU address, each with its own sign-in. On those services, an account can only sign in through its own address. Nod picks the address from a workspace address you give it, or asks for your workspace address or region before it proposes a connection. If sign-in ends on the service's home page instead of returning to Nod, tell Nod your workspace address and start again, or select **Connect MCP** and enter the address for your region.
 
 Nod keeps the token encrypted in Vault, and the server adds it to each call. Results and errors remove plaintext, JSON-escaped and URL- or form-encoded representations of the token. A returned file containing any of those representations is withheld.
 

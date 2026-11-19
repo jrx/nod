@@ -86,9 +86,13 @@ async function waitFor(predicate) {
   assert.fail('The isolated updater did not reach its expected state.');
 }
 
-async function start() {
+async function start({ hold = false } = {}) {
   await rm(stop, { force: true });
-  child = spawn(executable, [], { env: environment, stdio: 'ignore', windowsHide: true });
+  child = spawn(executable, [], {
+    env: { ...environment, NOD_UPDATE_FIXTURE_HOLD: hold ? '1' : '0' },
+    stdio: 'ignore',
+    windowsHide: true,
+  });
   await new Promise((resolve, reject) => {
     child.once('spawn', resolve);
     child.once('error', reject);
@@ -100,12 +104,13 @@ async function start() {
   });
 }
 
-async function replace(directory) {
+async function replace(directory, relaunch = true) {
   const { command, args, env } = windowsInstallCommand({
     directory,
     appPath: executable,
     pid: child.pid,
     systemRoot: process.env.SYSTEMROOT,
+    relaunch,
   });
   const operation = run(command, args, { env: { ...environment, ...env }, timeout: 180_000 });
   const result = operation.then(
@@ -135,6 +140,14 @@ try {
   await writeFile(join(profile, 'profile.json'), JSON.stringify({ ownerId: owner }));
   const source = join(root, 'source');
   await mkdir(source);
+  const mainSource = await readFile(join(repository, 'desktop/main/main.mjs'), 'utf8');
+  const guardStart = mainSource.indexOf('if (!app.requestSingleInstanceLock())');
+  const guardEnd = mainSource.indexOf('else if (await openedDuringUpdateRestart())', guardStart);
+  assert.ok(
+    guardStart >= 0 && guardEnd > guardStart,
+    'The desktop single-instance guard is missing.',
+  );
+  const singleInstanceGuard = mainSource.slice(guardStart, guardEnd);
   await copyFile(join(repository, 'desktop/main/settings.mjs'), join(source, 'settings.mjs'));
   await copyFile(
     join(repository, 'desktop/main/windows-update.mjs'),
@@ -167,20 +180,35 @@ const root = process.env.NOD_UPDATE_FIXTURE_ROOT;
 const profile = join(root, 'profile');
 const hash = (value) => createHash('sha256').update(value).digest('hex');
 const record = (event, fields = {}) => appendFile(join(root, 'events.jsonl'), JSON.stringify({ event, pid: process.pid, version: app.getVersion(), ...fields }) + '\\n');
+let decryptionReason;
+const storageState = async () => Promise.all(['userData', 'sessionData'].map(async (scope) => {
+  try {
+    const state = JSON.parse(await readFile(join(app.getPath(scope), 'Local State'), 'utf8'));
+    return { scope, keys: Object.fromEntries(['encrypted_key', 'app_bound_encrypted_key'].map((name) => [name, typeof state.os_crypt?.[name] === 'string' ? hash(state.os_crypt[name]) : 'missing'])) };
+  } catch (error) { return { scope, error: error.code || error.name }; }
+}));
 app.setPath('userData', join(root, 'electron'));
-if (!app.requestSingleInstanceLock()) app.quit();
-else if (process.argv.includes('--quit')) app.exit();
+${singleInstanceGuard}
 else {
 app.on('second-instance', async (_event, argv) => {
   if (!argv.includes('--quit')) return;
   await record('stopped');
-  app.exit(0);
+  app.quit();
 });
 app.whenReady().then(async () => {
   const settingsPath = join(profile, 'settings.json');
   const fresh = await stat(settingsPath).then(() => false, (error) => { if (error.code === 'ENOENT') return true; throw error; });
   if (fresh) await writeFile(settingsPath, JSON.stringify({ version: 1, theme: 'system', onboardingCompleted: true, notifications: false, launchAtLogin: true, secrets: {} }), { mode: 0o600 });
-  const store = createSettingsStore(settingsPath, safeStorage);
+  await record('storage-open', { storage: await storageState() });
+  const encryption = {
+    isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
+    encryptString: (value) => safeStorage.encryptString(value),
+    decryptString: (value) => {
+      try { return safeStorage.decryptString(value); }
+      catch (error) { decryptionReason = error.message; throw error; }
+    },
+  };
+  const store = createSettingsStore(settingsPath, encryption);
   const key = Buffer.from((await store.environment()).NOD_VAULT_KEY, 'base64');
   const owner = JSON.parse(await readFile(join(profile, 'profile.json'), 'utf8')).ownerId;
   const identity = await loadIntegrationIdentity({
@@ -209,9 +237,9 @@ app.whenReady().then(async () => {
   assert.equal(saved.onboardingPreferenceStep, 'complete');
   const files = {};
   for (const name of ['settings.json', 'profile.json', 'vault', 'identity-checkpoint', 'integration-identity/' + hash(owner) + '.encrypted', 'integration-identity/' + hash(owner) + '.public']) files[name] = hash(await readFile(join(profile, name)));
-  await record('ready', { files, keyHash: hash(key), preferences: saved, publicKey: identity.publicKey, managedOwner: identity.userId,
+  await record('ready', { files, keyHash: hash(key), storage: await storageState(), preferences: saved, publicKey: identity.publicKey, managedOwner: identity.userId,
     identityProof: sign(null, Buffer.from(${JSON.stringify(challenge)} + ':' + app.getVersion()), identity.key).toString('base64url') });
-  if (app.getVersion() === '1.0.1') { await record('stopped'); app.exit(0); }
+  if (app.getVersion() === '1.0.1' && process.env.NOD_UPDATE_FIXTURE_HOLD !== '1') { await record('stopped'); app.exit(0); }
   else {
     let stopping = false;
     setInterval(async () => {
@@ -227,7 +255,7 @@ app.whenReady().then(async () => {
     }, 100);
   }
 }).catch(async (error) => {
-  await record('error', { message: error.message });
+  await record('error', { message: error.message, decryptionReason, storage: await storageState() });
   app.exit(1);
 });
 }
@@ -258,6 +286,8 @@ app.whenReady().then(async () => {
       win32metadata: { CompanyName: 'n8n GmbH', ProductName: 'Nod', FileDescription: 'Nod' },
       overwrite: true,
     });
+    await mkdir(join(application, 'resources/engine/windows-runtime'), { recursive: true });
+    await writeFile(join(application, 'resources/engine/windows-runtime/manifest.json'), '{}');
     const stage = join(root, `stage-${version}`);
     await mkdir(stage);
     installers[version] = join(stage, 'nod-Setup-x64.exe');
@@ -305,7 +335,11 @@ app.whenReady().then(async () => {
           bytes: bytes.length,
           sha256: createHash('sha256').update(bytes).digest('hex'),
         },
-        runtime: { file: 'nod-Runtime-win32-x64.tar.gz' },
+        runtime: {
+          file: 'nod-Runtime-win32-x64.tar.gz',
+          bytes: 1,
+          sha256: 'a'.repeat(64),
+        },
       },
       {
         directory: join(root, 'staged'),
@@ -321,7 +355,8 @@ app.whenReady().then(async () => {
   assert.deepEqual(await unsignedWindowsFiles([system], { release: true }), []);
   assert.equal((await unsignedWindowsFiles([system])).length, 1);
   receipt.stage = 'installing 1.0.0';
-  await run(installers['1.0.0'], ['/S', `/D=${installation}`], {
+  await run(installers['1.0.0'], [`/D=${installation}`], {
+    env: environment,
     timeout: 180_000,
     windowsVerbatimArguments: true,
     argv0: `"${installers['1.0.0']}"`,
@@ -329,6 +364,26 @@ app.whenReady().then(async () => {
   installed = true;
   await stat(executable);
   await stat(join(installation, 'Uninstall.exe'));
+  const openedByInstaller = await waitFor((entries) =>
+    entries.find((entry) => entry.event === 'ready' && entry.version === '1.0.0'),
+  );
+  await run(executable, ['--quit'], { env: environment, timeout: 30_000 });
+  await waitFor((entries) =>
+    entries.find((entry) => entry.event === 'stopped' && entry.pid === openedByInstaller.pid),
+  );
+  await run(
+    powershell,
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-Command',
+      "$ErrorActionPreference = 'Stop'; $process = Get-Process -Id ([int]$env:NOD_UPDATE_STOP_PID) -ErrorAction SilentlyContinue; if ($process) { Wait-Process -InputObject $process -Timeout 30 -ErrorAction Stop }; exit 0",
+    ],
+    {
+      env: { ...environment, NOD_UPDATE_STOP_PID: String(openedByInstaller.pid) },
+      timeout: 35_000,
+    },
+  );
   receipt.stage = 'starting 1.0.0';
   const first = await start();
   const identityPublicKey = createPublicKey({
@@ -361,10 +416,14 @@ app.whenReady().then(async () => {
   );
   await run(nsis, [rejectedSource]);
   receipt.stage = 'rejecting failed update';
+  const readyBeforeRejection = (await recorded()).filter((entry) => entry.event === 'ready').length;
   const rejectedUpdate = await replace(rejected);
   assert.equal(rejectedUpdate.ok, false, 'A rejected installer must fail without opening Nod.');
   await delay(500);
-  assert.equal((await recorded()).filter((entry) => entry.event === 'ready').length, 1);
+  assert.equal(
+    (await recorded()).filter((entry) => entry.event === 'ready').length,
+    readyBeforeRejection,
+  );
   receipt.stage = 'restarting 1.0.0';
   const recovered = await start();
   assert.equal(recovered.version, '1.0.0');
@@ -383,6 +442,12 @@ app.whenReady().then(async () => {
   );
   verifyIdentity(await start());
   receipt.stage = 'updating to 1.0.1 from the running app';
+  const retired = join(installation, 'resources/app/retired/retired.mjs');
+  const cachedRuntime = join(installation, 'resources/engine/windows-runtime/guest.tar.gz');
+  for (const path of [retired, cachedRuntime]) {
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, 'synthetic');
+  }
   await writeFile(stop, dirname(installers['1.0.1']));
   await waitFor((entries) =>
     entries.find((entry) => entry.event === 'stopped' && entry.pid === child.pid),
@@ -396,7 +461,31 @@ app.whenReady().then(async () => {
   assert.deepEqual(updated.files, first.files);
   assert.equal(updated.keyHash, first.keyHash);
   assert.deepEqual(updated.preferences, first.preferences);
+  await assert.rejects(stat(retired), { code: 'ENOENT' });
+  assert.equal(await readFile(cachedRuntime, 'utf8'), 'synthetic');
   verifyIdentity(updated);
+  receipt.stage = 'installing on quit without relaunch';
+  const runningUpdated = await start({ hold: true });
+  assert.equal(runningUpdated.version, '1.0.1');
+  verifyIdentity(runningUpdated);
+  const readyBeforeQuitInstall = (await recorded()).filter(
+    (entry) => entry.event === 'ready',
+  ).length;
+  const quitInstall = await replace(dirname(installers['1.0.1']), false);
+  assert.equal(quitInstall.ok, true, quitInstall.error?.message);
+  await delay(500);
+  assert.equal(
+    (await recorded()).filter((entry) => entry.event === 'ready').length,
+    readyBeforeQuitInstall,
+  );
+  const reopened = await start();
+  assert.equal(reopened.version, '1.0.1');
+  assert.deepEqual(reopened.files, first.files);
+  assert.equal(reopened.keyHash, first.keyHash);
+  verifyIdentity(reopened);
+  await waitFor((entries) =>
+    entries.find((entry) => entry.event === 'stopped' && entry.pid === reopened.pid),
+  );
   Object.assign(receipt, {
     passed: true,
     stage: 'completed',
@@ -404,9 +493,12 @@ app.whenReady().then(async () => {
     realPowerShell: true,
     realNsis: true,
     realElectron: true,
+    installerOpenedApp: true,
+    quitInstallStayedClosed: true,
     failedInstallPreserved: true,
     runningAppQuitByInstaller: true,
     updateStartedByApp: true,
+    retiredFilesRemoved: true,
     foreignInstallerRefused: true,
     windowsCatalogInstallerRefused: true,
     encryptedProfilePreserved: true,

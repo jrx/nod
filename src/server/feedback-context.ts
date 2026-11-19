@@ -32,9 +32,14 @@ export async function feedbackContext(options: {
   const execute = promisify(childProcess.execFile);
   const { environment } = options;
   const development = environment.NODE_ENV !== 'production';
-  let appRelease: string | null = null;
-  let appModified: boolean | null = null;
-  if (development) {
+  let appRelease: string | null = environment.NOD_APP_RELEASE?.trim() || null;
+  let appModified: boolean | null =
+    environment.NOD_APP_MODIFIED === 'true'
+      ? true
+      : environment.NOD_APP_MODIFIED === 'false'
+        ? false
+        : null;
+  if (!appRelease && environment.NOD_DESKTOP !== 'true') {
     try {
       const { stdout } = await execute(
         'git',

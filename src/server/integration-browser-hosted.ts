@@ -88,7 +88,14 @@ export function createHostedIntegrationBrowser(origin: string): IntegrationConne
       const capability = randomBytes(32).toString('base64url');
       const url = `${origin}/api/apps/connect/${capability}`;
       const expiresAt = Date.now() + 10 * 60_000;
-      const timer = setTimeout(() => finish(id), expiresAt - Date.now());
+      const timer = setTimeout(() => {
+        const attempt = attempts.get(capability);
+        if (attempt)
+          logFailure('app_connection_expired', undefined, {
+            step: attempt.remote ? 'consent' : attempt.bootstrapped ? 'start' : 'open',
+          });
+        finish(id);
+      }, expiresAt - Date.now());
       timer.unref();
       attempts.set(capability, {
         id,

@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 import pg from 'pg';
 import { accessCookie, accessKey } from '../src/server/access.ts';
+import { afterCommit } from '../src/server/transaction.ts';
 
 test('a verification code is held back in any wording or language and is the code only by itself', async () => {
   const { classifyVerificationReply, securityCodeIn } =
@@ -62,7 +63,9 @@ test(
     });
     const { createApp } = await import('../src/server/app.ts');
     const { dataRoot, ownerId, port, configuration } = await import('../src/server/config.ts');
+    const { createTasks } = await import('../src/server/tasks.ts');
     await db.initializeDatabase();
+    await createTasks({ pool: db.pool, ownerId }).initialize();
     await thread.initializeThreads();
     await db.pool.query(`CREATE TABLE credential_requests (
     id text PRIMARY KEY,thread_id uuid REFERENCES threads(id),turn_id uuid REFERENCES turns(id),
@@ -76,6 +79,7 @@ test(
     const failurePresentations: Array<{ threadId: string; input: object }> = [];
     let beforePayment = async () => {};
     let duringPayment = async () => {};
+    let cancelPaymentBeforeEntry: string | undefined;
     const { createPayments } = await import('../src/server/payments.ts');
     const { createVaultUses } = await import('../src/server/vault-use.ts');
     const paymentCard = {
@@ -103,12 +107,19 @@ test(
       }),
       capture: async () => new Uint8Array([255, 216, 255]),
       cards: async () => [paymentCard],
-      card: async () => ({
-        cardholder: 'Synthetic Cardholder',
-        cardNumber: '4242424242424242',
-        expiryMonth: 8,
-        expiryYear: 2031,
-      }),
+      card: async (_id, _version, client) => {
+        if (cancelPaymentBeforeEntry && client) {
+          const turnId = cancelPaymentBeforeEntry;
+          cancelPaymentBeforeEntry = undefined;
+          afterCommit(client, () => thread.abortTurns([turnId]));
+        }
+        return {
+          cardholder: 'Synthetic Cardholder',
+          cardNumber: '4242424242424242',
+          expiryMonth: 8,
+          expiryYear: 2031,
+        };
+      },
       fill: async (input) => {
         entered.push(input.card.securityCode ?? '');
         await duringPayment();
@@ -448,6 +459,70 @@ test(
           }
         },
       );
+      await t.test('known non-entry keeps a cancelled code receipt across replay', async () => {
+        for (const kind of ['otp', 'payment']) {
+          await reset();
+          const pending = await seed();
+          let requestId = pending.requestId;
+          let calls = 0;
+          const guarded =
+            kind === 'payment'
+              ? verification
+              : await createChatVerification(db.pool, {
+                  ownerId,
+                  keyStore: { getKey: async () => Buffer.alloc(32, 61) },
+                  refresh() {},
+                  submitCode: async (_owner, _turn, _code, id) => {
+                    calls++;
+                    await db.pool.query(
+                      "UPDATE credential_requests SET status='consumed' WHERE id=$1",
+                      [id],
+                    );
+                    return { status: 'unavailable', notEntered: true };
+                  },
+                });
+          if (kind === 'payment') {
+            await payments.request(pending, {
+              amount: '43.20',
+              currency: 'EUR',
+              fields: { number: '@e4', expiry: '@e5', securityCode: '@e6' },
+            });
+            requestId = (await db.pool.query('SELECT id FROM vault_payments')).rows[0].id;
+            cancelPaymentBeforeEntry = pending.turnId;
+          }
+          const clientMessageId = randomUUID();
+          const input = {
+            clientMessageId,
+            threadId: pending.threadId,
+            verificationRequestId: requestId,
+          };
+          const code = kind === 'payment' ? '737' : '563829';
+          const response = await guarded.accept(code, input);
+          assert.equal(response?.verificationStatus, 'unavailable');
+          assert.match(response?.messageText ?? '', /cancelled before sending/);
+          const stored = (
+            await db.pool.query(
+              'SELECT v.status,m.text FROM chat_verification_submissions v JOIN messages m ON m.id=v.message_id WHERE v.message_id=$1',
+              [clientMessageId],
+            )
+          ).rows[0];
+          assert.equal(stored.status, 'cancelled');
+          assert.equal(stored.text, response?.messageText);
+          assert.equal(stored.text.includes(code), false);
+          assert.doesNotMatch(stored.text, /sent securely/);
+          const repeated = await guarded.accept(code, input);
+          assert.deepEqual(repeated, response);
+          assert.deepEqual(entered, []);
+          assert.deepEqual(injected, []);
+          assert.equal(calls, kind === 'otp' ? 1 : 0);
+          assert.deepEqual(failurePresentations, []);
+          if (kind === 'payment')
+            assert.deepEqual(
+              (await db.pool.query('SELECT status FROM vault_uses WHERE id=$1', [requestId])).rows,
+              [{ status: 'not_entered' }],
+            );
+        }
+      });
       await t.test(
         'Stop cancels a waiting payment before or during entry without restarting the task',
         async () => {

@@ -16,6 +16,19 @@ const rebaseAt = 8 * 1024 * 1024;
 export const keptImages = 4;
 export const removedImage =
   'An earlier image was removed from context. Take a new screenshot or read the file again if you need it.';
+const requestEntry = 'nod-request';
+
+export function requestStart(manager: SessionManager) {
+  const entry = manager
+    .getBranch()
+    .findLast((entry) => entry.type === 'custom' && entry.customType === requestEntry);
+  return entry?.type === 'custom' ? (entry.data as { at: number }).at : 0;
+}
+
+export function startRequest(manager: SessionManager) {
+  manager.appendCustomEntry(requestEntry, { at: Date.now() });
+}
+
 export const recoveryContext =
   'Earlier context remains in saved history or workspace files. Read the source before using missing facts. Do not repeat completed or uncertain actions.';
 const failure = () =>
@@ -114,8 +127,24 @@ export async function readPiSessionEntries(options: { threadId: string; sessionR
   return entries(await readFile(latest.path)).slice(1);
 }
 
-export function openLocalSession(directory: string) {
-  const manager = SessionManager.continueRecent(directory, directory);
+const restartType = 'nod-context-restart';
+
+export function openLocalSession(directory: string, contextRestart?: string) {
+  let manager = SessionManager.continueRecent(directory, directory);
+  if (
+    contextRestart &&
+    !manager
+      .getEntries()
+      .some(
+        (entry) =>
+          entry.type === 'custom' &&
+          entry.customType === restartType &&
+          entry.data === contextRestart,
+      )
+  ) {
+    manager = SessionManager.create(directory, directory);
+    manager.appendCustomEntry(restartType, contextRestart);
+  }
   const file = manager.getSessionFile();
   const session =
     file && existsSync(file) && statSync(file).size > rebaseAt
@@ -136,6 +165,8 @@ function rebaseSession(source: SessionManager, next: SessionManager) {
   const copyRecording = (entry: (typeof audio)[number]) =>
     next.appendCustomMessageEntry(entry.customType, entry.content, entry.display, entry.details);
   for (const entry of audio.slice(-2)) if (!current.has(entry.id)) copyRecording(entry);
+  const started = requestStart(source);
+  if (started) next.appendCustomEntry(requestEntry, { at: started });
   let images = [...projected.values()]
     .flat()
     .reduce(
@@ -174,6 +205,10 @@ function rebaseSession(source: SessionManager, next: SessionManager) {
         );
     }
   }
+  const restart = source
+    .getEntries()
+    .findLast((entry) => entry.type === 'custom' && entry.customType === restartType);
+  if (restart?.type === 'custom') next.appendCustomEntry(restartType, restart.data);
   return next;
 }
 

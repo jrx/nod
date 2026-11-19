@@ -252,7 +252,7 @@ const manifest = {
     ...(caseVersion >= 6
       ? {
           'C8-rtk-used':
-            'The execution trace records a real RTK command invocation beyond rewrite probing. A disposable PATH shim logs arguments then execs the installed binary without changing output; applies to the display cases.',
+            'The execution trace records a real RTK command invocation beyond rewrite probing. A wrapper at the protected absolute path records arguments and runs the installed binary without changing output; applies to the display cases.',
         }
       : {}),
   },
@@ -436,22 +436,16 @@ try {
   const installed = version.exitCode === 0 && /^rtk 0\.51\.0\s*$/.test(version.output);
   if (caseVersion >= 6 && installed) {
     const shim =
-      '#!/bin/sh\nprintf "%s\\n" "$*" >> /tmp/rtk-eval-invocations.log\nexec /usr/local/bin/rtk "$@"\n';
-    assert.equal(
-      (
-        await exec(
-          first,
-          `mkdir -p /tmp/rtk-eval-bin && printf %s ${shellQuote(shim)} > /tmp/rtk-eval-bin/rtk && chmod 755 /tmp/rtk-eval-bin/rtk`,
-        )
-      ).exitCode,
-      0,
-    );
-    for (const [name, session] of sessions)
-      sessions.set(name, {
-        ...session,
-        exec: (script, options) =>
-          session.exec(`export PATH=/tmp/rtk-eval-bin:$PATH\n${script}`, options),
-      });
+      '#!/bin/sh\nprintf "%s\\n" "$*" >> /tmp/rtk-eval-invocations.log\nexec /usr/local/bin/rtk-eval-real "$@"\n';
+    command('docker', [
+      'exec',
+      '--user',
+      'root',
+      container,
+      '/bin/sh',
+      '-c',
+      `mv /usr/local/bin/rtk /usr/local/bin/rtk-eval-real && printf %s ${shellQuote(shim)} > /usr/local/bin/rtk && chmod 755 /usr/local/bin/rtk`,
+    ]);
   }
   const system = await exec(first, 'uname -sm; node --version; git --version; python3 --version');
   for (let repetition = 1; repetition <= repeatCount; repetition++) {

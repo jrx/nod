@@ -1,7 +1,10 @@
 {
-  "version": "0.8.2",
-  "previousTag": "nod-v0.8.1",
-  "source": "60598bd3cac73a5ea6bc3814cf28faf46e7aaf18",
-  "highlights": "## 🛠️ Give first setup another try\n\nLinux setup now checks the private computer image before it starts. Its new copy method avoids the image-copy failure on eCryptfs home folders.\n\nNew Mac and Linux setups also record their progress before the first start. If that start fails or is stopped, retry can rebuild the unfinished computer. Completed computers keep their data. An older interrupted Mac setup may still need help; send its startup log in feedback.\n\n## 📂 File permission, without a detour\n\nAsk Nod to list Downloads, read an invoice, or save a report. If local file access is off, Nod can now ask to turn it on in chat, save your choice, and continue your request.\n\nThis setting covers allowed locations in your home folder and on external drives. Your excluded folders and the checks for each file action still apply. Change the setting in **Settings → Privacy & data**, or ask Nod to turn it off.\n\n## Also in this release\n\n- **Long requests:** Nod checks request size before sending it to a model. Large content stays available in workspace files, with shorter previews in the request.\n- **Setup:** A retry after account setup no longer repeats the account save when only the local device check failed.\n- **Contacts:** Shared contact previews now read quoted vCard parameters, including values with colons or semicolons.",
-  "video": null
+  "version": "0.8.4",
+  "previousTag": "nod-v0.8.3",
+  "source": "cc81434d87b2ad15f7c2d0934c4ac6824c4db0fb",
+  "highlights": "## 🧩 Bring your app to Nod\n\nBuild a connector from an MCP server, an HTTP API or a CLI. The [contributor guide](https://nod.n8n.io/docs/contribute/apps/) and AI builder skill help you create an app folder, follow the standard and add the required tests. Then open a pull request for review. Approved connectors get an Apps entry, a public page and a social image.\n\nAlready have an MCP server on your computer or network? Enter its local or private address in **Apps → Connect MCP**.\n\n## 👀 See Nod's last few steps\n\nSelect the activity line in chat or a task to see up to four recent operations, newest first. Close the list when you want a quieter view. It stays closed while the work continues.\n\n## Also in this release\n\n- **Bug reports:** **Report bug** is easier to find. Nod offers a report when something in Nod itself fails. You review what gets sent.\n- **File previews:** Right-click an image in the preview panel to save or open it.\n- **Memory:** Nod follows references in requests to remember earlier details. Notes you write keep their line breaks.\n- **Sign-in:** MCP setup shows the service's reason when sign-in cannot start. ChatGPT sign-in works when its usual local port is busy.\n- **Long chats:** Earlier tools stay available on later turns. Context errors no longer leave the chat stuck.",
+  "video": {
+    "url": "https://github.com/user-attachments/assets/6bfc3d71-6de3-4593-8fad-b7e56d2af262",
+    "releaseSha256": "0fd4ab5fb690428c253131fd7b17d06b0d25821e56100b29738d600c4e68e3fa"
+  }
 }

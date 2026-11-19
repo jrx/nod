@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { z } from 'zod';
 import { BrowserActionError, type Computer } from '../../ports/computer.ts';
+import { logFailure, logRepeatedFailure } from '../../ports/failure-log.ts';
 import { fileBytes } from '../../shared/files.ts';
 import { threadIdentity } from '../../ports/thread-identity.ts';
 import type { CommandProcess } from '../command-process.ts';
@@ -97,7 +98,12 @@ export function createBridgeComputer(options: {
           uncertainBrowsers.clear();
           screens.clear();
         }
-      })().finally(() => recovering.delete(key));
+      })()
+        .catch((error) => {
+          logFailure('browser_recover_failed', error, { scope: scope ? 'browser' : 'all' });
+          throw error;
+        })
+        .finally(() => recovering.delete(key));
       recovering.set(key, recovery);
     }
     return recovery;
@@ -152,11 +158,37 @@ export function createBridgeComputer(options: {
       );
     }
     const order = ++sequence;
+    const started = Date.now();
+    let stderr = '';
+    const failed = (
+      reason: string,
+      error?: unknown,
+      exit: { exitCode?: number | null; signal?: string | null } = {},
+    ) => {
+      const message = error instanceof Error ? error.message : undefined;
+      const context = {
+        method: input.method,
+        ...(input.method === 'act' ? { action: input.input.action } : {}),
+        reason,
+        ...exit,
+        durationMs: Date.now() - started,
+        fenced,
+      };
+      if (reason === 'error_response')
+        logRepeatedFailure(
+          'browser_bridge_failed',
+          `${input.method}:${message}`,
+          { code: message, stderr },
+          context,
+        );
+      else logFailure('browser_bridge_failed', { message, stderr }, context);
+    };
     const result = new Promise<unknown>((resolve, reject) => {
       let child: CommandProcess;
       try {
         child = options.launch(input);
-      } catch {
+      } catch (error) {
+        failed('launch', error);
         uncertain = true;
         return reject(
           new Error(`The workspace browser is unavailable. Start its container. ${reopenNotice}`),
@@ -176,10 +208,15 @@ export function createBridgeComputer(options: {
         signal?.removeEventListener('abort', cancel);
         cancellations.delete(cancel);
       };
-      const unavailable = () => {
+      const unavailable = (
+        reason: string,
+        error?: unknown,
+        exit?: { exitCode: number | null; signal: string | null },
+      ) => {
         if (settled) return;
         settled = true;
         uncertain = true;
+        failed(reason, error, exit);
         cleanup();
         child.stdin.destroy();
         child.kill('SIGKILL');
@@ -194,20 +231,23 @@ export function createBridgeComputer(options: {
         }
         clearTimeout(timer);
         if (!response) child.stdin.write(JSON.stringify({ type: 'cancel', id: request.id }) + '\n');
-        drainTimer = setTimeout(unavailable, options.drainTimeoutMs ?? 15_000);
+        drainTimer = setTimeout(() => unavailable('timeout'), options.drainTimeoutMs ?? 15_000);
       }
       signal?.addEventListener('abort', cancel, { once: true });
       cancellations.set(cancel, browserId);
-      child.stdin.on('error', unavailable);
-      child.on('error', unavailable);
-      child.stderr.resume();
+      child.stdin.on('error', (error) => unavailable('stream_error', error));
+      child.on('error', (error) => unavailable('launch', error));
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk: string) => {
+        stderr = (stderr + chunk).slice(-2000);
+      });
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', (chunk: string) => {
         output += chunk;
         for (let end = output.indexOf('\n'); end >= 0; end = output.indexOf('\n')) {
           const line = output.slice(0, end);
           output = output.slice(end + 1);
-          if (Buffer.byteLength(line) > responseBytes) return unavailable();
+          if (Buffer.byteLength(line) > responseBytes) return unavailable('oversized_response');
           try {
             if (response) throw new Error();
             const value = JSON.parse(line);
@@ -223,20 +263,25 @@ export function createBridgeComputer(options: {
             response = browserResponse.parse(value);
             if (response.id !== request.id) throw new Error();
           } catch {
-            return unavailable();
+            return unavailable('malformed_response');
           }
         }
-        if (Buffer.byteLength(output) > responseBytes) unavailable();
+        if (Buffer.byteLength(output) > responseBytes) unavailable('oversized_response');
       });
-      child.on('close', (code) => {
+      child.on('close', (code, signal) => {
         if (settled) return;
-        if (code !== 0 || !response || output) return unavailable();
+        if (code !== 0 || !response || output)
+          return unavailable(code !== 0 ? 'exit' : 'malformed_response', undefined, {
+            exitCode: code,
+            signal: signal ?? null,
+          });
         settled = true;
         cleanup();
         updateMetadata(response.metadata, order);
         if (cancelling || (!response.ok && response.error === 'cancelled'))
           return reject(new Error('Browser operation cancelled.'));
         if (response.ok) return resolve(response.result);
+        failed('error_response', new Error(response.error));
         if (browserErrorMessage(response.error))
           return reject(
             new BrowserActionError(response.error as BrowserErrorCode, response.detail),
@@ -245,7 +290,13 @@ export function createBridgeComputer(options: {
           const error = new Error('Browser observations are paused during credential entry.');
           return reject(Object.assign(error, { statusCode: 423 }));
         }
-        reject(new Error('The workspace browser could not complete this action. Try again.'));
+        reject(
+          new Error(
+            response.detail
+              ? `The workspace browser could not complete this action: ${response.detail}`
+              : 'The workspace browser could not complete this action. Try again.',
+          ),
+        );
       });
       void (async () => {
         child.stdin.write(encoded);
@@ -259,7 +310,7 @@ export function createBridgeComputer(options: {
           };
           if (!child.stdin.write(JSON.stringify(line) + '\n')) await once(child.stdin, 'drain');
         }
-      })().catch(unavailable);
+      })().catch((error) => unavailable('stream_error', error));
       if (signal?.aborted) cancel();
     });
     pending.set(result, browserId);
@@ -508,11 +559,14 @@ export function createBridgeComputer(options: {
     selectSignInMethod: async (id, input, signal) => {
       await call({ method: 'selectSignInMethod', threadId: threadIdentity(id), input }, signal);
     },
-    fillCard: async (input) => {
-      await call({
-        method: 'fillCard',
-        input: browserCardInput.parse({ ...input, threadId: threadIdentity(input.threadId) }),
-      });
+    fillCard: async (input, signal) => {
+      await call(
+        {
+          method: 'fillCard',
+          input: browserCardInput.parse({ ...input, threadId: threadIdentity(input.threadId) }),
+        },
+        signal,
+      );
     },
     cardDestinations: async (id, fields) =>
       z
@@ -536,20 +590,23 @@ export function createBridgeComputer(options: {
         throw new Error('The checkout page could not be captured.');
       return new Uint8Array(Buffer.from(value, 'base64'));
     },
-    injectCredentials: async (input) => {
+    injectCredentials: async (input, signal) => {
       return (
         z
           .object({ status: z.literal('submitted') })
           .strict()
           .nullable()
           .parse(
-            await call({
-              method: 'injectCredentials',
-              input: browserCredentialInput.parse({
-                ...input,
-                threadId: threadIdentity(input.threadId),
-              }),
-            }),
+            await call(
+              {
+                method: 'injectCredentials',
+                input: browserCredentialInput.parse({
+                  ...input,
+                  threadId: threadIdentity(input.threadId),
+                }),
+              },
+              signal,
+            ),
           ) ?? undefined
       );
     },

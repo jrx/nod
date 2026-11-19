@@ -1,0 +1,15 @@
+diff --git a/dist/utils/overflow.js b/dist/utils/overflow.js
+index a106f863ccb322b58090f1c4ba82d62b0b2723f2..ac8fb374d7d17dd63e6239eca8d58b5289e08bed 100644
+--- a/dist/utils/overflow.js
++++ b/dist/utils/overflow.js
+@@ -76,6 +76,10 @@ const CEREBRAS_BODYLESS_OVERFLOW_PATTERN = /^4(?:00|13)\s*(?:status code)?\s*\(n
+  * pattern without this exclusion.
+  */
+ const NON_OVERFLOW_PATTERNS = [
++    /^(?:[\w -]+ API error \((?:401|402|403|404|408|409|410|429|5\d\d)\):|(?:401|402|403|404|408|409|410|429|5\d\d)(?:\s|:|$))/i,
++    /\(HTTP (?:401|402|403|404|408|409|410|429|5\d\d)\)(?: \(transport cause: [^)]+\))?(?: \[request phase: [^\]]+\])?\s*$/i,
++    /\b(?:insufficient_quota|quota_exceeded|usage_limit_reached)\b/i,
++    /\b(?:tokens? per (?:minute|day)|[tr]p[md])\b/i,
+     /^(Throttling error|Service unavailable):/i, // AWS Bedrock non-overflow errors (human-readable prefixes from formatBedrockError)
+     /rate limit/i, // Generic rate limiting
+     /too many requests/i, // Generic HTTP 429 style

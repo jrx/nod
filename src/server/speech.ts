@@ -8,13 +8,20 @@ import {
 import type { ProviderUsageEvent } from '../ports/provider-usage.ts';
 import type { ModelReview } from '../ports/decisions.ts';
 import { spendingLimitReached } from './ledger.ts';
+import { appPages } from '../shared/app-links.ts';
 
 export class TranscriptionLengthError extends SpeechProviderError {
   constructor() {
     super('This voice message is too long. Record a shorter message.');
   }
 }
-export class SpeechSetupError extends SpeechProviderError {}
+export class SpeechSetupError extends SpeechProviderError {
+  constructor() {
+    super(
+      `Set up audio in ${appPages['/settings/voice']}. Choose free voices or connect a voice service.`,
+    );
+  }
+}
 
 function cancellable<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return work;
@@ -84,9 +91,7 @@ export function createSpeech(provider: SpeechProvider) {
         ? (provider.transcriptionConfigured ?? provider.configured)
         : provider.configured)
     )
-      throw new SpeechSetupError(
-        'Set up audio in Settings → General → Voice. Choose free voices or connect a voice service.',
-      );
+      throw new SpeechSetupError();
   }
   return {
     get configured() {

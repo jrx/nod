@@ -41,6 +41,8 @@ Several controls protect each connection:
 | **App content cannot grant permission** | Nod marks app results as untrusted data. The trust check sees your words and the proposed action, never the app results. An email cannot authorize an action.                                                                                                            |
 | **A record you can review**             | [Usage](/use/spending/) shows app actions and the words that allowed them while the source message exists. You can [disconnect an account](#manage-connected-accounts) or revoke access in the provider's settings.                                                      |
 
+Each signed request carries the time it was signed. If your computer's clock is wrong, the connection service refuses the request. Nod then uses the time the service reports and signs that request once more.
+
 Composio documents credential encryption with AES-256-GCM and TLS for data in transit. Its [security documentation](https://docs.composio.dev/docs/security/overview) explains these controls. Its [Trust Center](https://trust.composio.dev/) provides security reports and its subprocessor list.
 
 With the default setup, app requests and results pass through n8n's connection service and Composio. Other setups use the connection service their operator selects. ZDR limits storage for covered calls. It does not reduce OAuth permissions or set retention for your model provider, destination apps, or Nod's local data. The trust check uses a model and can make mistakes. See the [Security review guide](/trust/security-review/) for the wider boundaries.
@@ -48,6 +50,8 @@ With the default setup, app requests and results pass through n8n's connection s
 The trust check protects requests made through Nod. It cannot block someone who uses a stolen app token outside Nod. The permissions you grant remain the limit of what that token can do. Review those permissions and revoke access in the provider's settings when you no longer need the connection.
 
 ## Connect your apps
+
+Browse [custom connections](/connect/community-apps/) for apps that use their own MCP servers. To add a community or partner app, follow [Creating your own connectors](/contribute/apps/).
 
 <Steps>
 
@@ -63,6 +67,8 @@ Use **Ask Nod** in the **Connect another tool** card below the catalog to get he
 
 The sign-in dialog closes automatically once Nod confirms the connection.
 
+After you connect from **Apps**, the success notice has an **Open chat** button. Select it to give Nod a task. Your current draft stays in place. Opening chat does not send a message or start work.
+
 If sign-in fails or the link is unavailable, select **Try again** to open a fresh sign-in window. Nod stops waiting as soon as the sign-in page can't start or closes, such as after a restart. If you closed the browser before finishing, select **Start again**. Finish in the newest window; a replaced link can no longer complete sign-in. If sign-in is already finishing, Nod keeps waiting for that result instead of starting another consent flow.
 
 Some browsers preview a link before showing the page. The same live sign-in link remains usable after a preview, until sign-in starts.
@@ -73,7 +79,7 @@ Expired chat cards keep the app's name and icon, but their connection button is 
 
 ## Manage connected accounts
 
-Connected cards in **Apps** show an account count beside the people icon. Select it to review account identities, reconnect or disconnect accounts. Select the plus icon to connect another account. Disconnecting removes Nod's access through that connection. You can also review or revoke access in the provider's settings.
+Connected cards in **Apps** show an account count beside the people icon. Select it to review account identities, reconnect or disconnect accounts. When **Add account** is available there, select it to connect another account. Disconnecting removes Nod's access through that connection. You can also review or revoke access in the provider's settings.
 
 Select **Reconnect** to sign in to a saved account again. The control is available when the provider supports it, including while the account is connected. This lets you complete consent again after its permissions change. It keeps the saved account and its settings. Otherwise, if **Add account** is available, use it to create an additional connection without removing the old account. Nod starts an additional connection only when you ask. **Sign-in unavailable** means the provider is not configured or does not support that app. Ask your server operator to check the [connection-service setup](/deploy/configuration/#apps-and-composio).
 

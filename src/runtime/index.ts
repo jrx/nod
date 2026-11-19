@@ -1,5 +1,6 @@
 import { presentationInputSchema, type Presentation } from '../shared/presentation.ts';
 import { proactiveUpdateSchema, sourceReadSchema } from '../shared/proactivity.ts';
+import { appPages } from '../shared/app-links.ts';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
@@ -11,6 +12,7 @@ import type {
   AgentEvent,
   AgentImage,
   AgentSession,
+  AgentSessionOptions,
   AgentTool,
   AgentToolOutcome,
   AgentToolResult,
@@ -20,7 +22,7 @@ import type {
   RuntimeResult,
   SkillLibrary,
 } from '../ports/agent.ts';
-import { appConfirmation, ModelRequestError } from '../ports/agent.ts';
+import { appConfirmation, ContextLimitError, ModelRequestError } from '../ports/agent.ts';
 import type { Computer, Workspace } from '../ports/computer.ts';
 import { BrowserActionError } from '../ports/computer.ts';
 import { threadIdentity } from '../ports/thread-identity.ts';
@@ -58,7 +60,7 @@ function toolProgress() {
       for (const result of results) {
         if (result.error === undefined) failures.delete(result.name);
         else if (
-          /^(?:Validation failed for tool |Invalid (?:arguments for tool |[\w ]+ (?:input[.:]|arguments(?: at|[.:])))|Tool \S+ not found|This source (?:failed during this check|check has reached its read limit)|Nod could not confirm it was still on the page and control it checked|(?:This connected|The selected) account changed\.|The trust check couldn|The action review model is unavailable|Nod could not write an accurate confirmation)/.test(
+          /^(?:Validation failed for tool |Invalid (?:arguments for tool |[\w ]+ (?:input[.:]|arguments(?: at|[.:])))|Tool \S+ not found|This source (?:failed during this check|check has reached its read limit)|Nod could not confirm it was still on the page and control it checked|(?:This connected|The selected) account changed\.|The trust check couldn|The action review model is unavailable|Nod could not write an accurate confirmation|The workspace command did not run)/.test(
             result.error,
           )
         ) {
@@ -234,6 +236,7 @@ export function createAgentRuntime(dependencies: {
     const sites = new Map<string, string>();
     let stopped = false;
     let modelError: string | undefined;
+    let contextExhausted = false;
     let modelIncomplete: 'output' | 'context' | undefined;
     const progress = toolProgress();
     let completed = false;
@@ -717,6 +720,50 @@ export function createAgentRuntime(dependencies: {
         };
         return { gate, settle: () => decide(gate.asked) };
       };
+      const sandboxTool =
+        (source: ExecutionScope, cwd: string): AgentSessionOptions['runTool'] =>
+        (name, params, run, options) => {
+          const admitted = name === 'bash' ? admission() : undefined;
+          const pending = guard(
+            name,
+            params,
+            async () => {
+              if (!admitted) return run();
+              await admitted.gate.admit(false);
+              assertActive();
+              const input = params as { command?: unknown; timeout?: unknown };
+              if (
+                typeof input?.command !== 'string' ||
+                (input.timeout !== undefined &&
+                  (typeof input.timeout !== 'number' || !Number.isFinite(input.timeout)))
+              )
+                throw new Error('The workspace command or timeout is invalid.');
+              if (!context.checkWorkspaceCommand)
+                throw new Error(
+                  'Workspace command checks are unavailable. The command did not run.',
+                );
+              const checked = await context.checkWorkspaceCommand(
+                {
+                  command: input.command,
+                  cwd,
+                  timeoutSeconds: Math.max(
+                    1,
+                    Math.ceil((input.timeout as number | undefined) ?? 3540),
+                  ),
+                },
+                signal,
+              );
+              assertActive();
+              const operation = checked.signal ? AbortSignal.any([signal, checked.signal]) : signal;
+              operation.throwIfAborted();
+              const result = await untilAborted(run(operation), operation);
+              await checked.record();
+              return result;
+            },
+            { ...options, execution: source },
+          );
+          return admitted ? pending.finally(admitted.settle) : pending;
+        };
       const bind = (turn: Turn, take: () => Promise<unknown>): AgentTool[] =>
         [
           ...nodTools(turn, skills, dependencies.documentation),
@@ -898,8 +945,7 @@ export function createAgentRuntime(dependencies: {
             }).filter((tool) => !parentTools.has(tool.name)),
             workspace: { ...workspace, path: childPath },
             timeZone: context.timeZone,
-            runTool: (name, params, run, options) =>
-              guard(name, params, run, { ...options, execution: source }),
+            runTool: sandboxTool(source, childPath),
             shouldStop: (results) => stopped || overBudget() || childProgress.stopped(results),
             onEvent: (event) => {
               countUsage(event);
@@ -949,19 +995,6 @@ export function createAgentRuntime(dependencies: {
           ...shared,
           execution,
           delegate,
-          ...(speaks
-            ? {
-                setStatus: async (text: string) => {
-                  const summary = (dependencies.redactError ?? String)(text.trim()).replace(
-                    /\s+/g,
-                    ' ',
-                  );
-                  if (!summary) throw new Error('Write a short activity description.');
-                  await context.emit('step', summary, { execution });
-                  return 'Status updated.';
-                },
-              }
-            : {}),
         },
         async () => {
           if (!browsed) await computer.hold(browserId, false).catch(() => {});
@@ -1059,7 +1092,9 @@ export function createAgentRuntime(dependencies: {
         ...execution,
         ...(context.model ? { model: context.model } : {}),
         automatic: Boolean(context.automatic),
-        ...(context.proactivity ? { restricted: true, restartable: !context.resumed } : {}),
+        contextRestart: context.contextRestart,
+        ...(context.proactivity ? { restricted: true } : {}),
+        newRequest: !context.resumed,
         ...(context.scheduleCache ? { scheduleCache: context.scheduleCache } : {}),
         ...(sessionId === threadId && !context.proactivity && dependencies.keepWarm
           ? { keepWarm: () => dependencies.keepWarm!(threadId) }
@@ -1071,7 +1106,7 @@ export function createAgentRuntime(dependencies: {
         workspace,
         ...(context.readAudio ? { readAudio: context.readAudio } : {}),
         timeZone: context.timeZone,
-        runTool: guard,
+        runTool: sandboxTool(execution, workspace.path),
         shouldStop: (results) => {
           if (stopped || finalDelivered) return true;
           if (progress.stopped(results)) return true;
@@ -1147,6 +1182,7 @@ export function createAgentRuntime(dependencies: {
             completeStream();
             streamId = randomUUID();
             modelError = undefined;
+            contextExhausted = false;
           }
           if (event.type === 'message_end') {
             if (event.status === 'succeeded') {
@@ -1181,7 +1217,10 @@ export function createAgentRuntime(dependencies: {
             speakNext = false;
             completeStream();
           }
-          if (event.type === 'error') modelError = event.message;
+          if (event.type === 'error') {
+            modelError = event.message;
+            contextExhausted = event.contextExhausted === true;
+          }
           if (event.type === 'final') {
             modelError = undefined;
             modelIncomplete = undefined;
@@ -1266,15 +1305,15 @@ export function createAgentRuntime(dependencies: {
       const paused = () =>
         `Paused at the ${dollars(context.checkIn!.budgetUsd)} check-in. Reply to keep going.`;
       if (modelError)
-        throw new ModelRequestError(
+        throw new (contextExhausted ? ContextLimitError : ModelRequestError)(
           `The model request failed: ${(dependencies.redactError ?? String)(modelError)}`,
         );
-      if (modelIncomplete && status === 'succeeded')
-        throw new Error(
-          modelIncomplete === 'context'
-            ? 'The model response was cut off because its context is full. Start a new conversation or choose a model with a larger context.'
-            : 'The model response was incomplete. Say continue to try again.',
+      if (modelIncomplete === 'context' && status === 'succeeded')
+        throw new ContextLimitError(
+          `The model response was cut off because its context is full. Choose a model with a larger context in ${appPages['/settings/models']}.`,
         );
+      if (modelIncomplete && status === 'succeeded')
+        throw new Error('The model response was incomplete. Say continue to try again.');
       if (stopped && status === 'succeeded') throw new Error('The turn was stopped.');
       if (status === 'succeeded' && (context.proactivity ? overBudget() : checkInStopped)) {
         status = 'waiting_user';

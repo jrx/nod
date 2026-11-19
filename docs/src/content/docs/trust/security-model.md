@@ -53,7 +53,7 @@ Only the server holds keys and decides what runs. The model, the workspace and a
 
 ### Browser
 
-- A login is entered only into a field whose real frame origin matches the login's exact origin. Card fields must match the approved destinations.
+- A login is entered only into a field whose real frame origin matches the sign-in request's exact origin. The saved login must match that website under the [Vault matching rules](/trust/vault/#website-matching). Card fields must match the approved destinations.
 - Entry and submission happen in one step that the model can't observe or act during. Scripts on the destination page can read the entered values, as with any form.
 - A page changed by the model's own JavaScript must reload before entry. After a failed entry, the model's view stays locked until the filled page changes.
 - After Nod fills a private value on a page, the model's page scripts stay paused on that page until it reloads or moves on, so a script can't read the value back even once the field is gone.

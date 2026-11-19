@@ -3,6 +3,7 @@ import { DataSharing } from '../../../components/data-sharing';
 import { LockKeyhole, MousePointerClick, ShieldCheck, Sparkles } from '../../../components/icons';
 import { NodGlyph } from '../../../components/motion';
 import { Button } from '../../../components/ui';
+import { appPages } from '../../../../shared/app-links';
 import { desktopRuntimeAvailable } from '../../../lib/desktop';
 import { legalLinks } from '../../../../shared/onboarding';
 import type { StepProps } from '..';
@@ -17,7 +18,7 @@ function differentiators(local: boolean) {
     {
       icon: Sparkles,
       title: 'Works proactively',
-      text: 'Turn on automatic preparation in Settings → Notifications to get useful work from app changes, within a monthly allowance.',
+      text: `Turn on automatic preparation in ${appPages['/settings/notifications']} to get useful work from app changes, within a monthly allowance.`,
     },
     {
       icon: LockKeyhole,

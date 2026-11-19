@@ -20,6 +20,7 @@ const privateCall = (name: string, args?: Record<string, unknown>) =>
 
 export interface ModelRequestFacts {
   requestPhase: 'prepare' | 'payload' | 'request' | 'response' | 'stream';
+  requestKind: 'regular' | 'cache_warm';
 }
 
 export interface PiModelCall {
@@ -163,6 +164,7 @@ export function piModelTrace(
       ...(call.request
         ? {
             request_phase: call.request.requestPhase,
+            request_kind: call.request.requestKind,
           }
         : {}),
     },

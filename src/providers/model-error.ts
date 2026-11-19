@@ -11,12 +11,21 @@ export async function modelServiceError(
   response: Response,
   service: string,
   secrets: string[] = [],
+  detailFields = ['message', 'type', 'code', 'status', 'param'],
 ) {
-  const redact = (value: string) =>
-    secrets.reduce(
-      (text, secret) => (secret ? text.replaceAll(secret, '[redacted]') : text),
-      value,
-    );
+  const values = [...new Set(secrets.filter(Boolean))].sort(
+    (left, right) => right.length - left.length,
+  );
+  const redact = (value: string) => {
+    if (!values.length) return value;
+    let result = '';
+    for (let at = 0; at < value.length;) {
+      const secret = values.find((secret) => value.startsWith(secret, at));
+      result += secret ? '[redacted]' : value[at];
+      at += secret?.length ?? 1;
+    }
+    return result;
+  };
   let reason = response.statusText;
   let serviceReason: string | undefined;
   const reader = response.body?.getReader();
@@ -41,7 +50,9 @@ export async function modelServiceError(
       if (typeof error === 'string') reason = serviceReason = error;
       else if (error && typeof error === 'object') {
         if (typeof error.message === 'string') serviceReason = error.message;
-        const fields = ['message', 'type', 'code', 'status', 'param'].flatMap((name) =>
+        else if (detailFields.includes('description') && typeof error.description === 'string')
+          serviceReason = error.description;
+        const fields = detailFields.flatMap((name) =>
           typeof error[name] === 'string' || typeof error[name] === 'number'
             ? [`${name}: ${error[name]}`]
             : [],

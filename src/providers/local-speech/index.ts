@@ -8,6 +8,7 @@ import {
   type LocalSpeechControls,
 } from '../../ports/speech.ts';
 import type { ProviderUsageEvent } from '../../ports/provider-usage.ts';
+import { logFailure } from '../../ports/failure-log.ts';
 import { speechVoices } from '../../shared/speech.ts';
 import { verifySpeechCache } from './cache.ts';
 
@@ -52,6 +53,10 @@ export function createLocalSpeechProvider(options: {
   let idle: ReturnType<typeof setTimeout> | undefined;
   let preparing: Preparation | undefined;
   let closed = false;
+  let stderr = '';
+  const failed: {
+    last?: { stage: string; exitCode?: number | null; signal?: string | null; detail?: string };
+  } = {};
   const cached = (async () => {
     const ready = await verifySpeechCache(options.cacheDir);
     const inputReady = ready || (await verifySpeechCache(options.cacheDir, true, true));
@@ -101,7 +106,7 @@ export function createLocalSpeechProvider(options: {
         [options.cacheDir],
         {
           cwd: options.cacheDir,
-          stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+          stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
           serialization: 'advanced',
           execArgv: ['--import', import.meta.resolve('tsx'), '--max-old-space-size=1536'],
           env: {
@@ -115,8 +120,13 @@ export function createLocalSpeechProvider(options: {
         },
       );
       child = worker;
-      const died = () => {
+      stderr = '';
+      worker.stderr?.setEncoding('utf8').on('data', (chunk: string) => {
+        stderr = (stderr + chunk).slice(-2000);
+      });
+      const died = (stage: string, exitCode?: number | null, signal?: string | null) => {
         if (child !== worker) return;
+        failed.last = { stage, exitCode, signal };
         const request = active?.request;
         preparationStatus(
           request?.method === 'transcribe' ||
@@ -125,8 +135,8 @@ export function createLocalSpeechProvider(options: {
         );
         stop(new SpeechProviderError('Local speech stopped. Try again.'));
       };
-      worker.on('error', died);
-      worker.on('exit', died);
+      worker.on('error', () => died('worker_error'));
+      worker.on('exit', (code, signal) => died('worker_exit', code, signal));
       worker.on('message', (raw: unknown) => {
         if (child !== worker || !active || !raw || typeof raw !== 'object') return;
         const reply = raw as {
@@ -134,6 +144,7 @@ export function createLocalSpeechProvider(options: {
           type?: unknown;
           progress?: unknown;
           reason?: unknown;
+          detail?: unknown;
           bytes?: unknown;
           text?: unknown;
         };
@@ -167,7 +178,11 @@ export function createLocalSpeechProvider(options: {
           reply.text.length <= 100_000
         )
           finished.resolve({ type: 'text', text: reply.text });
-        else
+        else {
+          failed.last = {
+            stage: 'worker',
+            detail: typeof reply.detail === 'string' ? reply.detail.slice(0, 2000) : undefined,
+          };
           finished.reject(
             new SpeechProviderError(
               reply.reason === 'silence'
@@ -179,6 +194,7 @@ export function createLocalSpeechProvider(options: {
                     : 'Local speech failed. Try again.',
             ),
           );
+        }
         advance();
       });
     }
@@ -216,9 +232,10 @@ export function createLocalSpeechProvider(options: {
       };
       const timeout = setTimeout(
         () => {
-          if (active === job)
+          if (active === job) {
+            failed.last = { stage: 'timeout' };
             stop(new SpeechProviderError('Local speech took too long. Try a shorter message.'));
-          else {
+          } else {
             const index = queue.indexOf(job);
             if (index >= 0) queue.splice(index, 1);
             job.cleanup();
@@ -231,7 +248,11 @@ export function createLocalSpeechProvider(options: {
       queue.push(job);
       try {
         advance();
-      } catch {
+      } catch (error) {
+        failed.last = {
+          stage: 'start',
+          detail: error instanceof Error ? error.message : undefined,
+        };
         stop(new SpeechProviderError('Local speech could not start.'));
       }
     });
@@ -317,12 +338,29 @@ export function createLocalSpeechProvider(options: {
       promise: Promise.resolve(),
     };
     preparing = preparation;
+    failed.last = undefined;
     preparation.promise = (async () => {
+      stderr = '';
       try {
         await mkdir(options.cacheDir, { recursive: true });
         await call({ method: 'prepare', transcription }, preparation.controller.signal);
         if (preparing === preparation) preparationStatus(transcription, { state: 'ready' });
       } catch (error) {
+        if (!preparation.controller.signal.aborted)
+          logFailure(
+            'speech_prepare_failed',
+            {
+              message: failed.last?.detail ?? (error instanceof Error ? error.message : undefined),
+              stderr,
+            },
+            {
+              stage: failed.last?.stage ?? 'cache',
+              exitCode: failed.last?.exitCode,
+              signal: failed.last?.signal,
+              provider: 'local',
+              transcription,
+            },
+          );
         if (preparing === preparation)
           preparationStatus(transcription, {
             state: preparation.controller.signal.aborted ? 'not_downloaded' : 'failed',

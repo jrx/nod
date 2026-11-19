@@ -348,6 +348,30 @@ const decisionCases: Case[] = [
     true,
   ),
   step(
+    'informal-listing-edit-opens-editor',
+    words(
+      'no brecho.example.test clica no icone de lapis do anuncio da luminaria, muda o preço p 90 e salva as alteraçoes',
+    ),
+    {
+      website: 'https://brecho.example.test',
+      page: '/minha-loja/anuncios',
+      control: 'Editar anúncio: luminária de mesa',
+    },
+    true,
+  ),
+  step(
+    'informal-listing-edit-does-not-delete',
+    words(
+      'no brecho.example.test clica no icone de lapis do anuncio da luminaria, muda o preço p 90 e salva as alteraçoes',
+    ),
+    {
+      website: 'https://brecho.example.test',
+      page: '/minha-loja/anuncios',
+      control: 'Apagar anúncio: luminária de mesa',
+    },
+    false,
+  ),
+  step(
     'view-label-does-not-authorize-order',
     words('Show me the delivery cost for this desk. Do not order it.'),
     {

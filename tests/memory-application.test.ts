@@ -341,7 +341,7 @@ test(
       const before = await memoryFile();
       const unsupported = await ask('Review my synthetic project notes.', [
         { tool: 'fetch_content', args: { urls: ['https://example.test/refunds'] } },
-        learn(),
+        learn(undefined, true),
         learn([randomUUID()], true),
       ]);
       assert.equal(await memoryFile(), before);
@@ -712,7 +712,7 @@ test('a full memory file sheds the oldest archive entries before refusing a save
     [{ id: ids[1], text: 'A note.' }],
     '2026-02-01T00:00:00.000Z',
   );
-  assert.deepEqual(applied, []);
+  assert.deepEqual(applied, { applied: [], rejected: ['full'] });
   assert.deepEqual(render(full), unchanged);
 });
 
@@ -723,17 +723,161 @@ test('memory refuses card numbers and login links but keeps links with long nume
     'Amex 378282246310005',
     'Old Visa 4222222222222',
     'Old Visa 4222 2222 22222',
+    'Card 4111\n1111\n1111\n1111',
+    'Card 4111\t1111\t1111\t1111',
+    'Card 4111\r\n1111\r\n1111\r\n1111',
+    'Card 4111  1111 - 1111  1111',
     'Card 4111 1111 1111 1111 12/27',
     'Ref 7 4111 1111 1111 1111',
     'Dashboard at https://owner:example-pass@example.com/admin',
+    'Key sk-fixturefix\ntureABCD1234',
+    'Token eyJfixture.fixture\n  .fixturesig',
   ])
     assert.equal(unsafe(text), true, text);
   for (const text of [
     'Favourite thread: https://x.com/example/status/1987654321098765432',
     'Talk recap: https://www.linkedin.com/feed/update/urn:li:activity:7254321098765432109/',
     'Order 12345678901234 arrives Friday.',
+    'Cheers,\nSam',
   ])
     assert.equal(unsafe(text), false, text);
+});
+
+test('memory notes keep their line breaks from every writer while other control characters stay out', async () => {
+  const memory = createMemoryService({
+    pool: {} as pg.Pool,
+    ownerId: 'multiline-owner',
+    store: memoryObjectStore(),
+  });
+  const added = await memory.add({ area: 'about', text: 'Line one\nLine two' });
+  await memory.importNotes({ notes: [{ area: 'routines', text: 'Garden\n- beds\n- shed' }] });
+  await memory.restate([{ area: 'about', slug: 'onboarding', text: 'Role\n\tDesigner' }]);
+  const kept = (await memory.load()).entries.map((entry) => entry.text).toSorted();
+  assert.deepEqual(kept, ['Garden\n- beds\n- shed', 'Line one\nLine two', 'Role\n\tDesigner']);
+  await memory.change(added, { text: 'Line one\nLine three' });
+  const tree = await memory.load();
+  assert.ok(tree.entries.some((entry) => entry.text === 'Line one\nLine three'));
+  assert.ok(tree.archive.some((entry) => entry.text === 'Line one\nLine two'));
+  assert.ok((await memory.context()).includes('about/line-one-line-two: Line one\n  Line three'));
+  for (const text of ['Line one\rLine two', 'Bell\u0007', 'Escape\u001b[31m'])
+    await assert.rejects(memory.add({ area: 'about', text }), text);
+
+  const said = [
+    {
+      id: ids[1],
+      text: 'My email sign-off is:\n\nCheers,\nSam\n\nunless it is formal, then:\n\nKind regards,\nSam',
+    },
+  ];
+  const add = (text: string, quote: string, slug = 'email-signoff') => ({
+    op: 'add',
+    area: 'preferences',
+    slug,
+    text,
+    m: [1],
+    quote,
+    sensitive: false,
+  });
+  const learned = await memory.edit((fresh) =>
+    applyOps(
+      fresh,
+      [
+        add(
+          'Email sign-off: "Cheers,\nSam"; formal: "Kind regards,\nSam"',
+          'Cheers,\nSam\n\nunless it is formal',
+        ),
+        add('Formal sign-off: Kind regards, Sam', 'Kind regards, Sam', 'formal-signoff'),
+        add('Bell\u0007', 'Cheers', 'bell'),
+        add('Carriage\rreturn', 'Cheers', 'carriage'),
+        add('Sign-off reused', 'Cheers,\nAlex', 'not-verbatim'),
+      ],
+      said,
+      '2026-02-01T00:00:00.000Z',
+      'stated',
+    ),
+  );
+  assert.deepEqual(
+    learned.applied.map(({ path }) => path),
+    ['preferences/email-signoff', 'preferences/formal-signoff'],
+  );
+  assert.deepEqual(learned.rejected, ['invalid', 'invalid', 'quote']);
+  const signoff = (await memory.load()).entries.find((entry) => entry.slug === 'email-signoff');
+  assert.equal(signoff?.text, 'Email sign-off: "Cheers,\nSam"; formal: "Kind regards,\nSam"');
+  assert.equal(signoff?.quote, 'Cheers,\nSam\n\nunless it is formal');
+  assert.deepEqual(
+    await memory.edit((fresh) =>
+      applyOps(
+        fresh,
+        [
+          {
+            op: 'archive',
+            path: 'preferences/formal-signoff',
+            reason: 'obsolete',
+            m: [1],
+            quote: 'formal, then:\n\nKind regards',
+          },
+        ],
+        said,
+        '2026-02-02T00:00:00.000Z',
+        'stated',
+      ),
+    ),
+    {
+      applied: [
+        {
+          operation: 'archive',
+          path: 'preferences/formal-signoff',
+          text: 'Formal sign-off: Kind regards, Sam',
+        },
+      ],
+      rejected: [],
+    },
+  );
+  assert.deepEqual(
+    applyOps(
+      emptyTree(),
+      [add('Accent only', '\u0301\n\u0301')],
+      [{ id: ids[1], text: 'Line one\nLine two' }],
+      '2026-02-01T00:00:00.000Z',
+    ),
+    { applied: [], rejected: ['quote'] },
+  );
+  assert.deepEqual(
+    applyOps(
+      emptyTree(),
+      [add('x'.repeat(4001), 'Line one')],
+      [{ id: ids[1], text: 'Line one\nLine two' }],
+      '2026-02-01T00:00:00.000Z',
+    ).rejected,
+    ['invalid'],
+  );
+  assert.deepEqual(
+    applyOps(
+      emptyTree(),
+      [add('Card on file', 'Card 4111\n1111\n1111\n1111')],
+      [{ id: ids[1], text: 'Card 4111\n1111\n1111\n1111' }],
+      '2026-02-01T00:00:00.000Z',
+    ),
+    { applied: [], rejected: ['secret'] },
+  );
+  const replacing = (replaces: string[], archived: string[] = []) =>
+    applyOps(
+      treeOf(entry({ slug: 'old-signoff', text: 'Signs off with Best.' })),
+      [
+        ...archived.map((path) => ({
+          op: 'archive',
+          path,
+          reason: 'obsolete',
+          m: [1],
+          quote: 'Cheers',
+        })),
+        { ...add('Sign-off: Cheers', 'Cheers', 'signoff'), replaces },
+      ],
+      [{ id: ids[1], text: 'Cheers' }],
+      '2026-02-01T00:00:00.000Z',
+      'stated',
+    ).rejected;
+  assert.deepEqual(replacing(['preferences/missing-signoff']), ['missing']);
+  assert.deepEqual(replacing(['about/old-signoff'], ['about/old-signoff']), []);
 });
 
 test('repair archives expired, stale and duplicate entries, keeps distinct numbers and never deletes', () => {

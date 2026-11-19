@@ -41,6 +41,8 @@ import { MessageLinkTooltip } from './message-link-tooltip';
 import { Tooltip } from './tooltip';
 import type { ImagePreview } from './attachment-images';
 import { MessagePresentation } from './message-presentation';
+import { BugReportCard } from './bug-report-card';
+import { ScheduleRunTrack } from './schedule-run';
 import { formatFullDateTime, formatTime, useDateFormat } from '../lib/date-format';
 import { copyContent, selectedText } from '../lib/clipboard';
 
@@ -298,8 +300,8 @@ function WorkLabel({ work }: { work: MessageWork }) {
       {work.status !== 'idle' && <span className="message-work-dot" aria-hidden="true" />}
       <span className="message-work-title">{work.title}</span>
       {work.status === 'working' && (
-        <span className="message-work-step" role="status">
-          <LiveLine item={work.live} />
+        <span className="message-work-step">
+          <LiveLine item={work.live} history={false} />
         </span>
       )}
     </>
@@ -354,6 +356,10 @@ export function MessageBubble({
   handoffPaused?: boolean;
 }) {
   const dateFormat = useDateFormat();
+  const run =
+    message.role === 'assistant' && message.presentation?.type === 'schedule-run'
+      ? message.presentation
+      : null;
   const visibleText =
     (message.role === 'user' ? message.displayText : undefined) ??
     message.audioCaption ??
@@ -690,7 +696,8 @@ export function MessageBubble({
     >
       <div className="message-content">
         {work && <WorkLabel work={work} />}
-        <div className="message-row">
+        {run && <ScheduleRunTrack run={run} />}
+        <div className="message-row" hidden={run?.outcome === 'failed'}>
           <div className={`message-bubble${!streaming && shownReaction ? ' has-reaction' : ''}`}>
             <div
               className="message-body"
@@ -795,9 +802,18 @@ export function MessageBubble({
               {message.role === 'assistant' &&
                 !streaming &&
                 message.presentation &&
-                message.presentation.type !== 'apps' && (
+                message.presentation.type !== 'apps' &&
+                message.presentation.type !== 'schedule-run' &&
+                (message.presentation.type === 'bug-report' ? (
+                  <BugReportCard
+                    key={message.presentation.draftId}
+                    draftId={message.presentation.draftId}
+                    title={message.presentation.title}
+                    summary={message.presentation.summary}
+                  />
+                ) : (
                   <MessagePresentation value={message.presentation} messageId={message.id} />
-                )}
+                ))}
               {message.role === 'assistant' && message.attachments.length > 0 && (
                 <MessageAttachments
                   attachments={message.attachments.filter(

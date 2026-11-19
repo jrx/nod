@@ -1,6 +1,7 @@
 import { createHmac, randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { z } from 'zod';
+import { modelServiceError } from '../model-error.ts';
 import {
   ChannelSetupFailure,
   telegramSecret,
@@ -68,6 +69,17 @@ function publicWebhook(value: string | undefined, provider: string, expected?: s
   return url.href;
 }
 
+function unreachable(error: unknown) {
+  let cause = error;
+  for (let depth = 0; depth < 4 && cause && typeof cause === 'object'; depth++) {
+    const { name, code } = cause as { name?: unknown; code?: unknown };
+    if (name === 'TimeoutError') return 'timed out after 15 seconds';
+    if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(code)) return code;
+    cause = (cause as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
 export function createChatSdkSetupVerifier(
   options: {
     fetch?: typeof fetch;
@@ -85,10 +97,44 @@ export function createChatSdkSetupVerifier(
       expected ? new URL(expected).href : undefined,
     );
   }
-  async function json(url: string, init: RequestInit = {}) {
-    const response = await request(url, { ...init, signal: AbortSignal.timeout(15_000) });
-    if (!response.ok) throw new ChannelSetupFailure('verification_failed');
-    return z.record(z.string(), z.unknown()).parse(await response.json());
+  async function json(url: string, init: RequestInit = {}, secrets: string[] = []) {
+    const target = new URL(url);
+    const service =
+      target.hostname === 'api.telegram.org'
+        ? `Telegram ${target.pathname.split('/').at(-1)}`
+        : 'WhatsApp Cloud API';
+    const lost = (error: unknown) => {
+      const reason = unreachable(error);
+      return new ChannelSetupFailure(
+        'verification_failed',
+        `${service} could not be reached${reason ? `: ${reason}` : ''}.`,
+      );
+    };
+    let response: Response;
+    try {
+      response = await request(url, { ...init, signal: AbortSignal.timeout(15_000) });
+    } catch (error) {
+      throw lost(error);
+    }
+    if (response.ok) {
+      const body = await response.json().catch((error: unknown) => {
+        throw unreachable(error) ? lost(error) : error;
+      });
+      const data = z.record(z.string(), z.unknown()).parse(body);
+      if (data.ok !== false && !data.error) return data;
+      response = Response.json(data, { status: response.status });
+    }
+    throw new ChannelSetupFailure(
+      'verification_failed',
+      (
+        await modelServiceError(
+          response,
+          service,
+          secrets.flatMap((value) => [value, encodeURIComponent(value)]),
+          ['message', 'description', 'type', 'code', 'error_code', 'status', 'param'],
+        )
+      ).message,
+    );
   }
   return {
     async verify(provider, input): ReturnType<ChannelSetupVerifier['verify']> {
@@ -99,7 +145,8 @@ export function createChatSdkSetupVerifier(
           const value = parsed.data;
           const webhookEndpoint = endpoint(value.webhookUrl, provider);
           const base = `https://api.telegram.org/bot${value.botToken}`;
-          const me = await json(`${base}/getMe`);
+          const secrets = [value.botToken, value.webhookUrl ?? ''];
+          const me = await json(`${base}/getMe`, {}, secrets);
           const account = z
             .object({
               id: z.number().int().positive(),
@@ -110,7 +157,7 @@ export function createChatSdkSetupVerifier(
             .parse(me.result);
           if (me.ok !== true || String(account.id) !== value.botToken.split(':')[0])
             throw new ChannelSetupFailure('verification_failed');
-          const existing = await json(`${base}/getWebhookInfo`);
+          const existing = await json(`${base}/getWebhookInfo`, {}, secrets);
           const webhook = z.object({ url: z.string() }).parse(existing.result);
           if (existing.ok !== true) throw new ChannelSetupFailure('verification_failed');
           if (!webhookEndpoint && webhook.url) throw new ChannelSetupFailure('existing_webhook');
@@ -170,9 +217,14 @@ export function createChatSdkSetupVerifier(
           'appsecret_proof',
           createHmac('sha256', value.appSecret).update(value.accessToken).digest('hex'),
         );
-        const data = await json(url.href, {
-          headers: { Authorization: `Bearer ${value.accessToken}` },
-        });
+        const data = await json(
+          url.href,
+          { headers: { Authorization: `Bearer ${value.accessToken}` } },
+          [
+            ...Object.values(value).filter((item): item is string => typeof item === 'string'),
+            url.searchParams.get('appsecret_proof')!,
+          ],
+        );
         const account = z
           .object({
             id: z.string(),
@@ -222,20 +274,27 @@ export function createChatSdkSetupVerifier(
           .regex(telegramSecret)
           .parse(environment.TELEGRAM_WEBHOOK_SECRET_TOKEN);
         if (!webhookEndpoint) throw new ChannelSetupFailure('invalid_input');
-        const registered = await json(`https://api.telegram.org/bot${value.botToken}/setWebhook`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            url: webhookEndpoint,
-            secret_token: secret,
-            allowed_updates: ['message', 'message_reaction'],
-            drop_pending_updates: false,
-          }),
-        });
+        const registered = await json(
+          `https://api.telegram.org/bot${value.botToken}/setWebhook`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              url: webhookEndpoint,
+              secret_token: secret,
+              allowed_updates: ['message', 'message_reaction'],
+              drop_pending_updates: false,
+            }),
+          },
+          [value.botToken, secret, webhookEndpoint],
+        );
         if (registered.ok !== true || registered.result !== true)
           throw new ChannelSetupFailure('webhook_failed');
-      } catch {
-        throw new ChannelSetupFailure('webhook_failed');
+      } catch (error) {
+        throw new ChannelSetupFailure(
+          'webhook_failed',
+          error instanceof ChannelSetupFailure ? error.details : undefined,
+        );
       }
     },
     async unregister(provider, environment) {
@@ -243,11 +302,15 @@ export function createChatSdkSetupVerifier(
       const { botToken } = telegramInput.pick({ botToken: true }).parse({
         botToken: environment.TELEGRAM_BOT_TOKEN,
       });
-      await json(`https://api.telegram.org/bot${botToken}/deleteWebhook`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ drop_pending_updates: true }),
-      });
+      await json(
+        `https://api.telegram.org/bot${botToken}/deleteWebhook`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ drop_pending_updates: true }),
+        },
+        [botToken],
+      );
     },
   };
 }

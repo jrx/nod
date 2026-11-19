@@ -21,6 +21,7 @@ import {
 import { api, ApiError, errorMessage } from '../lib/api';
 import { desktopFeedbackContext } from '../lib/desktop';
 import { feedbackActivitySnapshot } from '../lib/feedback-activity';
+import { feedbackClientState } from '../lib/feedback-client';
 import { feedbackErrorsAvailable, feedbackErrorsSnapshot } from '../lib/feedback-errors';
 import { clipboardFiles } from '../lib/composer-editor';
 import type { FeedbackAttachment } from '../lib/feedback-attachment';
@@ -357,6 +358,7 @@ function FeedbackDraftDialog({
         activity: feedbackActivitySnapshot(),
         errors: feedbackErrorsSnapshot(),
         errorsAvailable: feedbackErrorsAvailable(),
+        client: feedbackClientState(),
       }),
       signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]),
     })

@@ -24,6 +24,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { appendFile, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
+import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
@@ -46,8 +47,13 @@ import { registerArtifactFileHandlers } from './artifact-file-handlers.mjs';
 import { saveArtifactDownload } from './downloads.mjs';
 import { createDesktopLifecycle, startupErrorDetails } from './lifecycle.mjs';
 import { createMacEncryption } from './mac-encryption.mjs';
-import { createDesktopUpdater, createUpdateSource, startDesktopUpdateChecks } from './updates.mjs';
-import { startWindowsInstall } from './windows-update.mjs';
+import {
+  createDesktopUpdater,
+  createUpdateSource,
+  macInstallerRunning,
+  startDesktopUpdateChecks,
+} from './updates.mjs';
+import { clearInstalledWindowsUpdates, startWindowsInstall } from './windows-update.mjs';
 import { appOpenPath } from './app-links.mjs';
 import { trustSystemCertificates } from './system-certificates.mjs';
 import { opensAtLogin, setOpenAtLogin } from './login-item.mjs';
@@ -134,6 +140,7 @@ let freshAppOpening;
 let freshAppOpenCapture;
 let appOpeningDeferred = false;
 let appOpeningConsentVersion = 0;
+let localSetupObservation;
 const claimedAppOpens = new Set();
 const appUIOpenings = new Map();
 function deferAppOpening() {
@@ -163,13 +170,18 @@ let nativePreferencesPending = false;
 let guidedStartup = false;
 let quitting = false;
 let installingUpdate = false;
+let macInstallerBusy = false;
 let updateSource;
 let updates;
 let checkingUpdates;
 let updateRequestedManually = false;
+let updateRestartConfirmed = false;
 let updatePhase = 'idle';
+let updateStep = 'checking';
 let updateProgress;
-let updateFailed = false;
+let updateFailure;
+let nextUpdateFailureId = 0;
+let installUpdateOnQuit = true;
 let dismissedUpdateVersion;
 let pendingPreload;
 let stopUpdateChecks;
@@ -223,20 +235,39 @@ const lifecycle = createDesktopLifecycle({
   prepareRuntime: async ({ signal, onStatus, onStorageReady }) => {
     await mkdir(profileRoot, { recursive: true, mode: 0o700 });
     await writeDiagnostic('Preparing local runtime.').catch(() => {});
-    const { prepareRuntime } = await import(
-      pathToFileURL(join(engineRoot, 'desktop', 'runtime', 'index.mjs')).href
-    );
-    const prepared = await prepareRuntime({
-      dataRoot: profileRoot,
-      resourcesPath: engineRoot,
-      preserveRuntimeCache: testInstall,
-      resolveDownloadUrl: updateSource?.runtimeDownloadUrl,
-      signal,
-      onStatus,
-      onStorageReady,
-    });
-    await writeDiagnostic('Local runtime prepared.').catch(() => {});
-    return prepared;
+    const started = Date.now();
+    let phase = 'runtime';
+    let step;
+    try {
+      const { prepareRuntime } = await import(
+        pathToFileURL(join(engineRoot, 'desktop', 'runtime', 'index.mjs')).href
+      );
+      const prepared = await prepareRuntime({
+        dataRoot: profileRoot,
+        resourcesPath: engineRoot,
+        preserveRuntimeCache: testInstall,
+        resolveDownloadUrl: updateSource?.runtimeDownloadUrl,
+        signal,
+        onStatus: (value) => {
+          step = typeof value === 'string' ? value : value?.message;
+          onStatus(value);
+        },
+        onStorageReady: async (storage) => {
+          phase = 'engine';
+          await onStorageReady(storage);
+          phase = 'runtime';
+        },
+      });
+      await writeDiagnostic(
+        `Local runtime prepared. ${diagnosticFields({ ms: Date.now() - started })}`,
+      ).catch(() => {});
+      return prepared;
+    } catch (error) {
+      await writeDiagnostic(
+        `Local runtime failed. ${diagnosticFields({ phase, step, code: error.code, signal: error.signal, ms: Date.now() - started })}`,
+      ).catch(() => {});
+      throw error;
+    }
   },
   validateStart,
   startEngine,
@@ -355,6 +386,7 @@ function update(value) {
   if (tray) tray.setToolTip(`Nod — ${status.phase === 'ready' ? 'Running' : status.message}`);
   showDownloadProgress();
   updateReadinessNotice();
+  captureLocalSetup();
 }
 
 function showDownloadProgress() {
@@ -614,18 +646,80 @@ function showNotificationConfirmation() {
   notification.show();
 }
 
-async function writeDiagnostic(value) {
-  const directory = join(profileRoot, 'logs');
-  const path = join(directory, 'startup.log');
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  if ((await stat(path).catch(() => undefined))?.size > 64 * 1024)
-    await writeFile(path, '', { mode: 0o600 });
-  const line = bounded(value, 256 * 1024)
-    .replaceAll(engineRoot, '<engine>')
-    .replaceAll(profileRoot, '<profile>')
-    .replace(/https?:\/\/\S+/g, '<url>')
-    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '<address>');
-  await appendFile(path, `${new Date().toISOString()} ${line}\n`, { mode: 0o600 });
+let diagnosticWrites = Promise.resolve();
+function writeDiagnostic(value) {
+  const written = diagnosticWrites.then(async () => {
+    const directory = join(profileRoot, 'logs');
+    const path = join(directory, 'startup.log');
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    if ((await stat(path).catch(() => undefined))?.size > 64 * 1024) {
+      const newest = (await readFile(path)).subarray(-32 * 1024);
+      await writeFile(path, newest.subarray(newest.indexOf(10) + 1), { mode: 0o600 });
+    }
+    const home = homedir() || '<home>';
+    const line = bounded(value, 256 * 1024)
+      .replaceAll(engineRoot, '<engine>')
+      .replaceAll(profileRoot, '<profile>')
+      .replaceAll(home, '<home>')
+      .replaceAll(home.replaceAll('\\', '/'), '<home>')
+      .replace(/https?:\/\/\S+/g, '<url>')
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '<address>');
+    await appendFile(path, `${new Date().toISOString()} ${line}\n`, { mode: 0o600 });
+  });
+  diagnosticWrites = written.catch(() => {});
+  return written;
+}
+
+function diagnosticFields(details) {
+  return Object.entries(details)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(
+      ([key, value]) =>
+        `${key}=${/\s/.test(String(value)) ? JSON.stringify(String(value)) : value}`,
+    )
+    .join(' ');
+}
+
+function updateEvent(stage, details = {}) {
+  return writeDiagnostic(`update ${stage} ${diagnosticFields(details)}`.trimEnd()).catch(() => {});
+}
+
+async function recordStart() {
+  const build = await feedbackContext();
+  const log = await readFile(join(profileRoot, 'logs', 'startup.log'), 'utf8').catch(() => '');
+  const previous = [...log.matchAll(/^\S+ start version=(\S+)/gm)].at(-1)?.[1];
+  const executable = process.execPath.toLowerCase();
+  const within = (root) => Boolean(root) && executable.startsWith(`${root.toLowerCase()}\\`);
+  await writeDiagnostic(
+    `start ${diagnosticFields({
+      version: build.appVersion,
+      commit: build.appRelease ?? 'unknown',
+      modified: build.appModified ?? 'unknown',
+      mode: app.isPackaged ? 'packaged' : 'development',
+      platform: build.platform,
+      os: process.getSystemVersion(),
+      electron: process.versions.electron,
+      locale: app.getLocale(),
+      previous: previous ?? 'unknown',
+      updated: previous ? previous !== build.appVersion : 'unknown',
+      install:
+        process.platform === 'darwin'
+          ? app.isInApplicationsFolder()
+            ? 'applications'
+            : 'other'
+          : process.platform !== 'win32'
+            ? 'other'
+            : within(process.env.LOCALAPPDATA)
+              ? 'per-user'
+              : ['ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432'].some((name) =>
+                    within(process.env[name]),
+                  )
+                ? 'per-machine'
+                : 'other',
+      translocated:
+        process.platform === 'darwin' ? executable.includes('/apptranslocation/') : undefined,
+    })}`,
+  );
 }
 
 function isSetupURL(url) {
@@ -989,6 +1083,15 @@ function showEngine({ focus = true } = {}) {
   engineWindows.add(engineWindow);
   protectWindow(engineWindow, engineOrigin);
   const window = engineWindow;
+  window.webContents.on('render-process-gone', (_event, details) => {
+    if (quitting || window.isDestroyed() || details.reason === 'clean-exit') return;
+    void writeDiagnostic(
+      `Window renderer stopped (${details.reason}, code ${details.exitCode}).`,
+    ).catch(() => {});
+    window.destroy();
+    update({ windowError: 'Nod’s window stopped unexpectedly. Try again or report the bug.' });
+    void showSettings('general', true);
+  });
   const failed = () => {
     if (quitting || window.isDestroyed() || !pendingRenderers.has(window)) return;
     welcomeNavigation ||= initialWelcome;
@@ -1078,12 +1181,18 @@ function deliverFeedbackRequest(window) {
   window.webContents.send('nod:feedback:open');
 }
 
+function buildIdentity(nodBuild) {
+  return {
+    appRelease: typeof nodBuild?.source === 'string' ? nodBuild.source : null,
+    appModified: typeof nodBuild?.modified === 'boolean' ? nodBuild.modified : null,
+  };
+}
+
 async function feedbackContext() {
   const { nodBuild } = JSON.parse(await readFile(join(desktopRoot, 'package.json'), 'utf8'));
   return {
     appVersion: app.getVersion(),
-    appRelease: typeof nodBuild?.source === 'string' ? nodBuild.source : null,
-    appModified: typeof nodBuild?.modified === 'boolean' ? nodBuild.modified : null,
+    ...buildIdentity(nodBuild),
     development: !app.isPackaged,
     source: 'desktop',
     platform: `${process.platform}-${process.arch}`,
@@ -1360,6 +1469,8 @@ function captureFreshAppOpen() {
 
 function captureStartupPath(path) {
   if (appOpeningDeferred || onboardingCompleted || welcomePassed || remoteConnection) return;
+  localSetupObservation = path === 'local' ? {} : undefined;
+  captureLocalSetup();
   const openedAt = Date.now();
   return Promise.resolve(freshAppOpenCapture)
     .then(async () => {
@@ -1384,10 +1495,57 @@ function captureStartupPath(path) {
         distinctId: analytics.distinctId,
         openedAt,
         uuid: randomUUID(),
-        properties: { path },
+        properties: { path, local_setup_telemetry_available: true },
       });
     })
     .catch(() => {});
+}
+
+function captureLocalSetup() {
+  const observation = localSetupObservation;
+  if (
+    !observation ||
+    appOpeningDeferred ||
+    quitting ||
+    onboardingCompleted ||
+    welcomePassed ||
+    remoteConnection
+  )
+    return;
+  const phase = (value) =>
+    value === 'error'
+      ? 'failed'
+      : ['idle', 'preparing', 'starting', 'ready'].includes(value)
+        ? value
+        : 'unknown';
+  const properties = {
+    runtime_status: phase(status.runtime?.phase),
+    startup_status: phase(status.phase),
+    setup_available: status.engineReady === true,
+    platform: ['darwin', 'win32', 'linux'].includes(process.platform) ? process.platform : 'other',
+  };
+  const key = JSON.stringify(properties);
+  if (observation.previous === key) return;
+  observation.previous = key;
+  const openedAt = Date.now();
+  const consentVersion = appOpeningConsentVersion;
+  void (async () => {
+    const saved = await settings.get();
+    if (saved.welcome?.usageData !== true) return;
+    const analytics = await analyticsConfiguration();
+    if (!analytics.enabled || !analytics.distinctId || testInstall) return;
+    await captureNativeAnalytics({
+      event: 'local_setup_observed',
+      distinctId: analytics.distinctId,
+      openedAt,
+      uuid: randomUUID(),
+      properties,
+      verifyConsent: () =>
+        !quitting &&
+        localSetupObservation === observation &&
+        appOpeningConsentVersion === consentVersion,
+    });
+  })().catch(() => {});
 }
 
 async function engineRequest(path, options = {}) {
@@ -1813,6 +1971,17 @@ async function finishEnginePreparation(pending = false) {
   return status;
 }
 
+function reportUpdateStatus(phase, progress) {
+  if (['checking', 'preparing', 'downloading'].includes(phase)) updateStep = phase;
+  const percent = Number.isFinite(progress)
+    ? Math.min(100, Math.max(0, Math.floor(progress * 100)))
+    : undefined;
+  if (phase === updatePhase && percent === updateProgress) return;
+  updatePhase = phase;
+  updateProgress = percent;
+  refreshUpdateMenu();
+}
+
 function publicUpdateStatus() {
   return {
     phase: updatePhase,
@@ -1820,7 +1989,115 @@ function publicUpdateStatus() {
     ...(updateProgress === undefined ? {} : { progress: updateProgress }),
     ...(updates?.ready ? { readyVersion: updates.ready.version } : {}),
     ...(dismissedUpdateVersion ? { dismissedVersion: dismissedUpdateVersion } : {}),
+    ...(updateFailure ? { failure: { ...updateFailure } } : {}),
   };
+}
+
+function updateFailureDetails(error) {
+  const parts = [];
+  const seen = new Set();
+  for (
+    let current = error;
+    current && parts.length < 3 && !seen.has(current);
+    current = current.cause
+  ) {
+    seen.add(current);
+    let text = String(current.message || 'The update operation failed.').slice(0, 8000);
+    const start = text.indexOf('{');
+    let details;
+    if (start >= 0) {
+      try {
+        details = JSON.parse(text.slice(start));
+      } catch {}
+      text = text.slice(0, start);
+      for (const key of ['reason', 'message'])
+        if (typeof details?.[key] === 'string') text += ` ${details[key]}`;
+    }
+    const value = bounded(current.code ?? details?.code);
+    const code =
+      /^-?\d{1,5}$/.test(value) ||
+      [
+        'EACCES',
+        'EPERM',
+        'ENOENT',
+        'ENOSPC',
+        'EBUSY',
+        'EEXIST',
+        'EIO',
+        'EROFS',
+        'ECONNRESET',
+        'ECONNREFUSED',
+        'ECONNABORTED',
+        'ENOTFOUND',
+        'EAI_AGAIN',
+        'ETIMEDOUT',
+        'ABORT_ERR',
+        'ERR_ABORTED',
+        'ERR_INVALID_URL',
+        'ERR_SOCKET_CLOSED',
+        'ERR_STREAM_PREMATURE_CLOSE',
+        'UND_ERR_CONNECT_TIMEOUT',
+        'UND_ERR_HEADERS_TIMEOUT',
+        'UND_ERR_BODY_TIMEOUT',
+        'UND_ERR_SOCKET',
+        'NOD_RUNTIME_STOP_FAILED',
+        'NOD_WSL_REQUIRED',
+        'RUNTIME_ARCHIVE_REQUIRED',
+      ].includes(value)
+        ? `${value}: `
+        : '';
+    const status = [current.status, current.statusCode, details?.status, details?.statusCode].find(
+      (value) => Number.isInteger(value) && value >= 100 && value <= 599,
+    );
+    const message = bounded(text, 8000)
+      .replace(/\b(?:Bearer|Basic)\s+\S+/gi, '<redacted>')
+      .replace(/\b(?:authorization|cookie|set-cookie)\s*:[^\r\n]+/gi, '<redacted>')
+      .replace(
+        /\b(?:[a-z_-]*(?:password|secret|token|credential|key)|passwd|pwd)\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/gi,
+        '<redacted>',
+      )
+      .replace(/https?:\/\/[^\s<>"']+/gi, '<url>')
+      .replace(/'[^'\r\n]*[\\/][^'\r\n]*'|"[^"\r\n]*[\\/][^"\r\n]*"/g, '<path>')
+      .replace(/(?:[A-Z]:[\\/]|\\\\)[^\r\n<>"']+/gi, '<path>')
+      .replace(/(?<![\w<>])\/[^/\s:'"<>][^\r\n:'"<>]*/g, '<path>')
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '<address>')
+      .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b(?::\d{1,5})?(?:[/?#][^\s<>"']*)?/g, '<host>')
+      .replace(
+        /\[?(?:[a-f0-9]{0,4}:){2,7}[a-f0-9]{0,4}(?:%[a-z0-9_.-]+)?\]?(?::\d{1,5})?(?:[/?#][^\s<>"']*)?/gi,
+        '<host>',
+      )
+      .replace(
+        /\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}\b(?::\d{1,5})?(?:[/?#][^\s<>"']*)?/gi,
+        '<host>',
+      )
+      .replace(/\blocalhost(?::\d{1,5})?/gi, '<host>')
+      .replace(/(\b(?:ENOTFOUND|EAI_AGAIN)\s+)[^\s,;]+/g, '$1<host>')
+      .replace(/[A-Za-z0-9+/_=-]{24,}/g, '<redacted>');
+    parts.push(`${code}${message}${status ? ` (HTTP ${status})` : ''}`);
+  }
+  return parts.join(' ').slice(0, 2000);
+}
+
+async function openUpdateDownload() {
+  while (!installingUpdate) {
+    try {
+      await shell.openExternal('https://nod.n8n.io/docs/get-started/install-desktop/');
+      return;
+    } catch (error) {
+      const detail = updateFailureDetails(error);
+      await updateEvent('download-page-failed', { message: detail });
+      const { response } = await dialog.showMessageBox({
+        type: 'info',
+        message: 'Nod could not open the download page.',
+        detail: `${detail}\n\nhttps://nod.n8n.io/docs/get-started/install-desktop/`,
+        buttons: ['Try again', quitting ? 'Quit Nod' : 'Not now'],
+        defaultId: 1,
+        cancelId: 1,
+        noLink: true,
+      });
+      if (response !== 0) return;
+    }
+  }
 }
 
 function publishUpdateStatus() {
@@ -1838,7 +2115,7 @@ function refreshUpdateMenu() {
           checking: 'Checking for updates…',
           preparing: 'Preparing update…',
           downloading: 'Downloading update…',
-        }[updatePhase] || (updateFailed ? 'Update Failed. Try Again…' : 'Check for Updates…');
+        }[updatePhase] || (updateFailure ? 'Update Failed. Try Again…' : 'Check for Updates…');
   const item = Menu.getApplicationMenu?.()?.getMenuItemById('desktop-update');
   if (item) {
     item.label = label;
@@ -1858,7 +2135,7 @@ function refreshUpdateMenu() {
       Menu.buildFromTemplate([
         { label: 'Open Nod', click: showEngine },
         { label: 'Settings…', click: () => showSettings() },
-        { label: 'Send feedback…', click: showFeedback },
+        { label: 'Report bug…', click: showFeedback },
         {
           label,
           enabled: Boolean(updates) && !checkingUpdates,
@@ -1880,13 +2157,16 @@ function refreshUpdateMenu() {
   publishUpdateStatus();
 }
 
-async function checkForUpdates(manual = true, restartReady = false) {
+async function checkForUpdates(manual = true, restartReady = false, confirmed = false) {
   if (!updates || quitting) return;
   if (checkingUpdates) {
     if (manual) updateRequestedManually = true;
+    if (confirmed) updateRestartConfirmed = true;
     return checkingUpdates;
   }
   updateRequestedManually = manual;
+  updateRestartConfirmed = confirmed;
+  updateStep = 'checking';
   const release = () => {
     if (checkingUpdates === checking) checkingUpdates = undefined;
     refreshUpdateMenu();
@@ -1900,8 +2180,14 @@ async function checkForUpdates(manual = true, restartReady = false) {
           return;
         }
         const previousVersion = updates.ready?.version;
+        if (!restartReady)
+          void updateEvent('check-started', {
+            trigger: updateRequestedManually ? 'manual' : 'automatic',
+          });
         const candidate = restartReady ? updates.ready : await updates.check();
-        updateFailed = false;
+        if (!restartReady)
+          void updateEvent('check-finished', { ready: candidate?.version ?? 'none' });
+        updateFailure = undefined;
         if (quitting) return;
         if (!candidate) {
           if (updateRequestedManually)
@@ -1912,36 +2198,56 @@ async function checkForUpdates(manual = true, restartReady = false) {
           if (candidate.version !== previousVersion) await notifyUpdate(candidate);
           if (!updateRequestedManually || quitting) return;
         }
-        const { response } = await dialog.showMessageBox({
-          message: `Nod ${candidate.version} is ready.`,
-          buttons: ['Restart', 'Later'],
-          defaultId: 1,
-          cancelId: 1,
-          noLink: true,
-        });
-        if (response !== 0 || quitting) return;
+        if (!updateRestartConfirmed) {
+          const { response } = await dialog.showMessageBox({
+            message: `Nod ${candidate.version} is ready.`,
+            buttons: ['Restart', 'Later'],
+            defaultId: 1,
+            cancelId: 1,
+            noLink: true,
+          });
+          void updateEvent('prompt', {
+            version: candidate.version,
+            response: response === 0 ? 'restart' : 'later',
+          });
+          if (response !== 0 || quitting) return;
+        }
         restarting = true;
         await updates.restart();
         return;
       } catch (error) {
         if (quitting) return;
-        if (!restarting) updateFailed = true;
-        await writeDiagnostic(error.message).catch(() => {});
+        const phase = restarting ? 'restart' : updateStep;
+        const message = updateFailureDetails(error);
+        if (
+          updateRequestedManually ||
+          updateFailure?.phase !== phase ||
+          updateFailure?.message !== message
+        )
+          updateFailure = { id: ++nextUpdateFailureId, phase, message };
+        publishUpdateStatus();
+        await updateEvent('error', {
+          phase,
+          message,
+        });
         if (quitting) return;
         if (!updateRequestedManually && !restarting) throw error;
         const { response } = await dialog.showMessageBox({
           type: 'info',
-          message: restarting ? 'Couldn’t restart Nod' : 'Couldn’t check for updates',
-          detail: 'You can keep using Nod and try again later.',
-          buttons: [restarting ? 'Retry restart' : 'Try again', 'Not now'],
-          defaultId: 1,
-          cancelId: 1,
+          message: restarting ? 'Couldn’t restart Nod' : 'Couldn’t update Nod',
+          detail: `${message}\n\nYou can keep using Nod.`,
+          buttons: [restarting ? 'Retry restart' : 'Try again', 'Download Nod', 'Not now'],
+          defaultId: 2,
+          cancelId: 2,
           noLink: true,
         });
+        if (response === 1 && !quitting) await openUpdateDownload();
         if (response !== 0 || quitting) return;
       }
     }
-  })().finally(release);
+  })()
+    .finally(() => diagnosticWrites)
+    .finally(release);
   checkingUpdates = checking;
   refreshUpdateMenu();
   return checking;
@@ -1996,18 +2302,21 @@ async function preloadUpdateImages(assets, signal) {
 }
 
 async function restartForUpdate() {
-  if (quitting || !(await confirmRestart())) return;
+  if (quitting) return;
+  void updateEvent('restart-requested', { version: updates?.ready?.version });
+  if (!(await confirmRestart())) return updateEvent('restart-deferred');
   update({ phase: 'updating', message: 'Updating…' });
   const window = [engineWindow, setupWindow].find((item) => item && !item.isDestroyed());
   if (engineWindow && !engineWindow.isDestroyed()) engineWindow.show();
   else await showSettings('general', true);
   await rememberState(window);
-  await quit(installUpdate);
+  await quit(installUpdate, undefined, true);
 }
 
 async function rememberState(window) {
   session.fromPartition(clientPartition).flushStorageData();
   const state = JSON.stringify({
+    version: updates?.ready?.version,
     path: URL.parse(window?.webContents.getURL() ?? '')?.pathname,
     bounds: window?.getNormalBounds(),
     maximized: window?.isMaximized(),
@@ -2018,12 +2327,31 @@ async function rememberState(window) {
     .catch(() => {});
 }
 
+async function openedDuringUpdateRestart() {
+  if (process.platform !== 'darwin' || !app.isPackaged || testInstall) return false;
+  const running = await macInstallerRunning('dev.nod.desktop.ShipIt').catch(async (error) => {
+    await updateEvent('installer-check-failed', { code: error.code, signal: error.signal });
+  });
+  macInstallerBusy = running !== false;
+  if (!running) return false;
+  const version = await resumeRead.then((text) => JSON.parse(text).version).catch(() => undefined);
+  const restart = typeof version === 'string' && version !== app.getVersion();
+  await updateEvent('installer-running', { restart });
+  return restart;
+}
+
 async function resumeState() {
   const text = await resumeRead;
   if (text === undefined) return;
   await rm(resumePath, { force: true }).catch(() => {});
   try {
     const saved = JSON.parse(text);
+    if (typeof saved.version === 'string' && /^\d+\.\d+\.\d+$/.test(saved.version))
+      void updateEvent('installed', {
+        expected: saved.version,
+        running: app.getVersion(),
+        applied: saved.version === app.getVersion(),
+      });
     pendingAppPath ||= appOpenPath(`nod://open${saved.path}`, appPages) || undefined;
     if (Number.isInteger(saved.port) && saved.port > 1023 && saved.port < 65536)
       resumePort = saved.port;
@@ -2081,18 +2409,23 @@ async function confirmRestart() {
   return response === 0 && !quitting;
 }
 
-async function installUpdate() {
+async function installUpdate({ relaunch = true } = {}) {
+  const version = updates?.ready?.version;
   if (process.platform === 'win32') {
+    await updateEvent('install-started', { method: 'windows-installer', version });
     await startWindowsInstall({
       directory: join(windowsUpdates, updates.ready.version),
       appPath: process.execPath,
       pid: process.pid,
       systemRoot: process.env.SystemRoot,
+      relaunch,
     });
+    await updateEvent('installer-launched', { version });
     installingUpdate = true;
     app.exit();
     return;
   }
+  await updateEvent('quit-and-install', { version });
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       autoUpdater.removeListener('error', failed);
@@ -2101,6 +2434,7 @@ async function installUpdate() {
     const failed = (error) => {
       cleanup();
       installingUpdate = false;
+      void updateEvent('error', { phase: 'install', message: updateFailureDetails(error) });
       reject(error);
     };
     const accepted = () => {
@@ -2118,7 +2452,13 @@ async function installUpdate() {
   });
 }
 
-async function quit(complete, failure = 'Nod could not finish shutting down.') {
+async function quitApp() {
+  if (installUpdateOnQuit && process.platform === 'win32' && updates?.ready)
+    await quit(() => installUpdate({ relaunch: false }), undefined, true);
+  else await quit(() => app.exit());
+}
+
+async function quit(complete, failure = 'Nod could not finish shutting down.', update = false) {
   quitting = true;
   stayAwake(false);
   await persistCurrentZoomFactor().catch(
@@ -2134,7 +2474,7 @@ async function quit(complete, failure = 'Nod could not finish shutting down.') {
   for (const notification of displayedNotifications) notification.close();
   await stoppingUpdates;
   await chatReadCursors.flush().catch(() => {});
-  await finishQuit(complete, failure);
+  await finishQuit(complete, failure, update);
 }
 
 async function removeAllData() {
@@ -2165,24 +2505,34 @@ async function removeAllData() {
   }, 'Nod could not remove all its data.');
 }
 
-async function finishQuit(complete, failure) {
+async function finishQuit(complete, failure, update = false) {
   while (true) {
+    let installing = false;
     try {
       await disposeArtifactFiles?.();
       await lifecycle.close();
+      installing = update;
       await complete();
       return;
     } catch (error) {
-      await writeDiagnostic(error.message).catch(() => {});
+      const detail = updateFailureDetails(error);
+      await writeDiagnostic(detail).catch(() => {});
       const { response } = await dialog.showMessageBox({
         type: 'warning',
-        message: failure,
-        detail: 'Try again to finish quitting.',
-        buttons: ['Try again', 'Quit anyway'],
-        defaultId: 0,
-        cancelId: 0,
+        message: installing ? 'Nod could not install the update.' : failure,
+        detail: `${detail}\n\n${installing ? 'Nod has stopped. Try the installation again or download Nod.' : 'Try again to finish quitting.'}`,
+        buttons: installing
+          ? ['Retry installation', 'Download Nod', 'Quit without updating']
+          : ['Try again', 'Quit anyway'],
+        defaultId: installing ? 2 : 0,
+        cancelId: installing ? 2 : 0,
         noLink: true,
       });
+      if (installing && response === 1) await openUpdateDownload();
+      if (installing && response !== 0) {
+        app.exit();
+        return;
+      }
       if (response === 1) {
         app.exit();
         return;
@@ -2236,6 +2586,8 @@ async function startEngine({ runtime, signal, pending = false }) {
     typeof nodBuild?.tracesToken === 'string' ? nodBuild.tracesToken : process.env.NOD_TRACES_TOKEN;
   if (tracesToken) knownSecrets.add(tracesToken);
   const analytics = await analyticsConfiguration().catch(() => ({ enabled: false }));
+  const build = buildIdentity(nodBuild);
+  const started = Date.now();
   const environment = {
     ...baseEnvironment(),
     ...runtime.env,
@@ -2245,6 +2597,10 @@ async function startEngine({ runtime, signal, pending = false }) {
     NOD_DESKTOP: 'true',
     NOD_HOST: '127.0.0.1',
     NOD_APP_VERSION: app.getVersion(),
+    ...(build.appRelease ? { NOD_APP_RELEASE: build.appRelease } : {}),
+    ...(build.appModified === null ? {} : { NOD_APP_MODIFIED: String(build.appModified) }),
+    NOD_ELECTRON_VERSION: process.versions.electron,
+    NOD_OS_VERSION: process.getSystemVersion(),
     NOD_DESKTOP_OWNER_ID: owner,
     NOD_DESKTOP_AUTH_TOKEN: authToken,
     NOD_DESKTOP_RUNTIME_PENDING: 'true',
@@ -2314,7 +2670,10 @@ async function startEngine({ runtime, signal, pending = false }) {
         `Nod’s background service stopped${enginePreferencesReady ? '' : ' before it was ready'}${Number.isInteger(code) ? ` (code ${code})` : ''}. Try again to restart it.`;
     stopNotifications?.({ clear: closingEngine || quitting });
     stopNotifications = undefined;
-    if (!closingEngine) void writeDiagnostic(`Engine exited with code ${code}.`).catch(() => {});
+    if (!closingEngine)
+      void writeDiagnostic(
+        `Engine exited with code ${code}. ${diagnosticFields({ phase: enginePreferencesReady ? 'engine-running' : 'engine-spawn', ms: Date.now() - started })}`,
+      ).catch(() => {});
     engine = undefined;
     enginePreferencesReady = false;
     engineOrigin = '';
@@ -2339,7 +2698,6 @@ async function startEngine({ runtime, signal, pending = false }) {
       showSettings('general', true);
     }
   });
-  const started = Date.now();
   const deadline = started + 120_000;
   let ready = false;
   let lastFailure = 'none';
@@ -2383,6 +2741,7 @@ async function prepare(options = {}) {
     return retryAfterFailure ? prepare(options) : status;
   }
   if (options?.retry === true) engineFailure = undefined;
+  const started = Date.now();
   preparing = (async () => {
     if (status.remote)
       update({
@@ -2406,7 +2765,9 @@ async function prepare(options = {}) {
     return lifecycle.start({ retry: options?.retry === true });
   })()
     .catch((error) => {
-      void writeDiagnostic(startupErrorDetails(error)).catch(() => {});
+      void writeDiagnostic(
+        `Startup failed. ${diagnosticFields({ phase: status.phase, stage: status.stage, code: error.code, ms: Date.now() - started })}\n${startupErrorDetails(error)}`,
+      ).catch(() => {});
       const deferred =
         error.code === 'NOD_RESTART_DEFERRED' &&
         engine &&
@@ -2477,12 +2838,16 @@ async function importRuntime() {
   return status;
 }
 
-if (!app.requestSingleInstanceLock()) app.quit();
+if (!app.requestSingleInstanceLock()) app.exit();
 else if (process.argv.includes('--quit')) app.exit();
+else if (await openedDuringUpdateRestart()) app.exit();
 else {
   if (testInstall) process.on('SIGTERM', () => app.quit());
   app.on('second-instance', (_event, argv) => {
-    if (argv.includes('--quit')) return void app.quit();
+    if (argv.includes('--quit')) {
+      installUpdateOnQuit = false;
+      return void app.quit();
+    }
     const path = argv.map((value) => appOpenPath(value, appPages)).find(Boolean);
     if (path) pendingAppPath = path;
     showEngine();
@@ -2493,14 +2858,13 @@ else {
     if (installingUpdate) return;
     event.preventDefault();
     if (quitting) return;
-    void quit(() => app.exit()).catch(
-      (error) => void writeDiagnostic(error.message).catch(() => {}),
-    );
+    void quitApp().catch((error) => void writeDiagnostic(error.message).catch(() => {}));
   });
   void app
     .whenReady()
     .then(async () => {
       app.setName(appName);
+      await recordStart().catch(() => {});
       const setupSession = session.fromPartition('nod-settings');
       setupSession.setPermissionCheckHandler(() => false);
       setupSession.setPermissionRequestHandler((_sender, _permission, callback) => callback(false));
@@ -2544,13 +2908,21 @@ else {
       if (app.isPackaged && !testInstall && ['darwin', 'win32'].includes(process.platform)) {
         const { nodBuild } = JSON.parse(await readFile(join(desktopRoot, 'package.json'), 'utf8'));
         const windows = process.platform === 'win32';
-        if (windows) await rm(windowsUpdates, { recursive: true, force: true }).catch(() => {});
+        if (windows)
+          await clearInstalledWindowsUpdates(windowsUpdates, app.getVersion()).catch(() => {});
         updateSource = createUpdateSource({ sourceUrl: nodBuild?.updateSourceUrl });
         updates = createDesktopUpdater({
           source: updateSource,
           currentVersion: app.getVersion(),
           native: windows ? undefined : autoUpdater,
           prepareRuntime: async (candidate, signal, report) => {
+            const { version } = candidate;
+            void updateEvent('offered', {
+              version,
+              commit: candidate.source,
+              installer_bytes: candidate.installer?.bytes,
+              runtime_bytes: candidate.runtime?.bytes ?? candidate.runtime?.archive?.bytes,
+            });
             const saved = await settings.get();
             const includeRuntime =
               !saved.serverUrl &&
@@ -2559,15 +2931,27 @@ else {
               const { stageWindowsUpdate } = await import(
                 pathToFileURL(join(engineRoot, 'desktop/runtime/windows.mjs')).href
               );
-              return stageWindowsUpdate(candidate, {
+              void updateEvent('download-started', {
+                version,
+                target: 'installer',
+                with_runtime: includeRuntime,
+              });
+              const staged = await stageWindowsUpdate(candidate, {
                 directory: windowsUpdates,
                 resourcesPath: engineRoot,
                 signal,
                 includeRuntime,
                 onProgress: (progress) => report('downloading', progress),
               });
+              void updateEvent('download-finished', {
+                version,
+                target: 'installer',
+                verified: true,
+              });
+              return staged;
             }
             if (!includeRuntime) return;
+            void updateEvent('download-started', { version, target: 'runtime' });
             const { prepareRuntimeUpdate } = await import(
               pathToFileURL(join(engineRoot, 'desktop/runtime/assets.mjs')).href
             );
@@ -2579,24 +2963,38 @@ else {
                 if (Number.isFinite(progress)) report('downloading', progress);
               },
             });
+            void updateEvent('download-finished', { version, target: 'runtime', verified: true });
             report('preparing');
             if (!engine || closingEngine) pendingPreload = assets;
             else await preloadUpdateImages(assets, signal);
           },
           restart: restartForUpdate,
-          onStatus: (phase, progress) => {
-            const percent = Number.isFinite(progress)
-              ? Math.min(100, Math.max(0, Math.floor(progress * 100)))
-              : undefined;
-            if (phase === updatePhase && percent === updateProgress) return;
-            updatePhase = phase;
-            updateProgress = percent;
-            refreshUpdateMenu();
-          },
+          onStatus: reportUpdateStatus,
         });
+        if (!windows) {
+          for (const name of [
+            'checking-for-update',
+            'update-available',
+            'update-not-available',
+            'before-quit-for-update',
+          ])
+            autoUpdater.on(name, () => void updateEvent(`native-${name}`));
+          autoUpdater.on(
+            'update-downloaded',
+            (_event, _notes, name) => void updateEvent('native-update-downloaded', { name }),
+          );
+          autoUpdater.on(
+            'error',
+            (error) =>
+              void updateEvent('native-error', {
+                message: updateFailureDetails(error),
+              }),
+          );
+        }
         stopUpdateChecks = startDesktopUpdateChecks({
           check: () => checkForUpdates(false),
           powerMonitor,
+          defer: macInstallerBusy,
         });
       }
       nativeTheme.on('updated', publishPreferences);
@@ -2612,7 +3010,7 @@ else {
             submenu: [
               { role: 'about' },
               { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: () => showSettings() },
-              { label: 'Send feedback…', click: showFeedback },
+              { label: 'Report bug…', click: showFeedback },
               {
                 id: 'desktop-update',
                 label: 'Check for Updates…',
@@ -2683,17 +3081,33 @@ else {
         if (!isEngine(event)) throw new Error('This action is unavailable.');
         return publicUpdateStatus();
       });
+      ipcMain.handle('nod:updates:download', (event) => {
+        if (!isEngine(event)) throw new Error('This action is unavailable.');
+        return openUpdateDownload();
+      });
       ipcMain.handle('nod:updates:dismiss', (event, version) => {
         if (!isEngine(event)) throw new Error('This action is unavailable.');
+        if (typeof version === 'number' && updateFailure?.id === version) {
+          updateFailure = { ...updateFailure, dismissed: true };
+          publishUpdateStatus();
+          return;
+        }
         if (typeof version !== 'string' || updates?.ready?.version !== version) return;
         dismissedUpdateVersion = version;
         publishUpdateStatus();
+      });
+      ipcMain.handle('nod:updates:retry', async (event, id) => {
+        if (!isEngine(event)) throw new Error('This action is unavailable.');
+        if (!updateFailure || updateFailure.id !== id || checkingUpdates || quitting)
+          throw new Error('The update failure has changed. Check the update notice.');
+        const restart = updateFailure.phase === 'restart';
+        await checkForUpdates(true, restart, restart);
       });
       ipcMain.handle('nod:updates:restart', async (event) => {
         if (!isEngine(event)) throw new Error('This action is unavailable.');
         if ((!updates?.ready && !checkingUpdates) || quitting)
           throw new Error('No desktop update is ready.');
-        await checkForUpdates(true, true);
+        await checkForUpdates(true, true, true);
       });
       ipcMain.handle('nod:settings:get', (event) => {
         if (!isSetup(event) && !isEngine(event)) throw new Error('This action is unavailable.');
@@ -2845,6 +3259,7 @@ else {
         if (!isSetup(event) && !isEngine(event)) throw new Error('This action is unavailable.');
         if (isEngine(event) && remoteConnection) throw new Error('Local setup is unavailable.');
         if (options?.retry === true && !enginePreferencesReady) welcomeTransferError = undefined;
+        if (options?.retry === true) pendingFeedback = options.report === true;
         await transferWelcome();
         if (options?.retry === true && status.windowError) {
           showEngine();
@@ -2927,6 +3342,7 @@ else {
         if (removeData) removeData.enabled = !saved.serverUrl;
         onboardingCompleted = Boolean(saved.serverUrl);
         welcomePassed = saved.onboardingPreferenceStep === 'complete';
+        if (!saved.serverUrl && !welcomePassed && saved.welcome) localSetupObservation = {};
         update({ remote: Boolean(saved.serverUrl) });
         applyPreferences(saved);
         guidedStartup = !saved.serverUrl && saved.onboardingPreferenceStep !== 'complete';

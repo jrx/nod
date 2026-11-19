@@ -134,7 +134,6 @@ export const LockKeyhole = n8n('lock-locked');
 export const Maximize2 = n8n('arrows-out');
 export const MessageCircle = n8n('chat-bubble');
 export const MessageSquare = n8n('chat-bubble');
-export const MessageSquarePlus = n8n('chat-bubble-plus');
 export const MessageSquareText = n8n('chat-bubble');
 export const Mic = n8n('microphone');
 export const Minimize2 = n8n('arrows-in');

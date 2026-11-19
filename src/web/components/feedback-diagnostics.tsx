@@ -115,7 +115,11 @@ function reportDetails(entry: unknown) {
 function reportLogs(data: ReportRecord | null) {
   const entries: ReportRecord[] = [];
   const starts = new Map<string, number>();
-  for (const entry of [...rows(data?.logs), ...rows(data?.clientErrors)]) {
+  for (const entry of [
+    ...rows(data?.logs),
+    ...rows(data?.failures),
+    ...rows(data?.clientErrors),
+  ].sort((a, b) => Number(b.ageMs ?? 0) - Number(a.ageMs ?? 0))) {
     const key = typeof entry.callId === 'string' ? `${entry.turnId ?? ''}:${entry.callId}` : null;
     const index = key ? starts.get(key) : undefined;
     if (entry.event === 'tool_end' && index !== undefined) {

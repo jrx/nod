@@ -737,6 +737,87 @@ try{
   assert.equal(result.exitCode, 0, result.stdout + result.stderr);
 });
 
+test('memory request analytics keep fixed operations and honor usage sharing', async (t) => {
+  const captured: Parameters<ProductAnalytics['capture']>[0][] = [];
+  const analytics = await createAnalytics({
+    provider: { capture: (event) => captured.push(event), shutdown: async () => {} },
+    environment: 'development',
+    dataRoot: '.',
+    installationId: randomUUID(),
+  });
+  t.after(() => analytics.shutdown());
+  const owner = 'synthetic-owner';
+  analytics.setUsageData(owner, true);
+  const ledger = createLedger({
+    ownerId: owner,
+    pool: { query: async () => ({ rows: [] }) } as never,
+    analytics: analytics.forOwner(owner),
+  });
+  const curator = ledger.curator({
+    id: 'fixture',
+    configured: true,
+    async curate({ task }, _signal, report) {
+      report?.({
+        id: randomUUID(),
+        provider: 'openai',
+        model: 'gpt-6-luna',
+        status: task === 'recall' ? 'cancelled' : 'succeeded',
+        durationMs: 950,
+        costUsd: null,
+      });
+      return {};
+    },
+  });
+  const operations = ['reflect', 'remember', 'recall', 'style', 'skill', 'brief'] as const;
+  for (const task of [...operations, 'review', 'private-operation-canary'] as const)
+    await curator.curate({
+      task: task as Parameters<typeof curator.curate>[0]['task'],
+      instructions: 'Synthetic private instructions.',
+      input: { text: 'private-input-canary' },
+    });
+  assert.equal(captured.length, 8);
+  assert.deepEqual(
+    captured.map(({ properties }) => properties.memory_operation),
+    [...operations, undefined, undefined],
+  );
+  assert.equal(captured[2].properties.outcome, 'cancelled');
+  assert.equal(captured[2].properties.duration_ms, 950);
+  assert.equal(JSON.stringify(captured).includes('private-operation-canary'), false);
+  assert.equal(JSON.stringify(captured).includes('private-input-canary'), false);
+  for (const purpose of ['agent', 'review', 'tasks', 'task_classification'] as const)
+    analytics.forOwner(owner)({
+      event: 'model_used',
+      properties: {
+        provider: 'openai',
+        purpose,
+        memory_operation: 'recall',
+        outcome: 'succeeded',
+        input_tokens: 0,
+        output_tokens: 0,
+        pricing: 'unavailable',
+      },
+    });
+  assert.equal(captured.length, 8);
+  assert.equal(
+    analyticsEvent.safeParse({
+      event: 'model_used',
+      properties: {
+        provider: 'openai',
+        purpose: 'memory',
+        memory_operation: 'private-operation-canary',
+        outcome: 'succeeded',
+        input_tokens: 0,
+        output_tokens: 0,
+        pricing: 'unavailable',
+      },
+    }).success,
+    false,
+  );
+  analytics.setUsageData(owner, false);
+  await curator.curate({ task: 'recall', instructions: '', input: {} });
+  assert.equal(captured.length, 8);
+});
+
 test('turn analytics keep the actual agent provider and remove stale model details', async (t) => {
   for (const [provider, model, expected] of [
     ['openai', 'gpt-6-luna', { provider: 'openai', model: 'gpt-6-luna' }],

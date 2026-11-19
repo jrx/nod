@@ -25,7 +25,7 @@ import { EventEmitter } from 'node:events';
 import { execFile } from 'node:child_process';
 import { createServer as createHttpsServer } from 'node:https';
 import { createServer } from 'node:net';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { getCACertificates, setDefaultCACertificates } from 'node:tls';
@@ -101,6 +101,7 @@ import {
   createUpdateSource,
   startDesktopUpdateChecks,
 } from '../main/updates.mjs';
+import { clearInstalledWindowsUpdates } from '../main/windows-update.mjs';
 import {
   protectWindowsProfile,
   stageWindowsUpdate,
@@ -507,6 +508,8 @@ async function runningDesktop(
     reveal = () => assert.fail('No file should be revealed.'),
     openExternal,
     quitAndInstall = () => assert.fail('No update should install.'),
+    startWindowsInstall = () => assert.fail('No Windows update should install.'),
+    exit = () => {},
     displays = [{ workArea: { x: 0, y: 0, width: 1920, height: 1080 } }],
   } = {},
 ) {
@@ -546,6 +549,7 @@ async function runningDesktop(
     handle: (name, handler) => handlers.set(name, handler),
   });
   let openAtLogin = false;
+  let initialized = false;
   let requestHeaders;
   let permissionCheck;
   let permissionRequest;
@@ -614,15 +618,21 @@ async function runningDesktop(
       setLoginItemSettings: (value) => {
         if (updateLoginItems(value)) openAtLogin = value.openAtLogin;
       },
-      quit() {},
+      quit: () => appEvents.emit('before-quit', { preventDefault() {} }),
+      exit: () => {
+        if (initialized) exit();
+      },
     },
     process: {
       platform,
       argv,
       env: typeof environment === 'function' ? environment(dirname(storage.path)) : environment,
       resourcesPath: dirname(storage.path),
+      versions: { electron: '0.0.0' },
+      getSystemVersion: () => '0.0.0',
     },
     ipcMain: ipc,
+    startWindowsInstall,
     autoUpdater: Object.assign(new EventEmitter(), {
       quitAndInstall() {
         quitAndInstall();
@@ -661,6 +671,7 @@ async function runningDesktop(
     resolve,
     fileURLToPath,
     pathToFileURL,
+    homedir,
     mkdir,
     appendFile,
     readFile: (file, ...args) =>
@@ -839,6 +850,9 @@ async function runningDesktop(
       isMinimized() {
         return this.minimized === true;
       }
+      setProgressBar(value) {
+        this.progress = value;
+      }
       isMaximized() {
         return this.maximized === true;
       }
@@ -932,6 +946,7 @@ async function runningDesktop(
     ${artifactHandlers}
     ${loginItem}
     ${source}
+    ${source.slice(source.indexOf("  app.on('second-instance'"), source.indexOf('  void app\n    .whenReady()'))}
     appLinksReady = true;
     engine = {};
     enginePreferencesReady = true;
@@ -959,7 +974,7 @@ async function runningDesktop(
       launch: async () => { ${source.slice(source.lastIndexOf('      try {\n        const saved = await settings.get();'), source.indexOf('    })', source.lastIndexOf('      try {\n        const saved = await settings.get();')))} },
       settle: () => preparing ?? Promise.resolve(),
       installRuntime: (installer) => lifecycle.install(installer, { warmup: false }),
-      close: async () => { quitting = true; await lifecycle.close(); },
+      close: async () => { quitting = true; await lifecycle.close(); await diagnosticWrites; },
       profileRoot,
       profileOwner,
       nativeOpening: () => freshAppOpenCapture,
@@ -973,17 +988,22 @@ async function runningDesktop(
       status: () => status,
       notifyReady: updateReadinessNotice,
       checkUpdates: (updater, manual = true, restartReady = false) => { updates = updater; return checkForUpdates(manual, restartReady); },
+      reportUpdateStatus,
       registerFiles: () => { ${source.slice(source.indexOf('      disposeArtifactFiles = registerArtifactFileHandlers('), source.indexOf("      ipcMain.handle('nod:renderer-ready'"))} },
       quit,
+      quitApp: (install = true) => { installUpdateOnQuit = install; return quitApp(); },
+      requestQuit: () => app.quit(),
       restartForUpdate,
       crash: () => { engine = undefined; enginePreferencesReady = false; },
     };
     })()`,
     context,
   );
+  initialized = true;
   return {
     ...context.running,
     openLink: (value) => appEvents.emit('open-url', { preventDefault() {} }, value),
+    secondInstance: (argv) => appEvents.emit('second-instance', {}, argv),
     windows,
     children,
     nativeAnalytics,
@@ -1236,6 +1256,149 @@ test('opting out on Welcome stops later startup path events', async (t) => {
   }
 });
 
+test('native local setup observes early runtime failure and recovery without private details', async (t) => {
+  let attempts = 0;
+  const privateText = 'private-setup-detail /Users/synthetic/private-folder';
+  const f = await runningDesktop(t, async () => Response.json({ ok: true }), {
+    initialState: 'fresh',
+    allowStart: true,
+    packaged: true,
+    buildMetadata: { release: true },
+    version: '0.1.17',
+    prepareRuntime: async ({ onStatus, onStorageReady }) => {
+      onStatus({ stage: privateText, message: privateText, progress: 0.1 });
+      if (++attempts === 1) throw new Error(privateText);
+      onStatus({ stage: privateText, message: privateText, progress: 0.2 });
+      const runtime = { env: {} };
+      await onStorageReady(runtime);
+      return runtime;
+    },
+  });
+  try {
+    await f.launch();
+    await f.nativeOpening();
+    const setup = f.windows[0];
+    const event = { sender: setup.webContents, senderFrame: setup.webContents.mainFrame };
+    await f.handlers.get('nod:warmup')(event);
+    await waitFor(() => assert.equal(f.status().runtime.phase, 'error'), {
+      attempts: 40,
+      interval: 10,
+    });
+    const observations = () =>
+      f.nativeAnalytics.filter((item) => item.event === 'local_setup_observed');
+    assert.equal(observations().length, 0);
+    await f.handlers.get('nod:settings:save')(event, {
+      welcome: { usageData: true, continued: false },
+    });
+    await waitFor(() => assert.equal(observations().length, 1), {
+      attempts: 40,
+      interval: 10,
+    });
+    assert.equal(observations()[0].properties.runtime_status, 'failed');
+    assert.equal(observations()[0].properties.startup_status, 'idle');
+    assert.equal(observations()[0].properties.setup_available, false);
+    await f.handlers.get('nod:prepare')(event, { retry: true });
+    assert.equal(f.status().engineReady, true, JSON.stringify(f.status()));
+    await waitFor(() => assert.ok(observations().some((item) => item.properties.setup_available)), {
+      attempts: 40,
+      interval: 10,
+    });
+    assert.ok(observations().some((item) => item.properties.runtime_status === 'ready'));
+    f.children[0].emit('exit', 1);
+    await waitFor(
+      () =>
+        assert.ok(
+          observations().some(
+            (item) =>
+              item.properties.startup_status === 'failed' && !item.properties.setup_available,
+          ),
+        ),
+      { attempts: 40, interval: 10 },
+    );
+    const states = observations().map((item) =>
+      JSON.stringify([
+        item.properties.runtime_status,
+        item.properties.startup_status,
+        item.properties.setup_available,
+      ]),
+    );
+    assert.ok(states.every((value, index) => value !== states[index - 1]));
+    assert.ok(
+      f.nativeAnalytics.every((item) => item.distinct_id === observations()[0].distinct_id),
+    );
+    assert.equal(JSON.stringify(f.nativeAnalytics).includes(privateText), false);
+    assert.equal(
+      f.nativeAnalytics.find((item) => item.event === 'startup_path_selected')?.properties
+        .local_setup_telemetry_available,
+      true,
+    );
+    for (const item of observations())
+      assert.deepEqual(
+        Object.keys(item.properties)
+          .filter(
+            (key) =>
+              !key.startsWith('$') &&
+              !['analytics_schema', 'environment', 'surface', 'app_version', 'route'].includes(key),
+          )
+          .sort(),
+        ['platform', 'runtime_status', 'setup_available', 'startup_status'],
+      );
+  } finally {
+    await f.close();
+  }
+});
+
+test('queued native local setup observations stop after consent or path changes and close', async (t) => {
+  for (const action of ['opt_out', 'remote', 'close', 'disabled']) {
+    await t.test(action, async (t) => {
+      const loading = deferred();
+      const metadata = deferred();
+      let hold = false;
+      const f = await runningDesktop(t, async () => Response.json({ ok: true }), {
+        initialState: 'fresh',
+        packaged: true,
+        buildMetadata: { release: true },
+        version: '0.1.17',
+        environment: action === 'disabled' ? { NOD_ANALYTICS_ENABLED: 'false' } : {},
+        nativeMetadataRead: () => {
+          if (!hold) return;
+          loading.resolve();
+          return metadata.promise;
+        },
+      });
+      try {
+        await f.launch();
+        await f.nativeOpening();
+        hold = true;
+        const setup = f.windows[0];
+        const event = { sender: setup.webContents, senderFrame: setup.webContents.mainFrame };
+        await f.handlers.get('nod:settings:save')(event, {
+          welcome: { usageData: true, continued: false },
+        });
+        if (action !== 'disabled') await loading.promise;
+        if (action === 'opt_out') {
+          await f.handlers.get('nod:settings:save')(event, {
+            welcome: { usageData: false, continued: false },
+          });
+          await f.handlers.get('nod:settings:save')(event, {
+            welcome: { usageData: true, continued: false },
+          });
+        } else if (action === 'remote') void f.captureStartupPath('remote');
+        else if (action === 'close') await f.close();
+        metadata.resolve();
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        assert.deepEqual(
+          f.nativeAnalytics.filter((item) => item.event === 'local_setup_observed'),
+          [],
+        );
+      } finally {
+        metadata.resolve();
+        await f.close();
+      }
+    });
+  }
+});
+
 test(
   'native opening and path captures stop when Welcome opts out during metadata loading',
   { timeout: 15_000 },
@@ -1368,10 +1531,30 @@ test('a later local choice replaces an earlier remote startup path under the sam
       },
       { attempts: 40, interval: 10 },
     );
-    assert.equal(second.nativeAnalytics.length, 1);
-    assert.equal(second.nativeAnalytics[0].distinct_id, distinctId);
+    assert.equal(
+      second.nativeAnalytics.filter((item) => item.event === 'startup_path_selected').length,
+      1,
+    );
+    assert.equal(second.nativeAnalytics.filter((item) => item.event === 'app_opened').length, 0);
+    assert.ok(second.nativeAnalytics.every((item) => item.distinct_id === distinctId));
   } finally {
     await second.close();
+  }
+  const restarted = await runningDesktop(t, async () => Response.json({ ok: true }), {
+    ...options,
+    storedProfile: second.storage,
+  });
+  try {
+    await restarted.launch();
+    await waitFor(
+      () =>
+        assert.ok(restarted.nativeAnalytics.some((item) => item.event === 'local_setup_observed')),
+      { attempts: 40, interval: 10 },
+    );
+    assert.ok(restarted.nativeAnalytics.every((item) => item.distinct_id === distinctId));
+    assert.equal(restarted.nativeAnalytics.filter((item) => item.event === 'app_opened').length, 0);
+  } finally {
+    await restarted.close();
   }
 });
 
@@ -1436,7 +1619,7 @@ test('native first open waits for consent on disabled and returning profiles', a
 test('Windows onboarding waits for storage before unlocking credentials and exposes prerequisite recovery', async (t) => {
   const revealed = [];
   const cause = `Synthetic WSL missing: ${'x'.repeat(450)} HCS_E_HYPERV_NOT_INSTALLED`;
-  const details = `Error: ${cause}\n${'Synthetic WSL output\n'.repeat(200)}End of native error`;
+  const details = `Error: ${cause}\n${join(homedir(), 'synthetic-folder')}\n${'Synthetic WSL output\n'.repeat(200)}End of native error`;
   const f = await runningDesktop(
     t,
     async () => assert.fail('No backend can run without storage.'),
@@ -1453,6 +1636,11 @@ test('Windows onboarding waits for storage before unlocking credentials and expo
   f.storage.store.environment = async () =>
     assert.fail('No credentials are needed before storage.');
   try {
+    await mkdir(join(f.profileRoot, 'logs'), { recursive: true });
+    await appendFile(
+      join(f.profileRoot, 'logs', 'startup.log'),
+      'Synthetic earlier line\n'.repeat(4000),
+    );
     await f.launch();
     await f.prepare();
     assert.equal(f.children.length, 0);
@@ -1466,8 +1654,11 @@ test('Windows onboarding waits for storage before unlocking credentials and expo
     await showLog(event);
     assert.deepEqual(revealed, [join(f.profileRoot, 'logs', 'startup.log')]);
     const log = await readFile(revealed[0], 'utf8');
+    assert.ok(log.startsWith('Synthetic earlier line\n'));
+    assert.ok(log.length < 64 * 1024);
     assert.ok(log.includes(cause));
-    assert.ok(log.includes(details));
+    assert.ok(log.includes(details.replaceAll(homedir(), '<home>')));
+    assert.equal(log.includes(homedir()), false);
     assert.equal(f.status().error, cause);
     assert.ok(f.status().details.includes(details));
     assert.ok(f.status().details.includes('NOD_WSL_REQUIRED'));
@@ -1763,6 +1954,18 @@ test('native startup recovery keeps current status and serializes retry, prerequ
           .querySelector('[role="alert"]')
           ?.textContent.includes('Synthetic retry failed'),
       );
+      await settle(() => button('Report bug') && !button('Report bug').disabled);
+      button('Report bug').click();
+      await settle(() => calls.length === 2);
+      assert.deepEqual(JSON.parse(JSON.stringify(calls[1])), [
+        'prepare',
+        { retry: true, report: true },
+      ]);
+      await settle(() =>
+        page.window.document
+          .querySelector('[role="alert"]')
+          ?.textContent.includes('Synthetic retry failed'),
+      );
       publish({ phase: 'preparing', runtime: { phase: 'downloading', progress: 0.42 } });
       await settle(() => page.window.document.querySelector('progress')?.value === 0.42);
       assert.equal(page.window.document.querySelector('[role="alert"]'), null);
@@ -1786,10 +1989,10 @@ test('native startup recovery keeps current status and serializes retry, prerequ
           !button('Choose runtime file').disabled &&
           page.window.document.querySelector('[role="alert"]'),
       );
-      assert.equal(calls.filter(([name]) => name === 'prepare').length, 1);
+      assert.equal(calls.filter(([name]) => name === 'prepare').length, 2);
       assert.ok(page.window.document.querySelector('[role="alert"]'));
       button('Choose runtime file').click();
-      await settle(() => calls.filter(([name]) => name === 'prepare').length === 2);
+      await settle(() => calls.filter(([name]) => name === 'prepare').length === 3);
       assert.deepEqual(calls.at(-1), ['prepare', undefined]);
       await settle(() => !page.window.document.querySelector('[role="alert"]'));
     });
@@ -2462,7 +2665,7 @@ test('a missing native setup renderer offers explicit recovery without hidden ke
       try {
         const launched = f.launch();
         for (let attempt = 0; !f.windows.length && attempt < 100; attempt++)
-          await new Promise(setImmediate);
+          await new Promise((resolve) => wait(resolve, 5));
         const window = f.windows[0];
         assert.ok(window);
         assert.equal(window.isVisible(), false);
@@ -3240,6 +3443,80 @@ test('quit removes temporary files and stops downloads before the updater can qu
       assert.equal(cleanupAttempts, retry ? 2 : 1);
       assert.equal(prompts, retry ? 1 : 0);
     });
+});
+
+test('a normal Windows quit installs a ready update after cleanup and leaves Nod closed', async (t) => {
+  for (const install of [false, true]) {
+    const events = [];
+    const candidate = { version: '0.10.0' };
+    const f = await runningDesktop(t, async () => Response.json({}), {
+      platform: 'win32',
+      startWindowsInstall: async (options) => {
+        assert.equal(options.relaunch, false);
+        assert.equal(events[0], 'downloads-stopped');
+        events.push('install');
+      },
+      exit: () => events.push('exit'),
+    });
+    t.after(() => f.close());
+    f.crash();
+    await f.checkUpdates(
+      {
+        ready: candidate,
+        check: async () => candidate,
+        dispose: async () => events.push('downloads-stopped'),
+      },
+      false,
+    );
+    await f.quitApp(install);
+    assert.deepEqual(
+      events,
+      install ? ['downloads-stopped', 'install', 'exit'] : ['downloads-stopped', 'exit'],
+    );
+    await f.close();
+  }
+});
+
+test('quit requests install once, skip installer conflicts, and still close after an update launch fails', async (t) => {
+  for (const mode of ['ready', 'installer', 'launch-failed', 'not-ready']) {
+    const exited = deferred();
+    let installs = 0;
+    let exits = 0;
+    const candidate = mode === 'not-ready' ? undefined : { version: '0.10.0' };
+    const f = await runningDesktop(t, async () => Response.json({}), {
+      platform: 'win32',
+      prompt: (options) => {
+        assert.equal(mode, 'launch-failed');
+        assert.match(options.detail, /Synthetic PowerShell launch failure/);
+        assert.deepEqual(Array.from(options.buttons), [
+          'Retry installation',
+          'Download Nod',
+          'Quit without updating',
+        ]);
+        return { response: 2 };
+      },
+      startWindowsInstall: async () => {
+        installs++;
+        if (mode === 'launch-failed') throw new Error('Synthetic PowerShell launch failure');
+      },
+      exit: () => {
+        exits++;
+        exited.resolve();
+      },
+    });
+    t.after(() => f.close());
+    f.crash();
+    await f.checkUpdates(
+      { ready: candidate, check: async () => candidate, dispose: async () => {} },
+      false,
+    );
+    if (mode === 'installer') f.secondInstance(['nod.exe', '--quit']);
+    else f.requestQuit();
+    f.requestQuit();
+    await exited.promise;
+    assert.equal(installs, mode === 'installer' || mode === 'not-ready' ? 0 : 1);
+    assert.equal(exits, 1);
+  }
 });
 
 test('an update restart keeps Nod on screen and reopens it as it was', async (t) => {
@@ -5030,6 +5307,130 @@ commonName = supplied
   assert.equal(requests.length, 2);
 });
 
+test('expired system certificates do not replace a valid chain the server sends', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-expired-system-ca-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const defaults = getCACertificates('default');
+  t.after(() => setDefaultCACertificates(defaults));
+  const execute = promisify(execFile);
+  const openssl = (...args) =>
+    execute('openssl', args, { cwd: directory, timeout: 10_000, windowsHide: true });
+  await writeFile(
+    join(directory, 'ca.cnf'),
+    `[req]
+distinguished_name = dn
+[dn]
+[ca]
+default_ca = local
+[local]
+database = index
+new_certs_dir = .
+serial = serial
+default_md = sha256
+default_days = 1
+unique_subject = no
+policy = policy
+[policy]
+commonName = supplied
+`,
+  );
+  await writeFile(join(directory, 'index'), '');
+  await writeFile(join(directory, 'serial'), '01\n');
+  await writeFile(
+    join(directory, 'intermediate.ext'),
+    'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n',
+  );
+  await writeFile(
+    join(directory, 'server.ext'),
+    'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\nsubjectAltName=IP:127.0.0.1\n',
+  );
+  const keyOptions = ['-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-nodes'];
+  await openssl(
+    'req',
+    '-x509',
+    '-sha256',
+    ...keyOptions,
+    '-keyout',
+    'root.key',
+    '-out',
+    'root.pem',
+    '-days',
+    '1',
+    '-subj',
+    '/CN=Nod test root',
+    '-config',
+    'ca.cnf',
+    '-addext',
+    'basicConstraints=critical,CA:TRUE',
+    '-addext',
+    'keyUsage=critical,keyCertSign,cRLSign',
+  );
+  for (const name of ['intermediate', 'server'])
+    await openssl(
+      'req',
+      '-new',
+      ...keyOptions,
+      '-keyout',
+      `${name}.key`,
+      '-out',
+      `${name}.csr`,
+      '-subj',
+      `/CN=Nod test ${name}`,
+      '-config',
+      'ca.cnf',
+    );
+  const sign = (issuer, request, output, dates = []) =>
+    openssl(
+      'ca',
+      '-batch',
+      '-notext',
+      '-config',
+      'ca.cnf',
+      '-cert',
+      `${issuer}.pem`,
+      '-keyfile',
+      `${issuer}.key`,
+      '-in',
+      `${request}.csr`,
+      '-out',
+      `${output}.pem`,
+      '-extfile',
+      `${request}.ext`,
+      ...dates,
+    );
+  await sign('root', 'intermediate', 'intermediate');
+  await sign('root', 'intermediate', 'stale', [
+    '-startdate',
+    '20000101000000Z',
+    '-enddate',
+    '20000102000000Z',
+  ]);
+  await sign('intermediate', 'server', 'server');
+  const [root, intermediate, stale, leaf] = await Promise.all(
+    ['root', 'intermediate', 'stale', 'server'].map((name) =>
+      readFile(join(directory, `${name}.pem`), 'utf8'),
+    ),
+  );
+  const server = createHttpsServer(
+    { key: await readFile(join(directory, 'server.key')), cert: leaf + intermediate },
+    (_request, response) => response.end('ok'),
+  );
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const url = `https://127.0.0.1:${server.address().port}`;
+  setDefaultCACertificates([...defaults, root, stale]);
+  await assert.rejects(fetch(url), (error) => error.cause?.code === 'CERT_HAS_EXPIRED');
+  setDefaultCACertificates(defaults);
+  trustSystemCertificates({
+    getCACertificates: (type) => (type === 'system' ? [root, stale] : getCACertificates(type)),
+    setDefaultCACertificates,
+  });
+  assert.equal(await (await fetch(url)).text(), 'ok');
+});
+
 test('remote setup remains visible and navigable while the encrypted server token waits for macOS storage', async (t) => {
   const output = await mkdtemp(join(tmpdir(), 'nod-native-remote-unlock-'));
   t.after(() => rm(output, { recursive: true, force: true }));
@@ -6554,7 +6955,7 @@ test('public GitHub metadata redirects resolve to verified Mac runtime and Windo
 });
 
 test(
-  'manual update failures fence concurrent requests and retry only after an explicit choice without exposing diagnostics',
+  'manual update failures fence concurrent requests and keep the safe reason until an explicit retry',
   { timeout: 10_000 },
   async (t) => {
     const failure = new Error(
@@ -6591,7 +6992,8 @@ test(
       assert.equal(checks, 1);
       assert.equal(prompts.length, 1);
       assert.equal(f.updateMenu.enabled, false);
-      assert.equal(JSON.stringify(prompts).includes('Synthetic updater transport failure'), false);
+      assert.match(prompts[0].detail, /Synthetic updater transport failure/);
+      assert.equal(prompts[0].detail.includes('updates.example.invalid'), false);
       decision.resolve({ response: 0 });
       await Promise.all([initial, duplicate, duringDialog]);
       assert.equal(checks, 2);
@@ -6609,7 +7011,7 @@ test(
   },
 );
 
-test('declining a manual update retry and failed background checks never repeat work or show background errors', async (t) => {
+test('declining a manual update retry and failed background checks never repeat work or open background dialogs', async (t) => {
   for (const manual of [true, false]) {
     let checks = 0;
     const prompts = [];
@@ -6622,7 +7024,7 @@ test('declining a manual update retry and failed background checks never repeat 
     const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
       prompt: (options) => {
         prompts.push(options);
-        return { response: 1 };
+        return { response: 2 };
       },
     });
     if (manual) await f.checkUpdates(updater);
@@ -6630,7 +7032,8 @@ test('declining a manual update retry and failed background checks never repeat 
       await assert.rejects(f.checkUpdates(updater, false), /Synthetic update service unavailable/);
     assert.equal(checks, 1);
     assert.equal(prompts.length, manual ? 1 : 0);
-    assert.equal(JSON.stringify(prompts).includes('Synthetic update service unavailable'), false);
+    if (manual) assert.match(prompts[0].detail, /Synthetic update service unavailable/);
+    assert.equal(f.externalURLs.length, 0);
     assert.equal(f.updateMenu.enabled, true);
   }
 });
@@ -6673,14 +7076,14 @@ test(
       const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
         prompt: (options) => {
           prompts.push(options);
-          return { response: prompts.length === 2 && !retry ? 1 : 0 };
+          return { response: prompts.length === 2 && !retry ? 2 : 0 };
         },
       });
       await f.checkUpdates(updater);
       assert.equal(restarts, retry ? 2 : 1);
       assert.equal(prompts.length, 2);
       assert.equal(updater.ready, candidate);
-      assert.equal(JSON.stringify(prompts).includes('Synthetic native restart failure'), false);
+      assert.match(prompts[1].detail, /Synthetic native restart failure/);
       if (!retry) {
         await f.checkUpdates(updater, true, true);
         assert.equal(restarts, 2);
@@ -7031,6 +7434,37 @@ test('automatic update checks retry failures sooner and return to the normal int
     await settle();
     assert.equal(calls, expected);
   }
+});
+
+test('a start during a Mac update install waits fifteen minutes even with a shorter failure retry', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const powerMonitor = new EventEmitter();
+  let calls = 0;
+  const stop = startDesktopUpdateChecks({
+    powerMonitor,
+    defer: true,
+    interval: 60_000,
+    retry: 5,
+    check: async () => {
+      calls++;
+    },
+  });
+  t.after(stop);
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  await settle();
+  powerMonitor.emit('resume');
+  t.mock.timers.tick(15 * 60_000 - 1);
+  await settle();
+  assert.equal(calls, 0);
+  t.mock.timers.tick(1);
+  await settle();
+  assert.equal(calls, 1);
+  t.mock.timers.tick(59_999);
+  await settle();
+  assert.equal(calls, 1);
+  t.mock.timers.tick(1);
+  await settle();
+  assert.equal(calls, 2);
 });
 
 test('first installation resolves its exact published runtime without a newer app and rejects changed identities', async () => {
@@ -7397,6 +7831,7 @@ async function updatePreparation({
       engine: undefined,
       closingEngine: false,
       pendingPreload: undefined,
+      updateEvent: async () => {},
       loadRuntime: async (url) =>
         url.endsWith('/windows.mjs')
           ? {
@@ -7573,7 +8008,7 @@ test('Windows downloads stage the verified installer and fetch the runtime pack 
     onProgress: (value) => progress.push(value),
     unsigned: signed,
   });
-  assert.deepEqual(downloads, ['nod-Runtime-win32-x64.tar.gz', 'nod-Setup-x64.exe']);
+  assert.deepEqual(downloads, ['nod-Runtime-win32-x64.tar.gz']);
   assert.ok(progress.length >= 2);
   assert.ok(progress.every((value, index) => value > 0 && value >= (progress[index - 1] ?? 0)));
   assert.ok(progress.some((value) => value < 1));
@@ -7606,6 +8041,7 @@ test('Windows downloads stage the verified installer and fetch the runtime pack 
       request,
     });
     downloads.length = 0;
+    await rm(directory, { recursive: true, force: true });
     const statuses = [];
     await prepare(candidate, undefined, (phase, value) => statuses.push([phase, value]));
     assert.deepEqual(statuses.at(-1), ['downloading', 1]);
@@ -7646,7 +8082,9 @@ test('Windows downloads stage the verified installer and fetch the runtime pack 
     { message: 'The Nod update is not signed by n8n GmbH.' },
   );
   assert.deepEqual(checked, [join(directory, '0.2.0', 'nod-Setup-x64.exe')]);
-  await assert.rejects(stat(directory), { code: 'ENOENT' });
+  await assert.rejects(stat(join(directory, candidate.version, candidate.installer.file)), {
+    code: 'ENOENT',
+  });
 
   served['nod-Setup-x64.exe'] = Buffer.alloc(bytes['nod-Setup-x64.exe'].length, 'x');
   for (const includeRuntime of [true, false]) {
@@ -7659,7 +8097,9 @@ test('Windows downloads stage the verified installer and fetch the runtime pack 
         unsigned: signed,
       }),
     );
-    await assert.rejects(stat(directory), { code: 'ENOENT' });
+    await assert.rejects(stat(join(directory, candidate.version, candidate.installer.file)), {
+      code: 'ENOENT',
+    });
   }
 
   release.assets[1].digest = `sha256:${'e'.repeat(64)}`;
@@ -7873,7 +8313,7 @@ test('native readiness notification waits for full runtime readiness and reaches
   }
 });
 
-test('artifact exports keep owned bytes, safe names, separate saves and restricted opening', async () => {
+test('artifact exports keep owned bytes, safe names, separate saves and restricted opening, and remove failed downloads', async () => {
   const { createArtifactFiles, canOpenArtifact } = await import('../main/artifact-files.mjs');
   const root = await mkdtemp(join(tmpdir(), 'nod-artifact-contract-'));
   let requests = 0;
@@ -7925,6 +8365,24 @@ test('artifact exports keep owned bytes, safe names, separate saves and restrict
       fetchArtifact: async () => new Response('', { status: 404 }),
     });
     await assert.rejects(absent.prepare(randomUUID()), /no longer available/);
+    const brokenRoot = await mkdtemp(join(root, 'broken-'));
+    const broken = createArtifactFiles({
+      temporary: brokenRoot,
+      downloads: root,
+      fetchArtifact: async () =>
+        new Response(
+          new ReadableStream({
+            async pull(controller) {
+              controller.enqueue(new TextEncoder().encode('Partial synthetic bytes'));
+              await new Promise((resolve) => setTimeout(resolve, 20));
+              controller.error(new Error('Synthetic connection reset'));
+            },
+          }),
+        ),
+    });
+    await assert.rejects(broken.prepare(randomUUID()), /Synthetic connection reset/);
+    const [created] = await readdir(brokenRoot);
+    assert.deepEqual(await readdir(join(brokenRoot, created)), []);
     const blocked = join(root, 'not-a-directory');
     await writeFile(blocked, 'Synthetic disk setup failure');
     let cancelled = false;
@@ -7987,6 +8445,414 @@ test('artifact exports keep owned bytes, safe names, separate saves and restrict
     await files.dispose();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test('manual update failures offer only the official download page without another update attempt', async (t) => {
+  let checks = 0;
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
+    prompt: () => ({ response: 1 }),
+  });
+  await f.checkUpdates({
+    check: async () => {
+      checks++;
+      throw new Error('The desktop update download timed out.');
+    },
+  });
+  assert.equal(checks, 1);
+  assert.deepEqual(f.externalURLs, ['https://nod.n8n.io/docs/get-started/install-desktop/']);
+});
+
+test('update release lookup and metadata failures keep their HTTP status', async () => {
+  const request = async () => new Response(null, { status: 503 });
+  await assert.rejects(createUpdateSource({ fetch: request }).latest('0.1.0'), /HTTP 503/);
+  await assert.rejects(
+    createUpdateSource({ sourceUrl: 'https://updates.example.invalid/nod', fetch: request }).latest(
+      '0.1.0',
+    ),
+    /HTTP 503/,
+  );
+});
+
+test('failed desktop updates expose safe details and allow an explicit retry without a background dialog', async (t) => {
+  const prompts = [];
+  let checks = 0;
+  const failure = new Error(
+    "The update download failed (HTTP 503) at https://private.example.invalid/update '/Users/Synthetic Owner/Updates/archive.zip' token=PRIVATE_UPDATE_TOKEN",
+    { cause: Object.assign(new Error('Connection reset'), { code: 'ECONNRESET' }) },
+  );
+  const updater = {
+    async check() {
+      checks++;
+      if (checks < 3) throw failure;
+    },
+  };
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
+    prompt: (options) => {
+      prompts.push(options);
+      return { response: 2 };
+    },
+  });
+  f.showEngine();
+  await new Promise(setImmediate);
+  const window = f.windows.at(-1);
+  const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+  const status = f.handlers.get('nod:updates:status');
+  await assert.rejects(f.checkUpdates(updater, false), /HTTP 503/);
+  const reported = status(event).failure;
+  assert.ok(reported);
+  assert.match(reported.message, /HTTP 503/);
+  assert.match(reported.message, /ECONNRESET/);
+  for (const privateValue of ['private.example.invalid', 'Synthetic Owner', 'PRIVATE_UPDATE_TOKEN'])
+    assert.equal(reported.message.includes(privateValue), false);
+  assert.equal(prompts.length, 0);
+  assert.equal(checks, 1);
+  assert.ok(
+    window.sent.some(([channel, value]) => channel === 'nod:updates:status' && value.failure),
+  );
+  f.handlers.get('nod:updates:dismiss')(event, reported.id);
+  assert.equal(status(event).failure.dismissed, true);
+  await assert.rejects(f.checkUpdates(updater, false), /HTTP 503/);
+  assert.equal(status(event).failure.id, reported.id);
+  assert.equal(status(event).failure.dismissed, true);
+  const retry = f.handlers.get('nod:updates:retry');
+  await assert.rejects(retry({ ...event, senderFrame: {} }, reported.id), /unavailable/);
+  await assert.rejects(retry(event, reported.id + 1), /changed/);
+  await retry(event, reported.id);
+  assert.equal(checks, 3);
+  assert.equal(status(event).failure, undefined);
+  await assert.rejects(retry(event, reported.id), /changed/);
+  assert.equal(checks, 3);
+});
+
+test('update failure details mask paths with spaces and keep structured reasons and statuses', async (t) => {
+  for (const failure of [
+    new Error('Could not access /Users/Synthetic Owner/Updates/archive.zip: EACCES'),
+    Object.assign(new Error('Could not access C:\\Users\\Synthetic Owner\\Updates\\archive.zip'), {
+      code: 'EACCES',
+    }),
+    Object.assign(new Error('The update request failed.'), {
+      status: 403,
+      cause: Object.assign(new Error('The signature is invalid.'), { code: 'EACCES' }),
+    }),
+    new Error(
+      'The update failed {"reason":"The signature is invalid.","status":403,"private":"PRIVATE_UPDATE_TOKEN"}',
+    ),
+    new Error('The request failed: access_token=PRIVATE_UPDATE_TOKEN'),
+    new Error('getaddrinfo ENOTFOUND private-host.example.invalid'),
+    new Error('getaddrinfo ENOTFOUND synthetic-device'),
+    new Error('connect ECONNREFUSED 192.0.2.41:443'),
+    new Error('connect ECONNREFUSED [2001:db8::41]:443'),
+    new Error('connect ECONNREFUSED ::ffff:192.0.2.41'),
+    new Error('connect ECONNREFUSED fe80::41%synthetic-device'),
+    new Error('connect ECONNREFUSED localhost:443'),
+    Object.assign(new Error('The update failed.'), { code: 'PRIVATE_UPDATE_TOKEN' }),
+    new Error(
+      'The update failed {"code":"PRIVATE_UPDATE_TOKEN","reason":"The signature is invalid."}',
+    ),
+  ]) {
+    const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'));
+    f.showEngine();
+    await new Promise(setImmediate);
+    const window = f.windows.at(-1);
+    const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+    await assert.rejects(
+      f.checkUpdates(
+        {
+          check: async () => {
+            throw failure;
+          },
+        },
+        false,
+      ),
+    );
+    const message = f.handlers.get('nod:updates:status')(event).failure.message;
+    for (const privateValue of [
+      'Synthetic',
+      'Owner',
+      'archive.zip',
+      'PRIVATE_UPDATE_TOKEN',
+      'private-host',
+      'example.invalid',
+      '192.0.2.41',
+      '2001:db8',
+      'fe80::41',
+      'synthetic-device',
+      'localhost',
+    ])
+      assert.equal(message.includes(privateValue), false);
+    if (failure.status || failure.message.includes('"status":403'))
+      assert.match(message, /HTTP 403/);
+    if (failure.cause || failure.message.includes('"reason"'))
+      assert.match(message, /signature is invalid/);
+    if (failure.code === 'EACCES') assert.match(message, /EACCES/);
+  }
+});
+
+test('update diagnostics keep the failed preparation or download step', async (t) => {
+  for (const phase of ['checking', 'preparing', 'downloading']) {
+    const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'));
+    await assert.rejects(
+      f.checkUpdates(
+        {
+          check: async () => {
+            f.reportUpdateStatus(phase);
+            throw new Error('The update request failed (HTTP 503).');
+          },
+        },
+        false,
+      ),
+    );
+    const log = await readFile(join(f.profileRoot, 'logs/startup.log'), 'utf8');
+    assert.ok(log.includes('update error phase=' + phase + ' '));
+  }
+});
+
+test('native update installation failures show the reason and retry or open the download page after shutdown', async (t) => {
+  for (const platform of ['win32', 'darwin'])
+    for (const choice of [0, 1, 2]) {
+      let installs = 0;
+      let exits = 0;
+      const prompts = [];
+      const install = () => {
+        installs++;
+        if (installs === 1)
+          throw Object.assign(
+            new Error('The update installer failed at /Users/Synthetic Owner/archive.zip'),
+            { code: 'EACCES' },
+          );
+      };
+      const f = await runningDesktop(
+        t,
+        async (url) =>
+          Response.json(
+            new URL(url).pathname === '/api/desktop/status' ? { running: [] } : { ok: true },
+          ),
+        {
+          platform,
+          allowStart: true,
+          startWindowsInstall: install,
+          quitAndInstall: install,
+          exit: () => {
+            exits++;
+          },
+          prompt: (options) => {
+            prompts.push(options);
+            return { response: choice };
+          },
+        },
+      );
+      f.crash();
+      await f.prepare();
+      f.showEngine();
+      await new Promise(setImmediate);
+      const candidate = { version: '0.5.2' };
+      await f.checkUpdates(
+        { ready: candidate, check: async () => candidate, dispose: async () => {} },
+        false,
+      );
+      await f.restartForUpdate();
+      assert.equal(installs, choice === 0 ? 2 : 1);
+      assert.equal(prompts.length, 1);
+      assert.match(prompts[0].message, /could not install/);
+      assert.match(prompts[0].detail, /EACCES/);
+      assert.equal(prompts[0].detail.includes('Synthetic Owner'), false);
+      assert.equal(f.children[0].killed, true);
+      assert.equal(exits, platform === 'win32' || choice !== 0 ? 1 : 0);
+      assert.deepEqual(
+        f.externalURLs,
+        choice === 1 ? ['https://nod.n8n.io/docs/get-started/install-desktop/'] : [],
+      );
+    }
+});
+
+test('a failed in-app restart keeps the verified update and retries it once with the current failure ID', async (t) => {
+  let checks = 0;
+  let restarts = 0;
+  const candidate = { version: '0.5.2' };
+  const updater = {
+    ready: candidate,
+    async check() {
+      checks++;
+      return candidate;
+    },
+    async restart() {
+      restarts++;
+      if (restarts === 1) throw new Error('The installer could not start (code 7).');
+    },
+  };
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
+    prompt: () => ({ response: 2 }),
+  });
+  f.showEngine();
+  await new Promise(setImmediate);
+  const window = f.windows.at(-1);
+  const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+  const status = f.handlers.get('nod:updates:status');
+  await f.checkUpdates(updater, false);
+  await f.handlers.get('nod:updates:restart')(event);
+  assert.equal(restarts, 1);
+  assert.equal(status(event).failure.phase, 'restart');
+  assert.equal(status(event).readyVersion, candidate.version);
+  const id = status(event).failure.id;
+  const bridge = await engineBridge(window, f.handlers);
+  const client = await onboardingClient(bridge.bridge);
+  await client.retryDesktopUpdate(id);
+  assert.equal(restarts, 2);
+  assert.equal(checks, 1);
+  assert.equal(status(event).failure, undefined);
+  await assert.rejects(client.retryDesktopUpdate(id), /changed/);
+  assert.equal(restarts, 2);
+});
+
+test('a failed browser open keeps an explicit retry and lets a stopped app quit', async (t) => {
+  for (const stopped of [false, true]) {
+    let opens = 0;
+    let exits = 0;
+    let openingPrompts = 0;
+    const f = await runningDesktop(t, async () => Response.json({ ok: true }), {
+      platform: 'win32',
+      startWindowsInstall: async () => {
+        throw new Error('The installer could not start.');
+      },
+      openExternal: async () => {
+        opens++;
+        throw Object.assign(new Error('The browser could not open.'), { code: 'EACCES' });
+      },
+      exit: () => {
+        exits++;
+      },
+      prompt: (options) => {
+        if (options.message === 'Nod could not open the download page.') {
+          openingPrompts++;
+          assert.match(options.detail, /EACCES/);
+          assert.match(
+            options.detail,
+            /https:\/\/nod\.n8n\.io\/docs\/get-started\/install-desktop\//,
+          );
+          assert.equal(options.buttons[1], stopped ? 'Quit Nod' : 'Not now');
+          return { response: openingPrompts === 1 ? 0 : 1 };
+        }
+        return { response: 1 };
+      },
+    });
+    if (stopped) {
+      f.crash();
+      const candidate = { version: '0.5.2' };
+      await f.checkUpdates(
+        { ready: candidate, check: async () => candidate, dispose: async () => {} },
+        false,
+      );
+      await f.quitApp();
+    } else {
+      f.showEngine();
+      await new Promise(setImmediate);
+      const window = f.windows.at(-1);
+      const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+      const download = f.handlers.get('nod:updates:download');
+      assert.throws(() => download({ ...event, senderFrame: {} }), /unavailable/);
+      await download(event);
+    }
+    assert.equal(opens, 2);
+    assert.equal(openingPrompts, 2);
+    assert.equal(exits, Number(stopped));
+  }
+});
+
+test('the update notice shows failure recovery and keeps newer status after a late initial read', async (t) => {
+  const bundled = await build({
+    stdin: {
+      contents: `import {createRoot} from 'react-dom/client';
+        import {flushSync} from 'react-dom';
+        import {createElement} from 'react';
+        import {DesktopUpdateToast} from './src/web/components/desktop-update-toast';
+        export {flushSync};
+        const root = createRoot(document.getElementById('root'));
+        export function mount() { flushSync(() => root.render(createElement(DesktopUpdateToast))); }
+        export function close() { flushSync(() => root.unmount()); }`,
+      resolveDir: fileURLToPath(new URL('../..', import.meta.url)),
+    },
+    bundle: true,
+    format: 'iife',
+    globalName: 'updateNotice',
+    write: false,
+    jsx: 'automatic',
+  });
+  const page = new JSDOM('<!doctype html><div id="root"></div>', {
+    url: 'https://app.example.invalid',
+    runScripts: 'outside-only',
+  });
+  t.after(() => page.window.close());
+  const initial = deferred();
+  const retried = deferred();
+  const retries = [];
+  const dismissals = [];
+  let downloads = 0;
+  let listener;
+  page.window.nodDesktop = {
+    updateStatus: () => initial.promise,
+    onUpdateStatus: (receive) => {
+      listener = receive;
+      return () => {
+        listener = undefined;
+      };
+    },
+    retryUpdate: async (id) => {
+      retries.push(id);
+      await retried.promise;
+    },
+    dismissUpdate: async (id) => {
+      dismissals.push(id);
+    },
+    downloadUpdate: async () => {
+      downloads++;
+    },
+  };
+  page.window.eval(bundled.outputFiles[0].text);
+  const view = page.window.updateNotice;
+  t.after(() => view.close());
+  view.mount();
+  const failed = {
+    phase: 'idle',
+    checking: false,
+    readyVersion: '0.5.1',
+    failure: { id: 1, phase: 'downloading', message: 'The download timed out.' },
+  };
+  view.flushSync(() => listener(failed));
+  initial.resolve({ phase: 'idle', checking: false });
+  await new Promise(setImmediate);
+  const document = page.window.document;
+  assert.match(document.body.textContent, /could not download/);
+  assert.match(document.querySelector('[role="alert"]').textContent, /timed out/);
+  assert.equal(
+    document.querySelector('a').href,
+    'https://nod.n8n.io/docs/get-started/install-desktop/',
+  );
+  view.flushSync(() => document.querySelector('a').click());
+  assert.equal(downloads, 1);
+  const button = (label) =>
+    [...document.querySelectorAll('button')].find((entry) => entry.textContent === label);
+  view.flushSync(() => button('Try again').click());
+  assert.deepEqual(retries, [1]);
+  assert.equal(button('Please wait…').disabled, true);
+  retried.reject(new Error('The update failure has changed. Check the update notice.'));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.match(document.body.textContent, /failure has changed/);
+  view.flushSync(() => listener({ ...failed, failure: { ...failed.failure, dismissed: true } }));
+  assert.match(document.body.textContent, /Nod 0.5.1 is ready/);
+  assert.equal(document.body.textContent.includes('failure has changed'), false);
+  view.flushSync(() => listener({ phase: 'ready', checking: false, readyVersion: '0.5.2' }));
+  assert.equal(document.body.textContent.includes('failure has changed'), false);
+  view.flushSync(() => listener({ ...failed, failure: { ...failed.failure, id: 2 } }));
+  view.flushSync(() => button('Dismiss').click());
+  assert.deepEqual(dismissals, [2]);
+  view.flushSync(() => listener({ ...failed, failure: { ...failed.failure, dismissed: true } }));
+  assert.match(document.body.textContent, /Nod 0.5.1 is ready/);
+  view.flushSync(() => listener({ phase: 'ready', checking: false, readyVersion: '0.5.2' }));
+  assert.match(document.body.textContent, /Nod 0.5.2 is ready/);
+  assert.equal(document.body.textContent.includes('failure has changed'), false);
+  assert.equal(button('Restart to update').disabled, false);
+  view.flushSync(() => button('Later').click());
+  assert.deepEqual(dismissals, [2, '0.5.2']);
 });
 
 test('ready desktop updates share Later across engine windows and reopen for a new version', async (t) => {
@@ -8076,10 +8942,9 @@ test('ready desktop updates share Later across engine windows and reopen for a n
   assert.deepEqual(restarts, []);
 });
 
-test('in-app update restart keeps Later safe and shares one confirmation', async (t) => {
-  const choice = deferred();
-  const shown = deferred();
-  const prompts = [];
+test('in-app update restart restarts once without asking again', async (t) => {
+  const restarted = deferred();
+  const started = deferred();
   const restarts = [];
   const updater = {
     ready: undefined,
@@ -8089,18 +8954,11 @@ test('in-app update restart keeps Later safe and shares one confirmation', async
     },
     async restart() {
       restarts.push(this.ready.version);
+      started.resolve();
+      await restarted.promise;
     },
   };
-  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'), {
-    prompt: (options) => {
-      prompts.push(options);
-      if (prompts.length === 1) {
-        shown.resolve();
-        return choice.promise;
-      }
-      return { response: 0 };
-    },
-  });
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'));
   f.showEngine();
   await new Promise(setImmediate);
   const window = f.windows.at(-1);
@@ -8111,23 +8969,40 @@ test('in-app update restart keeps Later safe and shares one confirmation', async
   await f.checkUpdates(updater, false);
 
   const first = restart(event);
-  await shown.promise;
+  await started.promise;
   const second = restart(event);
-  assert.equal(prompts.length, 1);
   assert.equal(status(event).checking, true);
   assert.equal(f.updateMenu.enabled, false);
-  assert.match(prompts[0].message, /Nod 0\.5\.2 is ready/);
-  assert.deepEqual([...prompts[0].buttons], ['Restart', 'Later']);
-  assert.equal(prompts[0].defaultId, 1);
-  assert.equal(prompts[0].cancelId, 1);
-  choice.resolve({ response: 1 });
+  restarted.resolve();
   await Promise.all([first, second]);
-  assert.deepEqual(restarts, []);
-  assert.equal(status(event).readyVersion, '0.5.2');
+  assert.deepEqual(restarts, ['0.5.2']);
   assert.equal(status(event).checking, false);
+});
 
-  await restart(event);
-  assert.equal(prompts.length, 2);
+test('in-app update restart during a background check restarts without asking again', async (t) => {
+  const checked = deferred();
+  const restarts = [];
+  const updater = {
+    ready: undefined,
+    async check() {
+      await checked.promise;
+      this.ready = { version: '0.5.2' };
+      return this.ready;
+    },
+    async restart() {
+      restarts.push(this.ready.version);
+    },
+  };
+  const f = await runningDesktop(t, () => assert.fail('No engine request is needed.'));
+  f.showEngine();
+  await new Promise(setImmediate);
+  const window = f.windows.at(-1);
+  const event = { sender: window.webContents, senderFrame: window.webContents.mainFrame };
+  const restart = f.handlers.get('nod:updates:restart');
+  const background = f.checkUpdates(updater, false);
+  const clicked = restart(event);
+  checked.resolve();
+  await Promise.all([background, clicked]);
   assert.deepEqual(restarts, ['0.5.2']);
 });
 
@@ -8352,4 +9227,260 @@ test('legacy account completion migrates to device progress without changing key
   assert.equal(Object.hasOwn(migrated, 'onboardingCompleted'), false);
   assert.deepEqual(migrated.secrets, value.secrets);
   assert.deepEqual(await f.reopen().environment(), environment);
+});
+
+async function updateDownloadFixture(t) {
+  const root = await mkdtemp(join(tmpdir(), 'nod-update-download-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const bytes = {
+    'nod-Setup-x64.exe': Buffer.from('Synthetic Windows installer bytes'),
+    'nod-Runtime-win32-x64.tar.gz': Buffer.from('Synthetic Windows runtime bytes'),
+  };
+  const entry = (file) => ({
+    file,
+    url: `https://updates.example.invalid/${file}`,
+    bytes: bytes[file].length,
+    sha256: createHash('sha256').update(bytes[file]).digest('hex'),
+  });
+  const candidate = {
+    version: '0.10.0',
+    installer: entry('nod-Setup-x64.exe'),
+    runtime: entry('nod-Runtime-win32-x64.tar.gz'),
+  };
+  const options = {
+    directory: join(root, 'updates'),
+    resourcesPath: join(root, 'resources'),
+    unsigned: async () => [],
+    fetch: (url) => new Response(bytes[new URL(url).pathname.slice(1)]),
+  };
+  return { root, bytes, candidate, options, target: join(options.directory, candidate.version) };
+}
+
+test('Windows update retries keep verified files and resume partial bytes after a new launch', async (t) => {
+  const f = await updateDownloadFixture(t);
+  const controller = new AbortController();
+  const installer = join(f.target, f.candidate.installer.file);
+  const runtime = join(f.target, f.candidate.runtime.file);
+  await assert.rejects(
+    stageWindowsUpdate(f.candidate, {
+      ...f.options,
+      signal: controller.signal,
+      fetch: (url) =>
+        url.endsWith('.exe')
+          ? new Response(
+              new ReadableStream({
+                start: (stream) =>
+                  stream.enqueue(f.bytes[f.candidate.installer.file].subarray(0, 7)),
+              }),
+            )
+          : f.options.fetch(url),
+      onProgress: (progress) => {
+        if (
+          progress >
+            f.candidate.runtime.bytes / (f.candidate.runtime.bytes + f.candidate.installer.bytes) &&
+          progress < 1
+        )
+          controller.abort();
+      },
+    }),
+    { name: 'AbortError' },
+  );
+  assert.equal((await stat(installer)).size, 7);
+  assert.deepEqual(await readFile(runtime), f.bytes[f.candidate.runtime.file]);
+  await clearInstalledWindowsUpdates(f.options.directory, '0.9.0');
+  const requests = [];
+  let signatures = 0;
+  const resumed = {
+    ...f.options,
+    unsigned: async () => {
+      signatures++;
+      return [];
+    },
+    fetch: (url, options) => {
+      requests.push(url);
+      assert.equal(options.headers.range, 'bytes=7-');
+      const bytes = f.bytes[f.candidate.installer.file];
+      return new Response(bytes.subarray(7), {
+        status: 206,
+        headers: { 'content-range': `bytes 7-${bytes.length - 1}/${bytes.length}` },
+      });
+    },
+  };
+  await stageWindowsUpdate(f.candidate, resumed);
+  await stageWindowsUpdate(f.candidate, resumed);
+  assert.deepEqual(requests, [f.candidate.installer.url]);
+  assert.equal(signatures, 2);
+  assert.deepEqual(await readFile(installer), f.bytes[f.candidate.installer.file]);
+  await clearInstalledWindowsUpdates(f.options.directory, f.candidate.version);
+  assert.deepEqual(await readdir(f.options.directory), []);
+});
+
+test('Windows update staging checks cached hashes and removes an installer with a failed publisher check', async (t) => {
+  const f = await updateDownloadFixture(t);
+  await stageWindowsUpdate(f.candidate, f.options);
+  await writeFile(
+    join(f.target, f.candidate.installer.file),
+    Buffer.alloc(f.candidate.installer.bytes),
+  );
+  const requests = [];
+  await stageWindowsUpdate(f.candidate, {
+    ...f.options,
+    fetch: (url) => {
+      requests.push(url);
+      return f.options.fetch(url);
+    },
+  });
+  assert.deepEqual(requests, [f.candidate.installer.url]);
+  await assert.rejects(
+    stageWindowsUpdate(f.candidate, {
+      ...f.options,
+      fetch: () => assert.fail('Verified files do not need another download.'),
+      unsigned: async (files) => files,
+    }),
+    /not signed by n8n GmbH/,
+  );
+  await assert.rejects(stat(join(f.target, f.candidate.installer.file)), { code: 'ENOENT' });
+  assert.deepEqual(
+    await readFile(join(f.target, f.candidate.runtime.file)),
+    f.bytes[f.candidate.runtime.file],
+  );
+  await assert.rejects(
+    stageWindowsUpdate(
+      { ...f.candidate, installer: { ...f.candidate.installer, bytes: -1 } },
+      f.options,
+    ),
+    /update is invalid/,
+  );
+});
+
+test(
+  'a stalled Windows update stops and keeps bytes for the next background check',
+  { timeout: 5000 },
+  async (t) => {
+    const f = await updateDownloadFixture(t);
+    await assert.rejects(
+      stageWindowsUpdate(f.candidate, {
+        ...f.options,
+        includeRuntime: false,
+        stallTimeout: 25,
+        fetch: (_url, { signal }) =>
+          new Response(
+            new ReadableStream({
+              start(stream) {
+                stream.enqueue(f.bytes[f.candidate.installer.file].subarray(0, 7));
+                signal.addEventListener('abort', () => stream.error(signal.reason), { once: true });
+              },
+            }),
+          ),
+      }),
+      /stopped receiving data/,
+    );
+    assert.equal((await stat(join(f.target, f.candidate.installer.file))).size, 7);
+  },
+);
+
+test('Windows update resumes when a server ignores ranges and rejects corrupt saved bytes', async (t) => {
+  for (const response of ['full', 'wrong-range', 'corrupt-prefix']) {
+    const f = await updateDownloadFixture(t);
+    await mkdir(f.target, { recursive: true });
+    const path = join(f.target, f.candidate.installer.file);
+    const bytes = f.bytes[f.candidate.installer.file];
+    await writeFile(path, response === 'corrupt-prefix' ? Buffer.alloc(7) : bytes.subarray(0, 7));
+    let calls = 0;
+    const operation = stageWindowsUpdate(f.candidate, {
+      ...f.options,
+      includeRuntime: false,
+      fetch: (_url, { headers }) => {
+        calls++;
+        assert.equal(headers.range, calls === 1 ? 'bytes=7-' : undefined);
+        if (response === 'wrong-range' && calls === 1)
+          return new Response(bytes.subarray(8), {
+            status: 206,
+            headers: { 'content-range': `bytes 8-${bytes.length - 1}/${bytes.length}` },
+          });
+        return new Response(bytes);
+      },
+    });
+    if (response === 'corrupt-prefix') {
+      await assert.rejects(operation, /integrity check/);
+      await assert.rejects(stat(path), { code: 'ENOENT' });
+      await stageWindowsUpdate(f.candidate, { ...f.options, includeRuntime: false });
+    } else await operation;
+    assert.deepEqual(await readFile(path), bytes);
+    assert.equal(calls, response === 'wrong-range' ? 2 : 1);
+  }
+});
+
+test('Windows update failures keep partial bytes and never check or run an incomplete installer', async (t) => {
+  for (const failure of ['offline', 'http', 'short', 'oversized', 'unsafe-redirect']) {
+    const f = await updateDownloadFixture(t);
+    await mkdir(f.target, { recursive: true });
+    const path = join(f.target, f.candidate.installer.file);
+    const bytes = f.bytes[f.candidate.installer.file];
+    await writeFile(path, bytes.subarray(0, 7));
+    await assert.rejects(
+      stageWindowsUpdate(f.candidate, {
+        ...f.options,
+        includeRuntime: false,
+        unsigned: () => assert.fail('An incomplete installer cannot reach the publisher check.'),
+        fetch: (url) => {
+          assert.equal(new URL(url).protocol, 'https:');
+          if (failure === 'offline') throw new Error('Synthetic offline request');
+          if (failure === 'http') return new Response(null, { status: 503 });
+          if (failure === 'unsafe-redirect')
+            return new Response(null, {
+              status: 302,
+              headers: { location: 'http://unsafe.example.invalid/installer.exe' },
+            });
+          return new Response(
+            failure === 'short' ? bytes.subarray(0, 10) : Buffer.alloc(bytes.length + 1),
+          );
+        },
+      }),
+    );
+    if (['short', 'oversized'].includes(failure))
+      await assert.rejects(stat(path), { code: 'ENOENT' });
+    else assert.equal((await stat(path)).size, 7);
+  }
+});
+
+test('background checks cap the retry wait and retry on wake after a failure', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const powerMonitor = new EventEmitter();
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  let calls = 0;
+  let fail = true;
+  const stop = startDesktopUpdateChecks({
+    powerMonitor,
+    check: async () => {
+      calls++;
+      if (fail) throw new Error('Synthetic offline check');
+    },
+  });
+  t.after(stop);
+  await settle();
+  assert.equal(calls, 1);
+  powerMonitor.emit('resume');
+  await settle();
+  assert.equal(calls, 2);
+  for (const delay of [120_000, 240_000, 480_000, 900_000, 900_000]) {
+    const before = calls;
+    t.mock.timers.tick(delay - 1);
+    await settle();
+    assert.equal(calls, before);
+    t.mock.timers.tick(1);
+    await settle();
+    assert.equal(calls, before + 1);
+  }
+  fail = false;
+  powerMonitor.emit('resume');
+  await settle();
+  const before = calls;
+  powerMonitor.emit('resume');
+  t.mock.timers.tick(6 * 60 * 60_000 - 1);
+  await settle();
+  assert.equal(calls, before);
+  t.mock.timers.tick(1);
+  await settle();
+  assert.equal(calls, before + 1);
 });

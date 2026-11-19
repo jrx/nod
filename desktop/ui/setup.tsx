@@ -55,7 +55,7 @@ type Desktop = {
   openConnectionSettings(): Promise<void>;
   closeConnectionSettings(): Promise<void>;
   continueOnboarding(): Promise<void>;
-  prepare(options?: { retry: boolean }): Promise<Status>;
+  prepare(options?: { retry: boolean; report?: boolean }): Promise<Status>;
   warmup?(): Promise<void>;
   installWsl(): Promise<Status>;
   showStartupLog(): Promise<void>;
@@ -496,6 +496,29 @@ function Startup() {
         : active.message ||
           (firstSetup ? 'Preparing your workspace and browser.' : 'Opening your saved workspace.');
 
+  const retry = (report = false) =>
+    run(async () => {
+      if (!desktop) return;
+      if (failure?.needsServerConnection) {
+        await desktop.openConnectionSettings();
+        return;
+      }
+      if (settingsError || (firstSetup && !welcome)) {
+        const [preferences, settings] = await Promise.all([
+          desktop.getPreferences(),
+          desktop.getSettings(),
+        ]);
+        applyPreferences(preferences);
+        if (firstSetup) {
+          localChoiceSaved.current = Boolean(settings.welcome);
+          acceptWelcome(settings.welcome ?? { usageData: true, continued: false });
+        }
+        setSettingsError('');
+      }
+      if (firstSetup && !localChoiceSaved.current) return;
+      return desktop.prepare(report ? { retry: true, report } : { retry: true });
+    });
+
   return (
     <>
       <div className="titlebar" aria-hidden="true" />
@@ -525,38 +548,18 @@ function Startup() {
       >
         {failure && desktop && (
           <div className="recovery-actions">
-            <button
-              type="button"
-              disabled={working}
-              onClick={() =>
-                void run(async () => {
-                  if (failure.needsServerConnection) {
-                    await desktop.openConnectionSettings();
-                    return;
-                  }
-                  if (settingsError || (firstSetup && !welcome)) {
-                    const [preferences, settings] = await Promise.all([
-                      desktop.getPreferences(),
-                      desktop.getSettings(),
-                    ]);
-                    applyPreferences(preferences);
-                    if (firstSetup) {
-                      localChoiceSaved.current = Boolean(settings.welcome);
-                      acceptWelcome(settings.welcome ?? { usageData: true, continued: false });
-                    }
-                    setSettingsError('');
-                  }
-                  if (firstSetup && !localChoiceSaved.current) return;
-                  return desktop.prepare({ retry: true });
-                })
-              }
-            >
+            <button type="button" disabled={working} onClick={() => void retry()}>
               {working
                 ? 'Trying again…'
                 : failure.needsServerConnection
                   ? 'Reconnect to server'
                   : 'Try again'}
             </button>
+            {!failure.needsServerConnection && (
+              <button type="button" disabled={working} onClick={() => void retry(true)}>
+                Report bug
+              </button>
+            )}
             <button
               type="button"
               disabled={working}

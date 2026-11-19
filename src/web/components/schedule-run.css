@@ -1,0 +1,173 @@
+.schedule-run-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 18px;
+  text-decoration: none;
+}
+.schedule-run-hint:is(:hover, :focus-visible) {
+  color: var(--link);
+  text-decoration: underline;
+}
+.schedule-run-code {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  color: var(--muted-foreground);
+  background: var(--surface-subtle);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.schedule-run-track {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 600px;
+  margin: 0 0 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+.schedule-run-track[data-outcome='ran'] {
+  padding: 0 0 2px;
+  border: 0;
+  background: none;
+}
+.schedule-run-track-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted-foreground);
+  font-size: 13px;
+  line-height: 18px;
+}
+.schedule-run-track-title {
+  color: var(--foreground);
+  font-weight: 500;
+}
+.schedule-run-line {
+  position: relative;
+  display: flex;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.schedule-run-line li {
+  position: relative;
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+.schedule-run-line li:not(:last-child)::after {
+  content: '';
+  position: absolute;
+  top: 5px;
+  left: 14px;
+  right: 2px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--border);
+}
+.schedule-run-line li[data-state='next'] {
+  flex: 0 0 auto;
+}
+.schedule-run-mark {
+  position: relative;
+  z-index: 1;
+  box-sizing: border-box;
+  width: 12px;
+  height: 12px;
+  border-radius: var(--radius-full);
+  background: var(--surface);
+}
+:is([data-state='missed'], [data-state='due']) > .schedule-run-mark {
+  border: 2px solid color-mix(in srgb, var(--muted-foreground) 55%, transparent);
+}
+[data-state='failed'] > .schedule-run-mark {
+  border: 2px solid var(--error);
+  background: var(--error-soft);
+}
+[data-state='ran'] > .schedule-run-mark {
+  background: var(--brand-pink);
+}
+[data-state='next'] > .schedule-run-mark {
+  border: 2px solid var(--border);
+}
+.schedule-run-time {
+  color: var(--muted-foreground);
+  font-size: 12px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  padding-right: 6px;
+}
+[data-state='failed'] > .schedule-run-time {
+  color: var(--error);
+}
+[data-state='ran'] > .schedule-run-time {
+  color: var(--foreground);
+}
+.schedule-run-track-body {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--surface-subtle);
+}
+.schedule-run-sentence {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0;
+  color: var(--foreground);
+  font-size: 14px;
+  line-height: 20px;
+}
+.schedule-run-sentence svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--error);
+}
+.schedule-run-sentence-quiet {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.schedule-run-track-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.schedule-run-started {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--success);
+  font-size: 14px;
+  line-height: 20px;
+}
+.schedule-run-error {
+  flex: 1 1 100%;
+  margin: 0;
+  color: var(--error);
+  font-size: 13px;
+  line-height: 18px;
+}
+.chat-page .message-row[hidden] {
+  display: none;
+}
+[data-state='gap'] > .schedule-run-mark {
+  background: none;
+}

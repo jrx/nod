@@ -10,15 +10,12 @@ SetCompressor /SOLID zlib
 !ifdef SIGNER
   !uninstfinalize '"${NODE}" "${SIGNER}" "%1"' = 0
 !endif
-ShowInstDetails show
+ShowInstDetails hide
+AutoCloseWindow true
 !define MUI_ICON "${ICON}"
 !define MUI_UNICON "${ICON}"
 !define MUI_ABORTWARNING
-!define MUI_FINISHPAGE_RUN "$INSTDIR\nod.exe"
-!insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
-!insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
@@ -35,6 +32,12 @@ Function .onInit
     SetErrorLevel 1
     Abort
   ${EndIf}
+FunctionEnd
+
+Function .onInstSuccess
+  IfSilent installed
+  Exec '"$INSTDIR\nod.exe"'
+  installed:
 FunctionEnd
 
 Function CheckInstallDirectory
@@ -111,7 +114,18 @@ Section "nod"
     Abort
   directory_marked:
   WriteUninstaller "$INSTDIR\Uninstall.exe"
+  RMDir /r "$INSTDIR\previous-resources"
+  IfFileExists "$INSTDIR\resources\*.*" 0 resources_moved
+    ClearErrors
+    Rename "$INSTDIR\resources" "$INSTDIR\previous-resources"
+    IfErrors 0 resources_moved
+      MessageBox MB_ICONSTOP "Nod could not replace the files of its previous version. Close any program that has files open in the Nod folder, then run this installer again." /SD IDOK
+      SetErrorLevel 1
+      Abort
+  resources_moved:
   File /r "${APP_DIR}\*"
+  Rename "$INSTDIR\previous-resources\engine\windows-runtime\guest.tar.gz" "$INSTDIR\resources\engine\windows-runtime\guest.tar.gz"
+  RMDir /r "$INSTDIR\previous-resources"
   IfFileExists "$EXEDIR\nod-Runtime-win32-x64.tar.gz" 0 runtime_copied
     ClearErrors
     CopyFiles /SILENT "$EXEDIR\nod-Runtime-win32-x64.tar.gz" "$INSTDIR\resources\engine\windows-runtime\guest.tar.gz"

@@ -1,16 +1,26 @@
 import assert from 'node:assert/strict';
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
 import { constants } from 'node:fs';
-import { mkdir, mkdtemp, open, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  readlink,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { connect, createServer, type Socket } from 'node:net';
 import { createServer as createHttpServer } from 'node:http';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
-import test from 'node:test';
+import test, { describe } from 'node:test';
 import type { Static } from '@sinclair/typebox';
 import pg from 'pg';
 import type { Agent, AgentToolResult, RuntimeContext } from '../src/ports/agent.ts';
@@ -26,16 +36,11 @@ import {
   DaemonCommandError,
   existingDaemonCommand,
 } from '../src/providers/agent-browser/screens.ts';
-import { runProcess } from '../src/providers/process.ts';
+import { RuntimeTimeLimitError, runProcess } from '../src/providers/process.ts';
 import { containerBrowserOptions } from '../src/providers/container-browser/config.ts';
 import { openDevtools } from '../src/providers/agent-browser/devtools.ts';
-import { runBrowserBridge } from '../src/providers/container-browser/bridge.ts';
 import { createBridgeComputer } from '../src/providers/container-browser/client.ts';
-import {
-  browserNamespace,
-  createContainerBrowserComputer,
-  type BrowserBridgeLauncher,
-} from '../src/providers/container-browser/index.ts';
+import { browserNamespace } from '../src/providers/container-browser/index.ts';
 import {
   browserResponse,
   type BrowserCall,
@@ -44,7 +49,12 @@ import {
 import { startContainerBrowserWorker } from '../src/providers/container-browser/worker.ts';
 import { createAgentRuntime } from '../src/runtime/index.ts';
 import { toolDefinitions } from '../src/runtime/tools.ts';
-import { createBrowserFixture, fakeDevtools, type DevtoolsModel } from './browser-fixture.ts';
+import {
+  createBrowserFixture,
+  createBrowserWorkerFixture as harness,
+  fakeDevtools,
+  type DevtoolsModel,
+} from './browser-fixture.ts';
 import { stagedLoginBrowser } from './login-fixture.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { accessCookie, accessKey } from '../src/server/access.ts';
@@ -273,6 +283,116 @@ test(
         [next.id, { type: 'copy' }],
         [next.id, { type: 'copy' }],
       ]);
+      const viewId = `fixture-${randomUUID()}`;
+      let yieldedSecondFrame = false;
+      onView = async function* (signal) {
+        try {
+          yield Buffer.from('first-frame');
+          yieldedSecondFrame = true;
+          yield Buffer.from('second-frame');
+          await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+        } finally {
+          oldViewClosed.resolve();
+        }
+      };
+      const oldViewClosed = deferred();
+      const frameController = new AbortController();
+      const frameStream = await app.inject({
+        url: `/api/browser-handoff/stream?turnId=${nextTurnId}&view=${viewId}`,
+        headers,
+        payloadAsStream: true,
+        signal: frameController.signal,
+      });
+      assert.equal(frameStream.statusCode, 200);
+      const frameReader = frameStream.stream()[Symbol.asyncIterator]();
+      let frameBytes = Buffer.alloc(0);
+      const readFrame = async () => {
+        while (frameBytes.length < 4) {
+          const { value, done } = await frameReader.next();
+          assert.equal(done, false);
+          frameBytes = Buffer.concat([frameBytes, Buffer.from(value)]);
+        }
+        const size = frameBytes.readUInt32BE(0);
+        while (frameBytes.length < size + 4) {
+          const { value, done } = await frameReader.next();
+          assert.equal(done, false);
+          frameBytes = Buffer.concat([frameBytes, Buffer.from(value)]);
+        }
+        const frame = frameBytes.subarray(4, size + 4).toString();
+        frameBytes = frameBytes.subarray(size + 4);
+        return frame;
+      };
+      try {
+        assert.equal(await readFrame(), 'first-frame');
+        assert.equal(yieldedSecondFrame, false);
+        assert.equal(
+          (await post('/api/browser-handoff/frame-ack', { view: viewId })).statusCode,
+          200,
+        );
+        assert.equal(await readFrame(), 'second-frame');
+        assert.equal(yieldedSecondFrame, true);
+      } finally {
+        frameController.abort();
+        await oldViewClosed.promise;
+        onView = undefined;
+      }
+      const reconnectViewId = `fixture-${randomUUID()}`;
+      let yieldedReconnectFrame = false;
+      const reconnectViewClosed = deferred();
+      onView = async function* (signal) {
+        try {
+          yield Buffer.from('reconnected-first-frame');
+          yieldedReconnectFrame = true;
+          yield Buffer.from('reconnected-second-frame');
+          await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+        } finally {
+          reconnectViewClosed.resolve();
+        }
+      };
+      const reconnectController = new AbortController();
+      const reconnectStream = await app.inject({
+        url: `/api/browser-handoff/stream?turnId=${nextTurnId}&view=${reconnectViewId}`,
+        headers,
+        payloadAsStream: true,
+        signal: reconnectController.signal,
+      });
+      assert.equal(reconnectStream.statusCode, 200);
+      const reconnectReader = reconnectStream.stream()[Symbol.asyncIterator]();
+      let reconnectBytes = Buffer.alloc(0);
+      const readReconnectFrame = async () => {
+        while (reconnectBytes.length < 4) {
+          const { value, done } = await reconnectReader.next();
+          assert.equal(done, false);
+          reconnectBytes = Buffer.concat([reconnectBytes, Buffer.from(value)]);
+        }
+        const size = reconnectBytes.readUInt32BE(0);
+        while (reconnectBytes.length < size + 4) {
+          const { value, done } = await reconnectReader.next();
+          assert.equal(done, false);
+          reconnectBytes = Buffer.concat([reconnectBytes, Buffer.from(value)]);
+        }
+        const frame = reconnectBytes.subarray(4, size + 4).toString();
+        reconnectBytes = reconnectBytes.subarray(size + 4);
+        return frame;
+      };
+      try {
+        assert.equal(await readReconnectFrame(), 'reconnected-first-frame');
+        assert.equal(
+          (await post('/api/browser-handoff/frame-ack', { view: viewId })).statusCode,
+          409,
+        );
+        assert.equal(yieldedReconnectFrame, false);
+        assert.equal(
+          (await post('/api/browser-handoff/frame-ack', { view: reconnectViewId })).statusCode,
+          200,
+        );
+        assert.equal(await readReconnectFrame(), 'reconnected-second-frame');
+        assert.equal(yieldedReconnectFrame, true);
+      } finally {
+        reconnectController.abort();
+        await reconnectViewClosed.promise;
+        onView = undefined;
+      }
       const copyStarted = deferred();
       const copyRelease = deferred();
       onCopy = async () => {
@@ -514,6 +634,81 @@ function result(response: BrowserResponse) {
   assert.equal(response.ok, true);
   return response.ok ? response.result : undefined;
 }
+
+for (const kind of ['login', 'card'] as const)
+  test(`private ${kind} cancellation crosses the browser bridge without a later submission`, async () => {
+    const entered = deferred();
+    const release = deferred();
+    let operationSignal: AbortSignal | undefined;
+    let submissions = 0;
+    const wait = async (signal?: AbortSignal) => {
+      operationSignal = signal;
+      entered.resolve();
+      await release.promise;
+      signal?.throwIfAborted();
+      submissions++;
+    };
+    const fixture = await harness({
+      computer: fakeComputer({
+        injectCredentials: async (_input, signal) => {
+          await wait(signal);
+          return { status: 'submitted' };
+        },
+        fillCard: async (_input, signal) => {
+          await wait(signal);
+        },
+      }),
+    });
+    const computer = fixture.client(`/synthetic/private-${kind}`);
+    const controller = new AbortController();
+    const pending =
+      kind === 'login'
+        ? computer.injectCredentials(
+            {
+              threadId: 'task',
+              origin: 'https://example.com',
+              kind: 'password',
+              password: 'Synthetic bridge password',
+              passwordSelector: '#password',
+              submitSelector: '#submit',
+            },
+            controller.signal,
+          )
+        : computer.fillCard(
+            {
+              threadId: 'task',
+              fields: { number: '#number' },
+              document: 'synthetic-document',
+              destinations: { number: 'https://example.com' },
+              submitSelector: '#submit',
+              card: {
+                cardNumber: '4111111111111111',
+                expiryMonth: 12,
+                expiryYear: 2099,
+                cardholder: 'Synthetic owner',
+              },
+            },
+            controller.signal,
+          );
+    const rejected = assert.rejects(pending, /cancelled/);
+    try {
+      await entered.promise;
+      assert.ok(operationSignal);
+      assert.equal(operationSignal.aborted, false);
+      controller.abort();
+      for (let attempt = 0; !operationSignal.aborted && attempt < 100; attempt++) await delay(10);
+      assert.equal(operationSignal.aborted, true);
+      release.resolve();
+      await rejected;
+      assert.equal(submissions, 0);
+      await assert.rejects(computer.act('task', { action: 'snapshot' }), /unavailable/);
+      assert.ok(await computer.act('task', { action: 'open', url: 'https://example.com/reopen' }));
+    } finally {
+      release.resolve();
+      await rejected;
+      await fixture.close();
+    }
+  });
 
 test('quiesce refuses a pending request without aborting or querying its browser', async () => {
   const entered = deferred();
@@ -825,6 +1020,8 @@ test('a card goes only into the approved fields on the approved sites and stays 
       }
       if (command[0] === 'get' && command[1] === 'url') data = { url };
       if (command[0] === 'get' && command[1] === 'cdp-url') data = { cdpUrl: devtools.url };
+      if (command[0] === 'is' && command[1] === 'enabled')
+        data = { enabled: Boolean(model.frameOf[command[2]!]) };
       if (command[0] === 'get' && command[1] === 'attr')
         data = {
           value: command[3] === 'autocomplete' ? (autocomplete[command[2]!] ?? null) : null,
@@ -1097,6 +1294,37 @@ test('a browser that will not close is killed with its process groups so the nex
   }
 });
 
+for (const [host, owner] of [
+  ['another host', 'replaced-container-56'],
+  ['a host named with this host as prefix', `${hostname()}-replaced-56`],
+])
+  test(`a profile locked by a replaced browser container on ${host} opens again`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-browser-foreign-lock-'));
+    const fixture = stagedLoginBrowser();
+    const profile = join(directory, 'runtime', 'profiles', 'fixture');
+    const computer = createBrowserFixture({
+      dataRoot: directory,
+      run: async (executable, args, input) => {
+        const lock = await readlink(join(profile, 'SingletonLock')).catch(() => '');
+        if (args[args.indexOf('--idle-timeout') + 2] === 'open' && lock === owner)
+          throw new RuntimeTimeLimitError();
+        return fixture.run(executable, args, input);
+      },
+    });
+    try {
+      await mkdir(profile, { recursive: true });
+      await symlink(owner, join(profile, 'SingletonLock'));
+      const opened = await computer.act('fixture', {
+        action: 'open',
+        url: 'https://1.1.1.1/login',
+      });
+      assert.equal(opened.url, 'https://1.1.1.1/login');
+    } finally {
+      await computer.dispose().catch(() => {});
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
 type Execute = (
   id: string,
   input: Static<typeof toolDefinitions.browser.parameters>,
@@ -1263,139 +1491,6 @@ for (const failure of ['unknown', 'forged', 'navigation', 'wrong_action', 'cance
   });
 
 // Container browser worker namespaces
-
-function workerComputer() {
-  const calls: Array<{ method: string; input?: unknown }> = [];
-  let act: Computer['act'] = async (_id, input) => {
-    return {
-      text: input.text ?? 'Synthetic page',
-      url: input.url ?? 'https://example.com/',
-    };
-  };
-  const computer: Computer = {
-    ...fakeComputer(),
-    screenStatus: () => ({ state: 'live', capturedAt: '2026-09-25T12:00:00.000Z' }),
-    act: (id, input, signal) => {
-      calls.push({ method: 'act', input });
-      return act(id, input, signal);
-    },
-    screenshot: async () => Buffer.from('masked synthetic image'),
-    injectCredentials: async (input) => {
-      calls.push({ method: 'injectCredentials', input });
-      return { status: 'submitted' };
-    },
-    currentPage: async () => {
-      calls.push({ method: 'currentPage' });
-      return { origin: 'https://example.com', url: 'https://example.com/login' };
-    },
-    bindProfile: async (_id, profileId) => {
-      calls.push({ method: 'bindProfile', input: profileId });
-    },
-    hold: async () => {},
-    close: async () => {
-      calls.push({ method: 'close' });
-    },
-    clear: async (id) => {
-      calls.push({ method: 'clear', input: id });
-    },
-    discard: async (id) => {
-      calls.push({ method: 'discard', input: id });
-    },
-    fillCard: async (input) => {
-      calls.push({ method: 'fillCard', input });
-    },
-    cardDestinations: async (id, fields) => {
-      calls.push({ method: 'cardDestinations', input: { id, fields } });
-      return { document: 'loader-1', destinations: { number: 'https://pay.fixture.test' } };
-    },
-    checkoutImage: async (id) => {
-      calls.push({ method: 'checkoutImage', input: id });
-      return new Uint8Array([255, 216, 255]);
-    },
-    dispose: async () => {
-      calls.push({ method: 'dispose' });
-    },
-  };
-  return {
-    computer,
-    calls,
-    setAct(value: Computer['act']) {
-      act = value;
-    },
-  };
-}
-
-async function harness(
-  control: {
-    beforeFirstBridge?: Promise<void>;
-    computer?: Computer | (() => Computer);
-  } = {},
-) {
-  const root = await mkdtemp('/tmp/sk-browser-');
-  const socketPath = join(root, 'control.sock');
-  const instances = new Map<string, ReturnType<typeof workerComputer>>();
-  const worker = await startContainerBrowserWorker({
-    socketPath,
-    dataRoot: root,
-    createComputer: async (path) => {
-      if (typeof control.computer === 'function') return control.computer();
-      if (control.computer) return control.computer;
-      const value = workerComputer();
-      instances.set(path, value);
-      return value.computer;
-    },
-  });
-  const launches: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv | undefined }> =
-    [];
-  const bridges: ChildProcessWithoutNullStreams[] = [];
-  const launch: BrowserBridgeLauncher = (command, args, options) => {
-    launches.push({ command, args, env: options.env });
-    const process = Object.assign(new EventEmitter(), {
-      stdin: new PassThrough(),
-      stdout: new PassThrough(),
-      stderr: new PassThrough(),
-      kill() {
-        this.stdin.destroy();
-        return true;
-      },
-    });
-    void Promise.resolve(launches.length === 1 ? control.beforeFirstBridge : undefined)
-      .then(() => runBrowserBridge({ input: process.stdin, output: process.stdout, socketPath }))
-      .then((code) => {
-        process.stdout.end();
-        process.stderr.end();
-        process.emit('close', code);
-      });
-    const bridge = process as unknown as ChildProcessWithoutNullStreams;
-    bridges.push(bridge);
-    return bridge;
-  };
-  const clients: Computer[] = [];
-  function client(dataRoot: string, options: { timeoutMs?: number; drainTimeoutMs?: number } = {}) {
-    const value = createContainerBrowserComputer({ dataRoot, spawn: launch, ...options });
-    clients.push(value);
-    return value;
-  }
-  return {
-    root,
-    socketPath,
-    worker,
-    launches,
-    bridges,
-    instances,
-    client,
-    instance(dataRoot: string) {
-      const value = instances.get(join(root, browserNamespace(dataRoot)));
-      assert.ok(value);
-      return value;
-    },
-    async close() {
-      await Promise.allSettled(clients.map((client) => client.dispose()));
-      await worker.close();
-      await rm(root, { recursive: true, force: true });
-    },
-  };
-}
 
 test('a live view acknowledges applied input or fails', { timeout: 10_000 }, async (t) => {
   const inputs: unknown[] = [];
@@ -1620,6 +1715,77 @@ test('malformed methods and namespaces never reach a computer or filesystem path
     await assert.rejects(computer.discard!('../task'));
   } finally {
     await fixture.close();
+  }
+});
+
+test('a failed workspace browser action names only Nod-authored reasons', async () => {
+  let failure: Error = new RuntimeTimeLimitError();
+  const fixture = await harness({
+    computer: {
+      ...syntheticComputer(),
+      act: async () => {
+        throw failure;
+      },
+    },
+  });
+  try {
+    const computer = fixture.client('/synthetic/failure-reason');
+    await assert.rejects(
+      computer.act('task', { action: 'open', url: 'https://example.com/' }),
+      /could not complete this action: Runtime command exceeded its time limit\.$/,
+    );
+    for (failure of [
+      Object.assign(new Error("EACCES: permission denied, open '/data/profiles/task'"), {
+        code: 'EACCES',
+      }),
+      new Error('Synthetic private page text'),
+    ])
+      await assert.rejects(computer.act('task', { action: 'open', url: 'https://example.com/' }), {
+        message: 'The workspace browser could not complete this action. Try again.',
+      });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('a browser that fails to start reports why through the workspace browser', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-browser-start-failure-'));
+  let failure = (args: string[]) =>
+    `Chrome exited early (exit code: 21) for ${args[args.indexOf('--profile') + 1]} and ${/--disk-cache-dir=([^,]+)/.exec(args.join(' '))?.[1]}`;
+  const fixture = await harness({
+    computer: createAgentBrowserComputer({
+      dataRoot: directory,
+      headless: true,
+      run: async (_executable, args) => ({
+        exitCode: args.includes('info') ? 0 : 1,
+        stderr: '',
+        stdout: JSON.stringify(
+          args.includes('info')
+            ? { success: true, data: { active: false } }
+            : {
+                success: false,
+                error: failure(args),
+              },
+        ),
+      }),
+    }),
+  });
+  try {
+    await assert.rejects(
+      fixture.client(directory).act('fixture', { action: 'open', url: 'https://example.com/' }),
+      {
+        message:
+          'The workspace browser could not start, so no page opened. The browser said: Chrome exited early (exit code: 21) for [browser data] and [browser data]',
+      },
+    );
+    failure = () => 'Navigation failed: net::ERR_NAME_NOT_RESOLVED';
+    await assert.rejects(
+      fixture.client(directory).act('fixture', { action: 'open', url: 'https://example.com/' }),
+      { message: new BrowserActionError('browser_navigation_failed').message },
+    );
+  } finally {
+    await fixture.close();
+    await rm(directory, { recursive: true, force: true });
   }
 });
 
@@ -1978,233 +2144,235 @@ test('visual browser actions fence the session when releasing the pointer fails'
   }
 });
 
-test(
-  'native container browser stays responsive, streams live frames and refuses passkeys after heavy stderr output',
-  {
-    skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true' || process.platform !== 'linux',
-    timeout: 30_000,
-  },
-  async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'nod-stderr-native-'));
-    const server = createHttpServer((_request, response) => {
-      response.setHeader('content-type', 'text/html');
-      response.end(
-        '<button style="width:100vw;height:100vh" onclick="this.textContent=\'Accepted\'">Continue</button>',
-      );
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    assert.ok(address && typeof address !== 'string');
-    const computer = createAgentBrowserComputer({
-      ...containerBrowserOptions(directory),
-      privateNetwork: true,
-    });
-    let stderrPath: string | undefined;
-    try {
-      await computer.act('fixture', { action: 'open', url: `http://127.0.0.1:${address.port}` });
-      assert.ok((await computer.screenshot('fixture'))?.length);
-      for (const pid of await readdir('/proc')) {
-        if (!/^\d+$/.test(pid)) continue;
-        const args = await readFile(`/proc/${pid}/cmdline`, 'utf8').catch(() => '');
-        if (args.includes(`--user-data-dir=${directory}/`) && !args.includes('--type=')) {
-          stderrPath = `/proc/${pid}/fd/2`;
-          break;
-        }
-      }
-      assert.ok(stderrPath);
-      const writer = spawn(
-        process.execPath,
-        [
-          '--input-type=module',
-          '-e',
-          "import { writeFileSync } from 'node:fs'; writeFileSync(process.argv[1], Buffer.alloc(1024 * 1024, 120));",
-          stderrPath,
-        ],
-        { stdio: 'ignore', timeout: 1500, killSignal: 'SIGKILL' },
-      );
-      const exit = await new Promise<number | null>((resolve, reject) => {
-        writer.once('error', reject);
-        writer.once('exit', resolve);
-      });
-      assert.equal(
-        exit,
-        0,
-        'Chromium stderr must not block when browser output exceeds pipe capacity',
-      );
-      await computer.control!('fixture', { type: 'mouse', event: 'down', x: 0.5, y: 0.5 });
-      await computer.control!('fixture', { type: 'mouse', event: 'up', x: 0.5, y: 0.5 });
-      const page = await computer.act('fixture', { action: 'snapshot' });
-      assert.match(page.text, /Accepted/);
-      const screenshot = await computer.screenshot('fixture');
-      assert.ok(screenshot?.length);
-      assert.equal(computer.screenStatus!('fixture').state, 'live');
-      for await (const frame of computer.view!('fixture', new AbortController().signal)) {
-        assert.deepEqual([...frame.subarray(0, 2)], [0xff, 0xd8]);
-        break;
-      }
-      const passkey = await computer.act('fixture', {
-        action: 'evaluate',
-        script:
-          "Object.getPrototypeOf(navigator.credentials).get.call(navigator.credentials, { publicKey: { challenge: new Uint8Array(32) } }).then(() => 'resolved', (error) => error.message)",
-      });
-      assert.match(passkey.text, /Passkeys are not available in this browser/);
-    } finally {
-      if (stderrPath) {
-        const pipe = await open(stderrPath, constants.O_RDONLY | constants.O_NONBLOCK).catch(
-          () => undefined,
+describe('native browser controls', { concurrency: 3 }, () => {
+  test(
+    'native container browser stays responsive, streams live frames and refuses passkeys after heavy stderr output',
+    {
+      skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true' || process.platform !== 'linux',
+      timeout: 30_000,
+    },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-stderr-native-'));
+      const server = createHttpServer((_request, response) => {
+        response.setHeader('content-type', 'text/html');
+        response.end(
+          '<button style="width:100vw;height:100vh" onclick="this.textContent=\'Accepted\'">Continue</button>',
         );
-        if (pipe) {
-          try {
-            const buffer = Buffer.alloc(65536);
-            for (let count = 0; count < 32; count++) {
-              const read = await pipe.read(buffer).catch(() => ({ bytesRead: 0 }));
-              if (!read.bytesRead) break;
-            }
-          } finally {
-            await pipe.close();
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const computer = createAgentBrowserComputer({
+        ...containerBrowserOptions(directory),
+        privateNetwork: true,
+      });
+      let stderrPath: string | undefined;
+      try {
+        await computer.act('fixture', { action: 'open', url: `http://127.0.0.1:${address.port}` });
+        assert.ok((await computer.screenshot('fixture'))?.length);
+        for (const pid of await readdir('/proc')) {
+          if (!/^\d+$/.test(pid)) continue;
+          const args = await readFile(`/proc/${pid}/cmdline`, 'utf8').catch(() => '');
+          if (args.includes(`--user-data-dir=${directory}/`) && !args.includes('--type=')) {
+            stderrPath = `/proc/${pid}/fd/2`;
+            break;
           }
         }
+        assert.ok(stderrPath);
+        const writer = spawn(
+          process.execPath,
+          [
+            '--input-type=module',
+            '-e',
+            "import { writeFileSync } from 'node:fs'; writeFileSync(process.argv[1], Buffer.alloc(1024 * 1024, 120));",
+            stderrPath,
+          ],
+          { stdio: 'ignore', timeout: 1500, killSignal: 'SIGKILL' },
+        );
+        const exit = await new Promise<number | null>((resolve, reject) => {
+          writer.once('error', reject);
+          writer.once('exit', resolve);
+        });
+        assert.equal(
+          exit,
+          0,
+          'Chromium stderr must not block when browser output exceeds pipe capacity',
+        );
+        await computer.control!('fixture', { type: 'mouse', event: 'down', x: 0.5, y: 0.5 });
+        await computer.control!('fixture', { type: 'mouse', event: 'up', x: 0.5, y: 0.5 });
+        const page = await computer.act('fixture', { action: 'snapshot' });
+        assert.match(page.text, /Accepted/);
+        const screenshot = await computer.screenshot('fixture');
+        assert.ok(screenshot?.length);
+        assert.equal(computer.screenStatus!('fixture').state, 'live');
+        for await (const frame of computer.view!('fixture', new AbortController().signal)) {
+          assert.deepEqual([...frame.subarray(0, 2)], [0xff, 0xd8]);
+          break;
+        }
+        const passkey = await computer.act('fixture', {
+          action: 'evaluate',
+          script:
+            "Object.getPrototypeOf(navigator.credentials).get.call(navigator.credentials, { publicKey: { challenge: new Uint8Array(32) } }).then(() => 'resolved', (error) => error.message)",
+        });
+        assert.match(passkey.text, /Passkeys are not available in this browser/);
+      } finally {
+        if (stderrPath) {
+          const pipe = await open(stderrPath, constants.O_RDONLY | constants.O_NONBLOCK).catch(
+            () => undefined,
+          );
+          if (pipe) {
+            try {
+              const buffer = Buffer.alloc(65536);
+              for (let count = 0; count < 32; count++) {
+                const read = await pipe.read(buffer).catch(() => ({ bytesRead: 0 }));
+                if (!read.bytesRead) break;
+              }
+            } finally {
+              await pipe.close();
+            }
+          }
+        }
+        await computer.dispose();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
       }
-      await computer.dispose();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
+    },
+  );
 
-test(
-  'native handoff clicks stay aligned and copy preserves clipboard contents',
-  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
-  async () => {
-    const { createCanvas, loadImage } = await import('@napi-rs/canvas');
-    const context = createCanvas(1, 1).getContext('2d');
-    const directory = await mkdtemp(join(tmpdir(), 'nod-pointer-native-'));
-    const server = createHttpServer((_request, response) => {
-      response.setHeader('content-type', 'text/html');
-      response.end(
-        `<style>html,body{margin:0;width:100%;height:100%;overflow:hidden}button{position:fixed;left:10%;top:10%;width:10%;height:10%}</style>
+  test(
+    'native handoff clicks stay aligned and copy preserves clipboard contents',
+    { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+    async () => {
+      const { createCanvas, loadImage } = await import('@napi-rs/canvas');
+      const context = createCanvas(1, 1).getContext('2d');
+      const directory = await mkdtemp(join(tmpdir(), 'nod-pointer-native-'));
+      const server = createHttpServer((_request, response) => {
+        response.setHeader('content-type', 'text/html');
+        response.end(
+          `<style>html,body{margin:0;width:100%;height:100%;overflow:hidden}button{position:fixed;left:10%;top:10%;width:10%;height:10%}</style>
         <button id="target">Target</button><output></output><script>
         document.addEventListener('mousedown',event=>window.lastPointer={target:event.target.id,x:event.clientX,y:event.clientY});
         let frame=0;function paint(){document.querySelector('output').textContent=String(frame++);requestAnimationFrame(paint)}paint();
         </script>`,
-      );
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    assert.ok(address && typeof address !== 'string');
-    let socketPath = '';
-    const computer = createAgentBrowserComputer({
-      dataRoot: directory,
-      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-      privateNetwork: true,
-      headless: true,
-      daemonCommand: async (path, command, signal, timeoutMs) => {
-        socketPath = path;
-        return existingDaemonCommand(path, command, signal, timeoutMs);
-      },
-    });
-    let inspector: WebSocket | undefined;
-    try {
-      await computer.act('pointer', { action: 'open', url: `http://127.0.0.1:${address.port}` });
-      const connection = await existingDaemonCommand(socketPath, { action: 'cdp_url' });
-      const tabs = await existingDaemonCommand(socketPath, { action: 'tab_list' });
-      const tab = (tabs.tabs as Array<{ active: boolean; targetId: string }>).find(
-        (tab) => tab.active,
-      )!;
-      inspector = new WebSocket(String(connection.cdpUrl));
-      await once(inspector, 'open');
-      let sequence = 0;
-      const send = (method: string, params: Record<string, unknown>, sessionId?: string) =>
-        new Promise<Record<string, unknown>>((resolve, reject) => {
-          const id = ++sequence;
-          const receive = (event: MessageEvent) => {
-            const message = JSON.parse(String(event.data));
-            if (message.id !== id) return;
-            inspector!.removeEventListener('message', receive);
-            if (message.error) reject(new Error(message.error.message));
-            else resolve(message.result);
-          };
-          inspector!.addEventListener('message', receive);
-          inspector!.send(
-            JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }),
-          );
-        });
-      const { sessionId } = await send('Target.attachToTarget', {
-        targetId: tab.targetId,
-        flatten: true,
+        );
       });
-      const page = (method: string, params: Record<string, unknown>) =>
-        send(method, params, String(sessionId));
-      for (const [index, sample] of [
-        { width: 1440, height: 900, dpr: 1, zoom: 1, pan: false },
-        { width: 1440, height: 900, dpr: 2, zoom: 1, pan: false },
-        { width: 1440, height: 900, dpr: 1, zoom: 2, pan: false },
-        { width: 1440, height: 900, dpr: 1, zoom: 2, pan: true },
-        { width: 800, height: 1200, dpr: 1, zoom: 1, pan: false },
-      ].entries()) {
-        const color = [1, 2, 4].map((bit) => ((index + 1) & bit ? 255 : 0));
-        await existingDaemonCommand(socketPath, {
-          action: 'viewport',
-          width: sample.width,
-          height: sample.height,
-          deviceScaleFactor: sample.dpr,
-        });
-        await page('Emulation.setPageScaleFactor', { pageScaleFactor: sample.zoom });
-        if (sample.pan)
-          await page('Input.synthesizeScrollGesture', {
-            x: 400,
-            y: 300,
-            xDistance: -60,
-            yDistance: -60,
-            gestureSourceType: 'touch',
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      let socketPath = '';
+      const computer = createAgentBrowserComputer({
+        dataRoot: directory,
+        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+        privateNetwork: true,
+        headless: true,
+        daemonCommand: async (path, command, signal, timeoutMs) => {
+          socketPath = path;
+          return existingDaemonCommand(path, command, signal, timeoutMs);
+        },
+      });
+      let inspector: WebSocket | undefined;
+      try {
+        await computer.act('pointer', { action: 'open', url: `http://127.0.0.1:${address.port}` });
+        const connection = await existingDaemonCommand(socketPath, { action: 'cdp_url' });
+        const tabs = await existingDaemonCommand(socketPath, { action: 'tab_list' });
+        const tab = (tabs.tabs as Array<{ active: boolean; targetId: string }>).find(
+          (tab) => tab.active,
+        )!;
+        inspector = new WebSocket(String(connection.cdpUrl));
+        await once(inspector, 'open');
+        let sequence = 0;
+        const send = (method: string, params: Record<string, unknown>, sessionId?: string) =>
+          new Promise<Record<string, unknown>>((resolve, reject) => {
+            const id = ++sequence;
+            const receive = (event: MessageEvent) => {
+              const message = JSON.parse(String(event.data));
+              if (message.id !== id) return;
+              inspector!.removeEventListener('message', receive);
+              if (message.error) reject(new Error(message.error.message));
+              else resolve(message.result);
+            };
+            inspector!.addEventListener('message', receive);
+            inspector!.send(
+              JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }),
+            );
           });
-        const expected = await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {document.documentElement.style.backgroundColor='rgb(${color.join(',')})';const r=document.querySelector('#target').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,width:visualViewport.width,height:visualViewport.height,left:visualViewport.offsetLeft,top:visualViewport.offsetTop}})()`,
+        const { sessionId } = await send('Target.attachToTarget', {
+          targetId: tab.targetId,
+          flatten: true,
         });
-        const point = expected.result as {
-          x: number;
-          y: number;
-          width: number;
-          height: number;
-          left: number;
-          top: number;
-        };
-        const controller = new AbortController();
-        const frames = computer.view!('pointer', controller.signal)[Symbol.asyncIterator]();
-        try {
-          for (;;) {
-            const frame = await frames.next();
-            assert.equal(frame.done, false);
-            const image = await loadImage(frame.value!);
-            context.drawImage(image, 1 - image.width, 1 - image.height);
-            const pixel = context.getImageData(0, 0, 1, 1).data;
-            if (color.every((channel, index) => channel === (pixel[index]! > 127 ? 255 : 0))) break;
-          }
-          const position = {
-            x: (point.x - point.left) / point.width,
-            y: (point.y - point.top) / point.height,
-          };
-          await computer.control!('pointer', { type: 'mouse', event: 'down', ...position });
-          await computer.control!('pointer', { type: 'mouse', event: 'up', ...position });
-          const observed = await existingDaemonCommand(socketPath, {
+        const page = (method: string, params: Record<string, unknown>) =>
+          send(method, params, String(sessionId));
+        for (const [index, sample] of [
+          { width: 1440, height: 900, dpr: 1, zoom: 1, pan: false },
+          { width: 1440, height: 900, dpr: 2, zoom: 1, pan: false },
+          { width: 1440, height: 900, dpr: 1, zoom: 2, pan: false },
+          { width: 1440, height: 900, dpr: 1, zoom: 2, pan: true },
+          { width: 800, height: 1200, dpr: 1, zoom: 1, pan: false },
+        ].entries()) {
+          const color = [1, 2, 4].map((bit) => ((index + 1) & bit ? 255 : 0));
+          await existingDaemonCommand(socketPath, {
+            action: 'viewport',
+            width: sample.width,
+            height: sample.height,
+            deviceScaleFactor: sample.dpr,
+          });
+          await page('Emulation.setPageScaleFactor', { pageScaleFactor: sample.zoom });
+          if (sample.pan)
+            await page('Input.synthesizeScrollGesture', {
+              x: 400,
+              y: 300,
+              xDistance: -60,
+              yDistance: -60,
+              gestureSourceType: 'touch',
+            });
+          const expected = await existingDaemonCommand(socketPath, {
             action: 'evaluate',
-            script: 'window.lastPointer',
+            script: `(() => {document.documentElement.style.backgroundColor='rgb(${color.join(',')})';const r=document.querySelector('#target').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,width:visualViewport.width,height:visualViewport.height,left:visualViewport.offsetLeft,top:visualViewport.offsetTop}})()`,
           });
-          assert.deepEqual(
-            observed.result,
-            { target: 'target', x: point.x, y: point.y },
-            JSON.stringify(sample),
-          );
-        } finally {
-          controller.abort();
-          await frames.return?.();
+          const point = expected.result as {
+            x: number;
+            y: number;
+            width: number;
+            height: number;
+            left: number;
+            top: number;
+          };
+          const controller = new AbortController();
+          const frames = computer.view!('pointer', controller.signal)[Symbol.asyncIterator]();
+          try {
+            for (;;) {
+              const frame = await frames.next();
+              assert.equal(frame.done, false);
+              const image = await loadImage(frame.value!);
+              context.drawImage(image, 1 - image.width, 1 - image.height);
+              const pixel = context.getImageData(0, 0, 1, 1).data;
+              if (color.every((channel, index) => channel === (pixel[index]! > 127 ? 255 : 0)))
+                break;
+            }
+            const position = {
+              x: (point.x - point.left) / point.width,
+              y: (point.y - point.top) / point.height,
+            };
+            await computer.control!('pointer', { type: 'mouse', event: 'down', ...position });
+            await computer.control!('pointer', { type: 'mouse', event: 'up', ...position });
+            const observed = await existingDaemonCommand(socketPath, {
+              action: 'evaluate',
+              script: 'window.lastPointer',
+            });
+            assert.deepEqual(
+              observed.result,
+              { target: 'target', x: point.x, y: point.y },
+              JSON.stringify(sample),
+            );
+          } finally {
+            controller.abort();
+            await frames.return?.();
+          }
         }
-      }
-      if (process.platform === 'linux') {
-        const initial = await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {
+        if (process.platform === 'linux') {
+          const initial = await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => {
           const source = document.createElement('textarea');
           source.id = 'copy-source';
           source.value = 'Before Synthetic selected text After';
@@ -2213,15 +2381,15 @@ test(
           source.setSelectionRange(7, 30);
           return source.value.slice(source.selectionStart, source.selectionEnd);
         })()`,
-        });
-        assert.equal(initial.result, 'Synthetic selected text');
-        assert.equal(
-          await computer.control!('pointer', { type: 'copy' }),
-          'Synthetic selected text',
-        );
-        await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {
+          });
+          assert.equal(initial.result, 'Synthetic selected text');
+          assert.equal(
+            await computer.control!('pointer', { type: 'copy' }),
+            'Synthetic selected text',
+          );
+          await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => {
           const previous = document.createElement('textarea');
           previous.value = 'Prior remote clipboard';
           previous.addEventListener('copy', event => {
@@ -2234,30 +2402,30 @@ test(
           previous.focus();
           previous.select();
         })()`,
-        });
-        await computer.control!('pointer', { type: 'key', key: 'Control+c' });
-        const seeded = await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: 'window.seededRichCopy === true',
-        });
-        assert.equal(seeded.result, true);
-        const selected = await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {
+          });
+          await computer.control!('pointer', { type: 'key', key: 'Control+c' });
+          const seeded = await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: 'window.seededRichCopy === true',
+          });
+          assert.equal(seeded.result, true);
+          const selected = await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => {
           const source = document.querySelector('#copy-source');
           source.focus();
           source.setSelectionRange(7, 30);
           return source.value.slice(source.selectionStart, source.selectionEnd);
         })()`,
-        });
-        assert.equal(selected.result, 'Synthetic selected text');
-        assert.equal(
-          await computer.control!('pointer', { type: 'copy' }),
-          'Synthetic selected text',
-        );
-        const cleared = await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {
+          });
+          assert.equal(selected.result, 'Synthetic selected text');
+          assert.equal(
+            await computer.control!('pointer', { type: 'copy' }),
+            'Synthetic selected text',
+          );
+          const cleared = await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => {
           const source = document.querySelector('#copy-source');
           source.setSelectionRange(source.value.length, source.value.length);
           document.body.tabIndex = -1;
@@ -2265,34 +2433,34 @@ test(
           getSelection().removeAllRanges();
           return source.selectionStart === source.selectionEnd && document.activeElement === document.body && !getSelection().toString();
         })()`,
-        });
-        assert.equal(cleared.result, true);
-        assert.equal(await computer.control!('pointer', { type: 'copy' }), undefined);
-        await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {
+          });
+          assert.equal(cleared.result, true);
+          assert.equal(await computer.control!('pointer', { type: 'copy' }), undefined);
+          await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => {
           const destination = document.createElement('div');
           destination.id = 'copy-destination';
           destination.contentEditable = 'true';
           document.body.append(destination);
           destination.focus();
         })()`,
-        });
-        await computer.control!('pointer', {
-          type: 'key',
-          key: 'Control+v',
-        });
-        const pasted = await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {
+          });
+          await computer.control!('pointer', {
+            type: 'key',
+            key: 'Control+v',
+          });
+          const pasted = await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => {
           const destination = document.querySelector('#copy-destination');
           return { text: destination.textContent, rich: Boolean(destination.querySelector('strong')) };
         })()`,
-        });
-        assert.deepEqual(pasted.result, { text: 'Prior remote clipboard', rich: true });
-        await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {
+          });
+          assert.deepEqual(pasted.result, { text: 'Prior remote clipboard', rich: true });
+          await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => {
           const previous = document.createElement('textarea');
           previous.value = 'Prior rich only';
           previous.addEventListener('copy', event => {
@@ -2312,11 +2480,11 @@ test(
           previous.select();
           window.richOnlyReplacement = replacement;
         })()`,
-        });
-        await computer.control!('pointer', { type: 'key', key: 'Control+c' });
-        await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {
+          });
+          await computer.control!('pointer', { type: 'key', key: 'Control+c' });
+          await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => {
           const probe = document.createElement('div');
           probe.contentEditable = 'true';
           probe.addEventListener('paste', event => {
@@ -2328,28 +2496,28 @@ test(
           document.body.append(probe);
           probe.focus();
         })()`,
-        });
-        await computer.control!('pointer', { type: 'key', key: 'Control+v' });
-        const richOnlySeeded = await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {
+          });
+          await computer.control!('pointer', { type: 'key', key: 'Control+v' });
+          const richOnlySeeded = await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => {
           window.richOnlyReplacement.focus();
           window.richOnlyReplacement.select();
           return { seeded: window.seededRichOnly === true, clipboard: window.richOnlyClipboard };
         })()`,
-        });
-        const richOnlyState = richOnlySeeded.result as {
-          seeded: boolean;
-          clipboard: { plain: string; types: string[] };
-        };
-        assert.equal(richOnlyState.seeded, true);
-        assert.equal(richOnlyState.clipboard.plain, '');
-        assert.equal(richOnlyState.clipboard.types.includes('text/html'), true);
-        assert.equal(richOnlyState.clipboard.types.includes('text/plain'), false);
-        assert.equal(await computer.control!('pointer', { type: 'copy' }), undefined);
-        const richOnlyCopied = await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => {
+          });
+          const richOnlyState = richOnlySeeded.result as {
+            seeded: boolean;
+            clipboard: { plain: string; types: string[] };
+          };
+          assert.equal(richOnlyState.seeded, true);
+          assert.equal(richOnlyState.clipboard.plain, '');
+          assert.equal(richOnlyState.clipboard.types.includes('text/html'), true);
+          assert.equal(richOnlyState.clipboard.types.includes('text/plain'), false);
+          assert.equal(await computer.control!('pointer', { type: 'copy' }), undefined);
+          const richOnlyCopied = await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => {
           const destination = document.createElement('div');
           destination.contentEditable = 'true';
           document.body.append(destination);
@@ -2357,43 +2525,43 @@ test(
           window.richOnlyDestination = destination;
           return window.copiedRichOnly === true;
         })()`,
-        });
-        assert.equal(richOnlyCopied.result, true);
-        await computer.control!('pointer', { type: 'key', key: 'Control+v' });
-        const restoredRichOnly = await existingDaemonCommand(socketPath, {
-          action: 'evaluate',
-          script: `(() => ({
+          });
+          assert.equal(richOnlyCopied.result, true);
+          await computer.control!('pointer', { type: 'key', key: 'Control+v' });
+          const restoredRichOnly = await existingDaemonCommand(socketPath, {
+            action: 'evaluate',
+            script: `(() => ({
           text: window.richOnlyDestination.textContent,
           prior: Boolean(window.richOnlyDestination.querySelector('strong')),
           replacement: Boolean(window.richOnlyDestination.querySelector('em')),
         }))()`,
-        });
-        assert.deepEqual(restoredRichOnly.result, {
-          text: 'Prior rich only',
-          prior: true,
-          replacement: false,
-        });
+          });
+          assert.deepEqual(restoredRichOnly.result, {
+            text: 'Prior rich only',
+            prior: true,
+            replacement: false,
+          });
+        }
+      } finally {
+        inspector?.close();
+        await computer.dispose();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
       }
-    } finally {
-      inspector?.close();
-      await computer.dispose();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
+    },
+  );
 
-test(
-  'native visual browser actions solve a canvas interaction inside nested cross-origin frames',
-  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
-  async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'nod-visual-native-'));
-    let frameOrigin = '';
-    const server = createHttpServer((request, response) => {
-      response.setHeader('content-type', 'text/html');
-      response.end(
-        request.url === '/inner'
-          ? `<body style="margin:0"><canvas width="300" height="180" tabindex="0"></canvas><script>
+  test(
+    'native visual browser actions solve a canvas interaction inside nested cross-origin frames',
+    { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-visual-native-'));
+      let frameOrigin = '';
+      const server = createHttpServer((request, response) => {
+        response.setHeader('content-type', 'text/html');
+        response.end(
+          request.url === '/inner'
+            ? `<body style="margin:0"><canvas width="300" height="180" tabindex="0"></canvas><script>
           const canvas = document.querySelector('canvas');
           const context = canvas.getContext('2d');
           context.fillStyle = '#2475cc'; context.fillRect(0, 0, 80, 80);
@@ -2419,58 +2587,58 @@ test(
           };
           canvas.onkeydown = event => { if (event.isTrusted) { state.keys.push(event.key); send(); } };
           </script>`
-          : request.url === '/outer'
-            ? '<body style="margin:0"><iframe src="/inner" style="position:absolute;left:20px;top:30px;width:300px;height:180px;border:0"></iframe>'
-            : `<body><p>Select blue, drag across green, hold red, then use the arrow keys and space.</p>
+            : request.url === '/outer'
+              ? '<body style="margin:0"><iframe src="/inner" style="position:absolute;left:20px;top:30px;width:300px;height:180px;border:0"></iframe>'
+              : `<body><p>Select blue, drag across green, hold red, then use the arrow keys and space.</p>
             <output id="result"></output>
             <iframe src="${frameOrigin}/outer" style="position:absolute;left:30px;top:60px;width:360px;height:240px;border:0"></iframe>
             <script>addEventListener('message', event => { document.querySelector('output').textContent = JSON.stringify(event.data); });</script>`,
+        );
+      });
+      const frames = createHttpServer(
+        server.listeners('request')[0] as Parameters<typeof createHttpServer>[0],
       );
-    });
-    const frames = createHttpServer(
-      server.listeners('request')[0] as Parameters<typeof createHttpServer>[0],
-    );
-    const origin = async (value: typeof server) => {
-      await new Promise<void>((resolve) => value.listen(0, '127.0.0.1', resolve));
-      const address = value.address();
-      assert.ok(address && typeof address !== 'string');
-      return `http://127.0.0.1:${address.port}`;
-    };
-    frameOrigin = await origin(frames);
-    const pageOrigin = await origin(server);
-    const computer = createAgentBrowserComputer({
-      dataRoot: directory,
-      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-      privateNetwork: true,
-      headless: true,
-    });
-    const worker = await workerFixture(() => computer, 30_000);
-    const act = async (input: BrowserAction) =>
-      result(await worker.request({ method: 'act', threadId: 'fixture', input })) as {
-        text: string;
+      const origin = async (value: typeof server) => {
+        await new Promise<void>((resolve) => value.listen(0, '127.0.0.1', resolve));
+        const address = value.address();
+        assert.ok(address && typeof address !== 'string');
+        return `http://127.0.0.1:${address.port}`;
       };
-    try {
-      await act({ action: 'open', url: pageOrigin, waitMs: 100 });
-      const screen = result(await worker.request({ method: 'screenshot', threadId: 'fixture' }));
-      assert.equal(typeof screen, 'string');
-      const png = Buffer.from(screen as string, 'base64');
-      assert.equal(png.toString('hex', 0, 8), '89504e470d0a1a0a');
-      const point = (x: number, y: number) => ({
-        x: x / png.readUInt32BE(16),
-        y: y / png.readUInt32BE(20),
+      frameOrigin = await origin(frames);
+      const pageOrigin = await origin(server);
+      const computer = createAgentBrowserComputer({
+        dataRoot: directory,
+        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+        privateNetwork: true,
+        headless: true,
       });
-      await act({ action: 'click', ...point(90, 130) });
-      await act({
-        action: 'drag',
-        points: [point(90, 220), point(190, 220), point(300, 220)],
-        durationMs: 100,
-      });
-      await act({ action: 'click', ...point(300, 130), durationMs: 120 });
-      for (const key of ['ArrowLeft', 'ArrowRight', 'Space'] as const)
-        await act({ action: 'press', key });
-      const observation = await act({
-        action: 'evaluate',
-        script: `new Promise(resolve => {
+      const worker = await workerFixture(() => computer, 30_000);
+      const act = async (input: BrowserAction) =>
+        result(await worker.request({ method: 'act', threadId: 'fixture', input })) as {
+          text: string;
+        };
+      try {
+        await act({ action: 'open', url: pageOrigin, waitMs: 100 });
+        const screen = result(await worker.request({ method: 'screenshot', threadId: 'fixture' }));
+        assert.equal(typeof screen, 'string');
+        const png = Buffer.from(screen as string, 'base64');
+        assert.equal(png.toString('hex', 0, 8), '89504e470d0a1a0a');
+        const point = (x: number, y: number) => ({
+          x: x / png.readUInt32BE(16),
+          y: y / png.readUInt32BE(20),
+        });
+        await act({ action: 'click', ...point(90, 130) });
+        await act({
+          action: 'drag',
+          points: [point(90, 220), point(190, 220), point(300, 220)],
+          durationMs: 100,
+        });
+        await act({ action: 'click', ...point(300, 130), durationMs: 120 });
+        for (const key of ['ArrowLeft', 'ArrowRight', 'Space'] as const)
+          await act({ action: 'press', key });
+        const observation = await act({
+          action: 'evaluate',
+          script: `new Promise(resolve => {
           const read = () => {
             const state = JSON.parse(document.querySelector('#result').textContent || 'null');
             if (state?.keys.length >= 3) {
@@ -2481,25 +2649,26 @@ test(
           addEventListener('message', read);
           read();
         })`,
-      });
-      assert.deepEqual(JSON.parse(observation.text.slice(observation.text.indexOf('\n') + 1)), {
-        selected: true,
-        dragged: true,
-        held: true,
-        keys: ['ArrowLeft', 'ArrowRight', ' '],
-      });
-    } finally {
-      await worker.close();
-      await Promise.all(
-        [server, frames].map(async (value) => {
-          value.closeAllConnections();
-          await new Promise<void>((resolve) => value.close(() => resolve()));
-        }),
-      );
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
+        });
+        assert.deepEqual(JSON.parse(observation.text.slice(observation.text.indexOf('\n') + 1)), {
+          selected: true,
+          dragged: true,
+          held: true,
+          keys: ['ArrowLeft', 'ArrowRight', ' '],
+        });
+      } finally {
+        await worker.close();
+        await Promise.all(
+          [server, frames].map(async (value) => {
+            value.closeAllConnections();
+            await new Promise<void>((resolve) => value.close(() => resolve()));
+          }),
+        );
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+});
 
 test('a password typed through the handoff in several pauses hides only the finished value', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nod-handoff-secret-'));
@@ -2540,6 +2709,152 @@ test('a password typed through the handoff in several pauses hides only the fini
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test(
+  'native browser targets keep their own name before named ancestor context',
+  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-target-name-native-'));
+    const server = createHttpServer((_request, response) => {
+      response.setHeader('content-type', 'text/html');
+      response.end(`<title>Synthetic target names</title>
+        <style>#blank{position:fixed;left:0;top:0;width:20vw;height:20vh}body{padding-top:25vh}</style>
+        <form aria-label="Named form"><button type="button" id="form-button"></button></form>
+        <section role="region" aria-label="Named region"><button id="blank"></button><input id="field"></section>
+        <button id="named">Named exact button<div id="child"></div></button>
+        <div id="custom" role="treeitem" aria-label="Named custom target" tabindex="0"></div>
+        <form action="/submit" method="post" aria-label="Known form"><input id="known"></form>`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const origin = `http://127.0.0.1:${address.port}`;
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+    });
+    try {
+      await computer.act('target-name', { action: 'open', url: origin });
+      for (const [selector, ancestor] of [
+        ['#form-button', 'Named form'],
+        ['#blank', 'Named region'],
+        ['#child', 'Named exact button'],
+      ]) {
+        const page = await computer.currentPage('target-name', { action: 'click', selector });
+        assert.equal(page.controls?.[0]?.name, '', selector);
+        assert.ok(
+          page.controls?.slice(1).some(({ name }) => name === ancestor),
+          selector,
+        );
+        assert.match(page.target!, /^[0-9a-f]{64}$/);
+      }
+      for (const step of [
+        { action: 'click', x: 0.05, y: 0.05 },
+        {
+          action: 'click',
+          points: [
+            { x: 0.05, y: 0.05 },
+            { x: 0.05, y: 0.05 },
+          ],
+        },
+      ] satisfies BrowserAction[]) {
+        const page = await computer.currentPage('target-name', step);
+        assert.equal(page.controls?.[0]?.name, '');
+        assert.equal(page.controls?.[1]?.name, 'Named region');
+      }
+      await computer.act('target-name', { action: 'fill', selector: '#field', text: 'synthetic' });
+      for (const step of [
+        { action: 'press', key: 'Enter' },
+        { action: 'type', text: 'synthetic\n' },
+      ] satisfies BrowserAction[]) {
+        const page = await computer.currentPage('target-name', step);
+        assert.deepEqual(page.controls?.[0], { role: 'textbox', name: '' });
+        assert.equal(page.controls?.[1]?.name, 'Named region');
+        assert.equal(page.submits, undefined);
+      }
+      for (const [selector, name] of [
+        ['#named', 'Named exact button'],
+        ['#custom', 'Named custom target'],
+      ]) {
+        const page = await computer.currentPage('target-name', { action: 'click', selector });
+        assert.equal(page.controls?.[0]?.name, name);
+      }
+      await computer.act('target-name', { action: 'fill', selector: '#known', text: 'synthetic' });
+      const known = await computer.currentPage('target-name', { action: 'press', key: 'Enter' });
+      assert.deepEqual(known.controls?.[0], { role: 'textbox', name: '' });
+      assert.equal(known.controls?.[1]?.name, 'Known form');
+      assert.deepEqual(known.submits, { method: 'POST', to: `${origin}/submit` });
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'native coordinate targets follow normal pointer hit testing',
+  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-pointer-target-native-'));
+    const requests: string[] = [];
+    const server = createHttpServer((request, response) => {
+      if (request.method === 'POST' || request.url?.startsWith('/overlay')) {
+        requests.push(`${request.method} ${request.url}`);
+        response.writeHead(204).end();
+        return;
+      }
+      const named = request.url === '/named';
+      response.setHeader('content-type', 'text/html');
+      response.end(`<title>Synthetic pointer target</title>
+        <style>button{position:fixed;inset:0;width:100vw;height:100vh;border:0}#overlay{pointer-events:none;opacity:.2}</style>
+        <form method="post" action="/actual-${named ? 'named' : 'blank'}"><button${named ? ' aria-label="Named actual target"' : ''}></button></form>
+        <form method="get" action="/overlay"><button id="overlay" aria-label="Named overlay">Named overlay</button></form>`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+    });
+    try {
+      const expected: string[] = [];
+      for (const named of [false, true]) {
+        await computer.act('pointer-target', {
+          action: 'open',
+          url: `http://127.0.0.1:${address.port}/${named ? 'named' : 'blank'}`,
+        });
+        const step: BrowserAction = { action: 'click', x: 0.5, y: 0.5 };
+        const page = await computer.currentPage('pointer-target', step);
+        assert.ok(page.target);
+        assert.deepEqual(page.controls?.[0], {
+          role: 'button',
+          name: named ? 'Named actual target' : '',
+        });
+        assert.deepEqual(page.submits, {
+          method: 'POST',
+          to: `http://127.0.0.1:${address.port}/actual-${named ? 'named' : 'blank'}`,
+        });
+        assert.deepEqual(requests, expected);
+        await computer.act('pointer-target', { ...step, expectTarget: page.target });
+        expected.push(`POST /actual-${named ? 'named' : 'blank'}`);
+        for (let i = 0; i < 500 && requests.length < expected.length; i++) await delay(10);
+        assert.deepEqual(requests, expected);
+      }
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   'native secure entry completes single and split OTP controls without maxlength hints',
@@ -2767,6 +3082,16 @@ test('rich feedback redaction handles embedded JSON, identifying addresses, enco
     'Open "https://tenant.example.test/Personal%20Notes/log.txt" failed with HTTP 412.',
     'Rejected fixture%2fsecret-token and marta.vidal%40example.test.',
     'External record 00000000-1111-4222-8333-444444444444 was not found.',
+    '/media/private-owner/BACKUP/Medical Notes/scan.pdf does not exist.',
+    '/run/media/private-owner/USB/Tax Return/form.pdf does not exist.',
+    'Book a slot at calendly.com/synthetic-booker/30min please.',
+    'Profile www.example.com/in/synthetic-profile?ref=private-ref#private-anchor failed.',
+    'Redirect via unlisted.notatld/next?to=example.com/synthetic-hidden failed.',
+    'Mirror downloads.example.com:8443/synthetic-mirror?key=synthetic-query failed.',
+    'Open example.com/Private%20Records/Tax%20Return.pdf failed with HTTP 413.',
+    'Open example%2Ecom%2FReport%09synthetic-tab-record.pdf failed with HTTP 414.',
+    'Open example.com:8443/private?label=Case%20synthetic-query-record failed with HTTP 415.',
+    'Open example.com./private#Case%0Asynthetic-fragment-record failed with HTTP 416.',
     { type: 'image', data: 'synthetic-private-image' },
     {
       content: [
@@ -2813,6 +3138,20 @@ test('rich feedback redaction handles embedded JSON, identifying addresses, enco
     'Client Records',
     'Design Review',
     'Private Files',
+    'Medical Notes',
+    'Tax Return',
+    'BACKUP',
+    'synthetic-booker',
+    '30min',
+    'synthetic-profile',
+    'private-ref',
+    'private-anchor',
+    'synthetic-hidden',
+    'synthetic-mirror',
+    'synthetic-query',
+    'synthetic-tab-record',
+    'synthetic-query-record',
+    'synthetic-fragment-record',
     'fixture',
     'marta.vidal',
     '00000000-1111',
@@ -2844,8 +3183,24 @@ test('rich feedback redaction handles embedded JSON, identifying addresses, enco
     'HTTP 410',
     'HTTP 411',
     'HTTP 412',
+    'HTTP 413',
+    'HTTP 414',
+    'HTTP 415',
+    'HTTP 416',
+    'Book a slot at [url] please',
   ])
     assert.ok(encoded.includes(useful), useful);
+  const { timeZoneRegion } = await import('../src/shared/date-locale.ts');
+  const local = createFeedbackRedactor({
+    secrets: [],
+    profile: { names: [], region: timeZoneRegion('America/Los_Angeles') ?? undefined },
+  }).text('Call the clinic at (415) 555-0134 today.');
+  assert.ok(!local.includes('555-0134'), local);
+  assert.ok(local.includes('Call the clinic'), local);
+  const chained = createFeedbackRedactor({ secrets: [], profile: { names: [] } }).text(
+    `${'a.zz/'.repeat(6000)} then example.com:8443 and example.com./synthetic-chained?q=1 at example.com.`,
+  );
+  assert.ok(chained.endsWith(' then [host] and [url] at [host].'), chained.slice(-60));
   const concealedType = createFeedbackRedactor({ secrets: ['image'], profile: { names: [] } });
   assert.ok(
     !JSON.stringify(concealedType.value({ type: 'image', data: 'c3ludGhldGljIGltYWdl' })).includes(
@@ -2940,6 +3295,98 @@ test('rich feedback redaction bounds traversal and preserves sanitized Error dia
   assert.ok(!boundary.includes('bounded-private-secret'));
 });
 
+test('rich feedback redaction keeps error classes, frame files, sizes and model names without identity claims', async () => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const redactor = createFeedbackRedactor({ secrets: [], profile: { names: [] } });
+  const flattened = Object.assign(Object.create(null), {
+    name: 'JWTExpired',
+    message: 'Context of 200000 tokens exceeds the 131072-token limit after 1048576 bytes.',
+    stack: [
+      'JWTExpired: expired',
+      '    at rpc (file:///Users/private-owner/git/nod/src/server/thread.ts:281:13)',
+      '    at query (/home/private-owner/nod/node_modules/@fixture/pg/lib/client.js:10:2)',
+      '    at main (C:\\Users\\private-owner\\AppData\\nod\\dist\\server\\index.js:7:9)',
+      '    at /home/private-owner/private-project/worker.ts:18:4',
+      '    at C:\\Users\\private-owner\\scripts\\run.js:3:1',
+      '    at job (/home/private-owner/src/Private-Project/job.ts:5:1)',
+    ].join('\n'),
+    payload: { ok: true },
+    cause: {
+      name: 'Private Person',
+      message: 'claims rejected',
+      payload: { sub: 'payload-subject' },
+      claims: { email: 'claims-value' },
+      id_token: 'id-token-value',
+      nested: { JWT: 'jwt-value', accessToken: 'access-value', refresh_token: 'refresh-value' },
+      sub: 'subject-value',
+      sid: 'session-value',
+      jti: 'token-id-value',
+      nonce: 'nonce-value',
+      aud: ['audience-value'],
+    },
+  });
+  const safe = redactor.value({
+    error: flattened,
+    tool: { name: 'PrivateName' },
+    entry: { name: 'Alice', message: 'hello', stack: 'at home' },
+    record: 'Record 12345678 returned HTTP 1234567 for 2500000 items.',
+    relative: 'Read project/data/private-owner/file',
+  }) as any;
+  const encoded = JSON.stringify(safe);
+  assert.equal(safe.error.name, 'JWTExpired');
+  assert.equal(safe.error.cause.name, '[personal]');
+  assert.equal(safe.tool.name, '[personal]');
+  assert.equal(safe.entry.name, '[personal]');
+  assert.ok(safe.error.stack.includes('([path]:5:1)'));
+  for (const frame of [
+    '(src/server/thread.ts:281:13)',
+    '(node_modules/@fixture/pg/lib/client.js:10:2)',
+    '(dist/server/index.js:7:9)',
+    'at [path]:18:4',
+    'at [path]:3:1',
+  ])
+    assert.ok(safe.error.stack.includes(frame), frame);
+  for (const sensitive of [
+    'private-owner',
+    'private-project',
+    'Private-Project',
+    'worker.ts',
+    'run.js',
+    'job.ts',
+    'Users',
+    'AppData',
+    'C:',
+    'payload-subject',
+    'claims-value',
+    'id-token-value',
+    'jwt-value',
+    'access-value',
+    'refresh-value',
+    'subject-value',
+    'session-value',
+    'token-id-value',
+    'nonce-value',
+    'audience-value',
+    '12345678',
+    '1234567',
+  ])
+    assert.ok(!encoded.includes(sensitive), sensitive);
+  assert.equal(safe.error.payload, '[redacted]');
+  assert.equal(
+    safe.error.message,
+    'Context of 200000 tokens exceeds the 131072-token limit after 1048576 bytes.',
+  );
+  assert.equal(safe.record, 'Record [identifier] returned HTTP [identifier] for 2500000 items.');
+  assert.equal(redactor.text('Model: compatible/qwen2.5:3b.'), 'Model: compatible/qwen2.5:3b.');
+  assert.equal(
+    redactor.text('model openrouter/meta-llama/llama-3.3-70b-instruct failed'),
+    'model openrouter/meta-llama/llama-3.3-70b-instruct failed',
+  );
+  assert.equal(redactor.text('Open /data/private-owner/a.txt'), 'Open [path]');
+  assert.equal(redactor.text('Open ~/private-owner/a.txt'), 'Open [path]');
+  assert.equal(redactor.text('Open D:\\private-owner\\a.txt'), 'Open [path]');
+});
+
 test('browser handoff preserves platform editing chords, text input and paste', async () => {
   const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
     timeoutMs: 20_000,
@@ -2984,6 +3431,7 @@ test('browser handoff preserves platform editing chords, text input and paste', 
             closeHandoffStream = () => controller.error(new DOMException('Handoff ended.', 'AbortError'));
             options.signal.addEventListener('abort', () => controller.error(options.signal.reason), { once: true });
           } }));
+        if (path === '/api/browser-handoff/frame-ack') return Response.json({ ok: true });
         assert.equal(path, '/api/browser-handoff');
         const inputs = JSON.parse(options.body).inputs;
         received.push(...inputs);
@@ -3686,7 +4134,12 @@ test('UI analytics keep answer choices, the survey card and survey flag requests
         disconnect() { this.disconnected = true; }
         intersect(...values) { this.callback(values.map(value => ({ target: this.element, isIntersecting: value }))); }
       };
-      globalThis.fetch = async () => { throw new Error('This fixture cannot use the network.'); };
+      const seenRequests = [];
+      globalThis.fetch = async (path, options) => {
+        if (path !== '/api/account/survey-seen') throw new Error('This fixture cannot use the network.');
+        seenRequests.push(JSON.parse(options.body).survey);
+        return new Response('{"ok":true}', { headers: { 'content-type': 'application/json' } });
+      };
       const sent = [], requests = [];
       const client = {
         init(key, options) { this.token = key; this.options = options; },
@@ -3966,6 +4419,7 @@ test('UI analytics keep answer choices, the survey card and survey flag requests
       assert.equal(sent.length, beforeCard + 1);
       assert.equal(sent.at(-1).event, 'survey shown');
       assert.ok(localStorage.getItem('lastSeenSurveyDate'));
+      assert.deepEqual(seenRequests, [survey]);
       await visible(false);
       await visible(true);
       assert.equal(sent.length, beforeCard + 1);
@@ -4033,6 +4487,27 @@ test('UI analytics keep answer choices, the survey card and survey flag requests
       assert.equal(sent.at(-1).properties.$survey_submission_id, intermediate.properties.$survey_submission_id);
       assert.ok(!JSON.stringify(sent.slice(beforeNext)).includes('PRIVATE_'));
       await act(() => root.render(null));
+      client.surveys = [{ id: survey, type: 'api', current_iteration: null, questions }];
+      await act(() => configureAnalytics({ ...configuration, surveys: true, seenSurveys: [survey] }, 'web'));
+      await act(() => root.render(createElement(SurveyCard)));
+      assert.equal(card(), null);
+      await act(() => root.render(null));
+      client.surveys = [{ id: survey, type: 'api', current_iteration: 2, questions }];
+      await act(() => root.render(createElement(SurveyCard)));
+      assert.ok(card());
+      assert.equal(seenRequests.at(-1), survey + '_2');
+      await act(() => root.render(null));
+      await act(() => root.render(createElement(SurveyCard)));
+      assert.equal(card(), null);
+      await act(() => root.render(null));
+      client.surveys = [{ id: survey, type: 'api', current_iteration: 3, questions }];
+      await act(() => root.render(createElement(SurveyCard)));
+      await act(() => card().querySelector('.survey-card-close').click());
+      client.surveys = [{ id: survey, type: 'api', current_iteration: 4, questions }];
+      await act(() => configureAnalytics({ ...configuration, surveys: true, seenSurveys: [survey, survey + '_2', survey + '_3'] }, 'web'));
+      assert.ok(card());
+      await act(() => root.render(null));
+      consent(true);
       client.deferSurveys = true;
       await act(() => root.render(createElement(SurveyCard)));
       assert.equal(card(), null);
@@ -4469,6 +4944,74 @@ test('composer preserves keyboard shortcuts, upload retries, previews and failed
         assert.equal(sends.at(-1).text, '**bold\\*star** next *literal*');
         const richVisible = await assertVisiblePaste(sends.at(-1), 'bold*star next *literal*');
         assert.equal(richVisible.querySelector('strong')?.textContent, 'bold*star');
+        for (const draft of [
+          'See \\![docs](https://example.test/docs)',
+          'See \\\\[docs](https://example.test/docs)',
+          'See \\\\**docs**',
+          'See \\\\<u>docs</u>',
+          'a\\~~~x~~ ~~y~~\\~b',
+          'a\\**x* *y*\\*b',
+          'a\\***x**\\*b',
+          '\\*\\**x*',
+          '\\*!\\**x*',
+          '\\~a\nb *x*\\~',
+          '\\*Y\\* \\**Y*\\*',
+          'y'.repeat(5000) + '\n\\\u0060a \u0060x\u0060',
+          '\\\u0060a \u0060x\u0060',
+          'a\\\u0060\u0060x\u0060\\\u0060b',
+          '| a          |\n| ---------- |\n| b\\\\\\\\<br>c |',
+          '&#x61;~~<u>x</u>~~&#x61;',
+          '\\<!a **Q1**',
+        ]) {
+          await act(async () => replaceText(draft));
+          await submit();
+          assert.deepEqual(parseComposerMarkdown(sends.at(-1).text), parseComposerMarkdown(draft));
+        }
+        for (const [draft, sent] of [
+          ['# \u0060\u0060\u0060a *x* *', '# \u0060\u0060\u0060a *x* *'],
+          ['**Note:**&#x73;ee_it', '**Note:**&#x73;ee_it'],
+          ['\\#tag a*b\nc **Q1**\n========', '#tag a*b\nc **Q1**\n========'],
+        ]) {
+          await act(async () => replaceText(draft));
+          await submit();
+          assert.equal(sends.at(-1).text.trimEnd(), sent);
+        }
+        const { Editor } = await import('@tiptap/core');
+        const { createComposerExtensions } = await import('./src/web/lib/composer-editor.ts');
+        const { composerMarkdown } = await import('./src/web/lib/composer-markdown.ts');
+        const serializer = new Editor({ extensions: createComposerExtensions({ submit() {}, upload() {} }) });
+        for (const [address, href] of [
+          ['https://example.test', 'https://example.test'],
+          ['ada@example.test', 'mailto:ada@example.test'],
+          ['www.example.test', 'http://www.example.test'],
+        ]) {
+          serializer.commands.setContent({
+            type: 'doc',
+            content: [{ type: 'paragraph', content: [
+              { type: 'text', text: 'see ' + address },
+              { type: 'text', text: '(x)', marks: [{ type: 'strike' }] },
+            ] }],
+          });
+          const nodes = parseComposerMarkdown(composerMarkdown(serializer.state.doc)).content[0].content;
+          assert.deepEqual(
+            nodes.map((node) => [node.text, node.marks?.map((mark) => mark.attrs?.href ?? mark.type)]),
+            [['see ', undefined], [address, [href]], ['(x)', ['strike']]],
+          );
+        }
+        serializer.commands.setContent({
+          type: 'doc',
+          content: [{ type: 'paragraph', content: [
+            { type: 'text', text: 'see \\https://example.test' },
+            { type: 'text', text: '(x)', marks: [{ type: 'strike' }] },
+          ] }],
+        });
+        assert.deepEqual(
+          parseComposerMarkdown(composerMarkdown(serializer.state.doc)).content[0].content.map((node) => [
+            node.text,
+            node.marks?.map((mark) => mark.attrs?.href ?? mark.type),
+          ]),
+          [['see \\', undefined], ['https://example.test', ['https://example.test']], ['(x)', ['strike']]],
+        );
         await act(async () => replaceText('| label | value |\n| --- | --- |\n| first | second |'));
         await pasteAtEnd('table tr:last-child td:first-child p', 'A|B\\|C\nD');
         await submit();
@@ -5689,49 +6232,6 @@ test(
   },
 );
 
-test(
-  'reloading a page reached by a form POST does not resubmit it',
-  { timeout: 60_000 },
-  async () => {
-    let posts = 0;
-    const server = createHttpServer((request, response) => {
-      response.setHeader('content-type', 'text/html');
-      if (request.method === 'POST') {
-        posts += 1;
-        response.end(`<title>Done</title><p>count ${posts}</p>`);
-        return;
-      }
-      response.end('<form method="post" action="/submit"><button id="go">Go</button></form>');
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    const directory = await mkdtemp(join(tmpdir(), 'nod-reload-'));
-    const computer = createAgentBrowserComputer({
-      dataRoot: directory,
-      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-      privateNetwork: true,
-      headless: true,
-    });
-    try {
-      await computer.act('post', { action: 'open', url: origin });
-      await computer.act('post', { action: 'click', selector: '#go' });
-      await computer.act('post', { action: 'wait', text: 'count 1' });
-      assert.equal(posts, 1);
-      await computer.act('post', { action: 'reload' });
-      await computer.act('post', { action: 'wait', load: 'load' });
-      assert.equal(posts, 1);
-      await computer.act('post', { action: 'open', url: origin });
-      await computer.act('post', { action: 'reload' });
-      assert.equal(posts, 1);
-    } finally {
-      await computer.dispose();
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
-
 test('navigation stays available when a saved script fence cannot reach the inspector', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nod-navigation-recovery-'));
   const fixture = stagedLoginBrowser();
@@ -5791,12 +6291,15 @@ test('failed private entry holds every Pi action until the filled document chang
   const directory = await mkdtemp(join(tmpdir(), 'nod-private-cleanup-'));
   const fixture = stagedLoginBrowser();
   let failSubmit = true;
+  let failedSubmissions = 0;
   const computer = createBrowserFixture({
     dataRoot: directory,
     run: async (...args) => {
       const command = args[1].slice(args[1].indexOf('--idle-timeout') + 2);
-      if (command[0] === 'click' && failSubmit)
+      if (command[0] === 'click' && failSubmit) {
+        failedSubmissions++;
         return { stdout: '{"success":false}', stderr: '', exitCode: 1 };
+      }
       return fixture.run(...args);
     },
   });
@@ -5812,6 +6315,7 @@ test('failed private entry holds every Pi action until the filled document chang
         submitSelector: 'button',
       }),
     );
+    assert.equal(failedSubmissions, 1);
     const before = fixture.pages.get('private')!.entered.length;
     for (const input of [
       { action: 'snapshot' as const },
@@ -5874,164 +6378,6 @@ test('failed private entry holds every Pi action until the filled document chang
     await rm(directory, { recursive: true, force: true });
   }
 });
-
-test(
-  'private submission keeps SPA state, delayed requests and field formats, and pauses scripts while a value stays',
-  { timeout: 60_000 },
-  async () => {
-    const submitted = deferred<string>();
-    const cardSubmitted = deferred<string>();
-    let submissions = 0;
-    const server = createHttpServer(async (request, response) => {
-      response.setHeader('content-type', 'text/html');
-      if (request.url === '/record') {
-        let body = '';
-        for await (const bytes of request) body += bytes;
-        submissions++;
-        submitted.resolve(body);
-        response.end('Accepted');
-      } else if (request.url === '/card-record') {
-        let body = '';
-        for await (const bytes of request) body += bytes;
-        cardSubmitted.resolve(body);
-        response.end('Accepted');
-      } else if (request.url === '/delayed') {
-        response.end(`<input id="company"><input id="password" type="password"><button id="submit">Continue</button><script>
-        document.querySelector('button').onclick = () => setTimeout(() => fetch('/record', { method: 'POST', body: JSON.stringify({company: document.querySelector('#company').value, password: document.querySelector('#password').value}) }), 1200);
-      </script>`);
-      } else if (request.url === '/card') {
-        response.end(
-          '<h2>Order total EUR 30</h2><input id="number"><select id="month"><option value="">Choose month</option><option value="aug">August</option></select><input id="year"><input id="expiry"><button id="submit">Pay</button><script>document.querySelector("button").onclick = () => fetch("/card-record", {method:"POST", body:JSON.stringify({month:document.querySelector("#month").value, year:document.querySelector("#year").value, expiry:document.querySelector("#expiry").value})});</script>',
-        );
-      } else {
-        response.end(`<input id="username"><button id="submit">Continue</button><script>
-        document.querySelector('button').onclick = () => { document.body.innerHTML = '<h1>Password step</h1><input type="password" id="password">'; };
-      </script>`);
-      }
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    const directory = await mkdtemp(join(tmpdir(), 'nod-private-state-'));
-    const computer = createAgentBrowserComputer({
-      dataRoot: directory,
-      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-      privateNetwork: true,
-      headless: true,
-    });
-    try {
-      await computer.act('state', { action: 'open', url: origin });
-      await computer.injectCredentials({
-        threadId: 'state',
-        origin,
-        kind: 'identifier',
-        username: 'synthetic@example.test',
-        usernameSelector: '#username',
-        submitSelector: '#submit',
-      });
-      assert.match((await computer.act('state', { action: 'snapshot' })).text, /Password step/);
-      await computer.act('state', { action: 'open', url: `${origin}/delayed` });
-      await computer.act('state', {
-        action: 'fill',
-        selector: '#company',
-        text: 'Synthetic company',
-      });
-      await computer.act('state', { action: 'evaluate', script: 'document.title' });
-      await computer.injectCredentials({
-        threadId: 'state',
-        origin,
-        kind: 'password',
-        password: 'Synthetic private value',
-        passwordSelector: '#password',
-        submitSelector: '#submit',
-      });
-      assert.deepEqual(JSON.parse(await submitted.promise), {
-        company: 'Synthetic company',
-        password: 'Synthetic private value',
-      });
-      assert.equal(submissions, 1);
-      assert.equal(
-        (await computer.act('state', { action: 'snapshot' })).text.includes(
-          'Synthetic private value',
-        ),
-        false,
-      );
-      await assert.rejects(
-        computer.act('state', {
-          action: 'evaluate',
-          script: 'Promise.resolve(document.querySelector("#password").value.length)',
-        }),
-        /scripts are paused/,
-      );
-      await computer.act('state', { action: 'open', url: `${origin}/card` });
-      const fields = {
-        number: '#number',
-        expiryMonth: '#month',
-        expiryYear: { selector: '#year', format: 'YY' },
-        expiry: { selector: '#expiry', format: 'YYYY-MM' },
-      };
-      const bound = await computer.cardDestinations('state', fields);
-      await computer.fillCard({
-        threadId: 'state',
-        ...bound,
-        fields,
-        submitSelector: '#submit',
-        card: {
-          cardNumber: '4242424242424242',
-          expiryMonth: 8,
-          expiryYear: 2030,
-          cardholder: 'Synthetic owner',
-        },
-      });
-      assert.deepEqual(JSON.parse(await cardSubmitted.promise), {
-        month: 'aug',
-        year: '30',
-        expiry: '2030-08',
-      });
-      assert.match(
-        (await computer.act('state', { action: 'snapshot' })).text,
-        /Order total EUR 30/,
-      );
-      await assert.rejects(
-        computer.act('state', {
-          action: 'evaluate',
-          script: 'document.querySelector("#number").value',
-        }),
-        /scripts are paused/,
-      );
-      await computer.act('fence', { action: 'open', url: `${origin}/card` });
-      await computer.act('fence', {
-        action: 'evaluate',
-        script: 'globalThis.__nodScripted = false',
-      });
-      const recovered = createAgentBrowserComputer({
-        dataRoot: directory,
-        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-        privateNetwork: true,
-        headless: true,
-      });
-      try {
-        assert.equal((await recovered.currentPage('fence')).origin, origin);
-        await recovered.act('fence', { action: 'snapshot' });
-        await assert.rejects(
-          recovered.cardDestinations('fence', fields),
-          /script ran on this document/,
-        );
-        await computer.act('fence', { action: 'reload' });
-        assert.equal(
-          (await recovered.cardDestinations('fence', fields)).destinations.number,
-          origin,
-        );
-      } finally {
-        await recovered.dispose();
-      }
-    } finally {
-      await computer.dispose();
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
 
 test('a checked browser step is described from its snapshot and runs only on that page and control', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'nod-checked-step-'));
@@ -6244,10 +6590,33 @@ test(
         to: `${origin}/reserve`,
       });
       await computer.act('submits', { action: 'fill', selector: 'input[name=q]', text: 'tables' });
-      assert.deepEqual(await submits({ action: 'press', key: 'Enter' }), {
-        method: 'GET',
-        to: `${origin}/search`,
-      });
+      for (const key of [
+        'Enter',
+        'Return',
+        'Shift+Enter',
+        'Enter+Shift',
+        'Ctrl+Enter+Meta',
+        'NumpadEnter',
+        '\r',
+        '\n',
+      ]) {
+        assert.deepEqual(
+          await submits({ action: 'press', key }),
+          {
+            method: 'GET',
+            to: `${origin}/search`,
+          },
+          key,
+        );
+      }
+      for (const key of [
+        'Enter+Unknown',
+        ' Enter ',
+        'ControlOrMeta+Enter',
+        'Enter\n',
+        'ShiftLeft+Enter',
+      ])
+        assert.equal(await submits({ action: 'press', key }), undefined, key);
       await computer.act('submits', {
         action: 'evaluate',
         script: "document.querySelector('form button').focus()",
@@ -6302,342 +6671,6 @@ test(
       assert.deepEqual(sent, []);
     } finally {
       await computer.dispose();
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(directory, { recursive: true, force: true });
-    }
-  },
-);
-
-test(
-  'native sign-in methods bind observed controls and refuse changed or repeated selections',
-  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 90_000 },
-  async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'nod-method-native-'));
-    const received: string[] = [];
-    const cancelling = new AbortController();
-    const cancelled = deferred();
-    let cancelledMethod: string | undefined;
-    const changes: Record<string, string> = {
-      replaced: 'primary.replaceWith(primary.cloneNode(true))',
-      renamed: "primary.textContent = 'Delete account'",
-      accessibleName: "primary.setAttribute('aria-label', 'Delete account')",
-      destination: "primary.form.action = '/other'",
-      disabled: 'primary.disabled = true',
-      hidden: "primary.style.display = 'none'",
-      base: "document.querySelector('base').href = '/other/'",
-      covered:
-        "const cover=document.createElement('button');cover.style.cssText='position:fixed;inset:0;z-index:1000';cover.textContent='Cover';cover.onclick=()=>fetch('/covered',{method:'POST'});document.body.append(cover)",
-      changedOnPress: "primary.addEventListener('mousedown',()=>primary.form.action='/other')",
-      removedOnRelease: "primary.addEventListener('mouseup',()=>primary.remove())",
-    };
-    const server = createHttpServer(async (request, response) => {
-      if (request.url === '/pressed') {
-        cancelling.abort();
-        await cancelled.promise;
-        response.end();
-        return;
-      }
-      if (request.method === 'POST') {
-        received.push(request.url!);
-        response.writeHead(303, { location: '/done' });
-        response.end();
-        return;
-      }
-      response.setHeader('content-type', 'text/html');
-      if (request.url === '/done') {
-        response.end('<h1>Selected</h1>');
-        return;
-      }
-      if (
-        ['/framed', '/foreign', '/duplicate', '/scaled-half', '/scaled-double'].includes(
-          request.url!,
-        )
-      ) {
-        const scaled = request.url!.startsWith('/scaled-');
-        const source =
-          request.url === '/foreign' || scaled
-            ? `http://localhost:${(server.address() as { port: number }).port}/${scaled ? 'scaled-inner' : 'inner'}`
-            : '/inner';
-        const transform = scaled
-          ? `transform:scale(${request.url === '/scaled-half' ? 0.5 : 2});transform-origin:top left;`
-          : '';
-        response.end(
-          `
-          ${request.url === '/duplicate' ? '<button id="primary">Continue with Example</button>' : ''}
-          <iframe title="Sign in" src="${source}" onload="document.getElementById('frame-state').textContent='Frame ready'" style="width:700px;height:400px;margin:70px 100px;border:12px solid;${transform}"></iframe><button id="reload-frame" onclick="document.getElementById('frame-state').textContent='Loading frame';document.querySelector('iframe').contentWindow.location.reload()">Reload frame</button><p id="frame-state">Loading frame</p>`,
-        );
-        return;
-      }
-      if (request.url === '/cancel') {
-        response.end(
-          '<form action="/selected" method="post"><button id="primary" onmousedown="const xhr=new XMLHttpRequest();xhr.open(\'POST\',\'/pressed\',false);xhr.send()">Continue with Example</button></form><button id="ordinary" onclick="if(event.isTrusted)fetch(\'/ordinary\',{method:\'POST\'})">Continue browsing</button>',
-        );
-        return;
-      }
-      const change = changes[request.url!.slice(1)] ?? '';
-      const primary =
-        request.url === '/image'
-          ? '<input id="primary" type="image" onclick="if(!event.isTrusted)event.preventDefault()" alt="Continue with Example" src="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22240%22 height=%2240%22%3E%3Crect width=%22240%22 height=%2240%22 fill=%22gray%22/%3E%3C/svg%3E">'
-          : '<button id="primary" onclick="if(!event.isTrusted)event.preventDefault()"><span>Continue with Example</span></button>';
-      response.end(
-        `
-        ${request.url === '/scaled-inner' ? '<script>addEventListener("pointermove",()=>{const xhr=new XMLHttpRequest();xhr.open("POST","/moved",false);xhr.send()},{once:true})</script>' : ''}
-        <base href="/"><form action="selected" method="post">${primary}<button id="alternate" formaction="/alternate">Use another account</button></form><a id="link" href="linked">Continue with Link</a><button id="change" onclick="${change}">Change control</button>`,
-      );
-    });
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const address = server.address();
-    assert.ok(address && typeof address !== 'string');
-    const origin = `http://127.0.0.1:${address.port}`;
-    let socketPath = '';
-    const makeComputer = () => {
-      const computer = createAgentBrowserComputer({
-        dataRoot: directory,
-        browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
-        privateNetwork: true,
-        headless: true,
-        daemonCommand: async (path, command, signal, timeoutMs) => {
-          socketPath = path;
-          return existingDaemonCommand(path, command, signal, timeoutMs);
-        },
-      });
-      const selectMethod = computer.selectSignInMethod!;
-      computer.selectSignInMethod = async (id, input, signal) => {
-        if (input.methodId === cancelledMethod)
-          signal?.addEventListener('abort', () => cancelled.resolve(), { once: true });
-        return selectMethod(id, input, signal);
-      };
-      return computer;
-    };
-    const worker = await harness({ computer: makeComputer });
-    const client = worker.client(directory, { timeoutMs: 30_000 });
-    const act = (input: BrowserAction) => client.act('fixture', input);
-    const choices = [
-      { label: 'Misleading label', selector: '#primary span' },
-      { label: 'Another misleading label', selector: '#alternate' },
-    ];
-    try {
-      await act({ action: 'open', url: origin });
-      await assert.rejects(
-        client.signInMethods!('fixture', origin, [
-          { label: 'First', selector: '#primary' },
-          { label: 'Second', selector: '#primary span' },
-        ]),
-      );
-      const bound = await client.signInMethods!('fixture', origin, choices);
-      assert.deepEqual(
-        bound.methods.map(({ label }) => label),
-        ['Continue with Example', 'Use another account'],
-      );
-      assert.deepEqual(bound.methods[0]!.page.submits, {
-        method: 'POST',
-        to: origin + '/selected',
-      });
-      assert.deepEqual(bound.methods[1]!.page.submits, {
-        method: 'POST',
-        to: origin + '/alternate',
-      });
-      const selection = { origin, document: bound.document, methodId: bound.methods[0]!.id };
-      await assert.rejects(client.selectSignInMethod!('other', selection));
-      await client.selectSignInMethod!('fixture', selection);
-      await act({ action: 'wait', url: '**/done' });
-      assert.deepEqual(received, ['/selected']);
-      await assert.rejects(client.selectSignInMethod!('fixture', selection));
-      await assert.rejects(
-        client.selectSignInMethod!('fixture', { ...selection, methodId: bound.methods[1]!.id }),
-      );
-      for (const change of [...Object.keys(changes), 'navigation', 'origin', 'closed']) {
-        await act({ action: 'open', url: origin + '/' + change });
-        const stale = await client.signInMethods!('fixture', origin, choices);
-        if (change === 'navigation') await act({ action: 'reload' });
-        else if (change === 'closed') await client.close('fixture');
-        else if (change !== 'origin') await act({ action: 'click', selector: '#change' });
-        await assert.rejects(
-          client.selectSignInMethod!('fixture', {
-            origin: change === 'origin' ? 'https://another.example' : origin,
-            document: stale.document,
-            methodId: stale.methods[0]!.id,
-          }),
-        );
-        assert.deepEqual(received, ['/selected']);
-      }
-      await act({ action: 'open', url: origin + '/base' });
-      const linked = await client.signInMethods!('fixture', origin, [
-        { label: 'Ignored', selector: '#link' },
-      ]);
-      await act({ action: 'click', selector: '#change' });
-      await assert.rejects(
-        client.selectSignInMethod!('fixture', {
-          origin,
-          document: linked.document,
-          methodId: linked.methods[0]!.id,
-        }),
-      );
-      assert.deepEqual(received, ['/selected']);
-      await act({ action: 'open', url: origin });
-      const snapshot = (await act({ action: 'snapshot' })).text;
-      const ref = /button "Continue with Example"[^\n]*ref=(e\d+)/.exec(snapshot)?.[1];
-      assert.ok(ref);
-      const byRef = await client.signInMethods!('fixture', origin, [
-        { label: 'Ignored', selector: '@' + ref },
-      ]);
-      assert.equal(byRef.methods[0]!.label, 'Continue with Example');
-      await assert.rejects(
-        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '@e9999' }]),
-      );
-      await act({ action: 'open', url: origin + '/covered' });
-      await act({ action: 'click', selector: '#change' });
-      const covered = /button "Continue with Example"[^\n]*ref=(e\d+)/.exec(
-        (await act({ action: 'snapshot' })).text,
-      )?.[1];
-      assert.ok(covered);
-      await assert.rejects(
-        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '@' + covered }]),
-      );
-      await assert.rejects(
-        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: 'button' }]),
-      );
-      await act({ action: 'open', url: origin + '/duplicate' });
-      await assert.rejects(
-        client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '#primary' }]),
-      );
-      for (const path of ['/framed', '/foreign']) {
-        await act({ action: 'open', url: origin + path });
-        await act({ action: 'wait', text: 'Frame ready' });
-        const inspect = () =>
-          client.signInMethods!('fixture', origin, [{ label: 'Ignored', selector: '#primary' }]);
-        if (path === '/foreign') {
-          await assert.rejects(inspect());
-          continue;
-        }
-        const framed = await inspect();
-        assert.equal(framed.methods[0]!.label, 'Continue with Example');
-        await act({ action: 'click', selector: '#reload-frame' });
-        await act({ action: 'wait', text: 'Frame ready' });
-        await assert.rejects(
-          client.selectSignInMethod!('fixture', {
-            origin,
-            document: framed.document,
-            methodId: framed.methods[0]!.id,
-          }),
-        );
-        const refreshed = await inspect();
-        assert.equal(refreshed.document, framed.document);
-        await client.selectSignInMethod!('fixture', {
-          origin,
-          document: refreshed.document,
-          methodId: refreshed.methods[0]!.id,
-        });
-        const deadline = Date.now() + 5000;
-        while (received.length < 2 && Date.now() < deadline) await delay(10);
-        assert.deepEqual(received, ['/selected', '/selected']);
-      }
-      const controller = new AbortController();
-      controller.abort();
-      await assert.rejects(client.selectSignInMethod!('fixture', selection, controller.signal));
-      assert.deepEqual(received, ['/selected', '/selected']);
-      await act({ action: 'open', url: origin + '/image' });
-      const image = await client.signInMethods!('fixture', origin, [
-        { label: 'Ignored', selector: '#primary' },
-      ]);
-      assert.equal(image.methods[0]!.label, 'Continue with Example');
-      assert.deepEqual(image.methods[0]!.page.submits, {
-        method: 'POST',
-        to: origin + '/selected',
-      });
-      await client.selectSignInMethod!('fixture', {
-        origin,
-        document: image.document,
-        methodId: image.methods[0]!.id,
-      });
-      await act({ action: 'wait', url: '**/done' });
-      assert.deepEqual(received, ['/selected', '/selected', '/selected']);
-      await assert.rejects(
-        client.selectSignInMethod!('fixture', {
-          origin,
-          document: image.document,
-          methodId: image.methods[0]!.id,
-        }),
-      );
-
-      for (const [index, path] of ['/framed', '/foreign'].entries()) {
-        await act({ action: 'open', url: origin + path });
-        await act({ action: 'wait', text: 'Frame ready' });
-        const connection = await existingDaemonCommand(socketPath, { action: 'cdp_url' });
-        const tabs = await existingDaemonCommand(socketPath, { action: 'tab_list' });
-        const tab = (tabs.tabs as { active: boolean; targetId: string }[]).find(
-          (value) => value.active,
-        )!;
-        let inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
-        try {
-          const bound = await inspector.signInControl({ pixel: { x: 150, y: 100 } });
-          assert.equal(
-            bound.origin,
-            path === '/foreign' ? `http://localhost:${address.port}` : origin,
-          );
-          assert.equal(bound.targetFrameId === bound.frameId, path === '/foreign');
-          assert.notEqual(bound.loaderId, await inspector.document());
-          if (path === '/framed') {
-            await act({ action: 'click', selector: '#reload-frame' });
-            await act({ action: 'wait', text: 'Frame ready' });
-            await assert.rejects(inspector.selectSignInControl(bound));
-          }
-          inspector.close();
-          inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
-          const current = await inspector.signInControl({ pixel: { x: 150, y: 100 } });
-          inspector.close();
-          inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
-          await inspector.selectSignInControl(current);
-          const deadline = Date.now() + 5000;
-          while (received.length < 4 + index && Date.now() < deadline) await delay(10);
-          assert.deepEqual(received, Array(4 + index).fill('/selected'));
-          await assert.rejects(inspector.selectSignInControl(current));
-        } finally {
-          inspector.close();
-        }
-      }
-      for (const path of ['/scaled-half', '/scaled-double']) {
-        await act({ action: 'open', url: origin + path });
-        await act({ action: 'wait', text: 'Frame ready' });
-        const connection = await existingDaemonCommand(socketPath, { action: 'cdp_url' });
-        const tabs = await existingDaemonCommand(socketPath, { action: 'tab_list' });
-        const tab = (tabs.tabs as { active: boolean; targetId: string }[]).find(
-          (value) => value.active,
-        )!;
-        const inspector = await openDevtools(String(connection.cdpUrl), tab.targetId);
-        try {
-          const bound = await inspector.signInControl({ selector: '#primary' });
-          await assert.rejects(inspector.selectSignInControl(bound));
-          assert.deepEqual(received, Array(5).fill('/selected'));
-        } finally {
-          inspector.close();
-        }
-      }
-      await act({ action: 'open', url: origin + '/cancel' });
-      const interrupted = await client.signInMethods!('fixture', origin, [
-        { label: 'Ignored', selector: '#primary' },
-      ]);
-      cancelledMethod = interrupted.methods[0]!.id;
-      const interruptedSelection = {
-        origin,
-        document: interrupted.document,
-        methodId: cancelledMethod,
-      };
-      await assert.rejects(
-        client.selectSignInMethod!('fixture', interruptedSelection, cancelling.signal),
-      );
-      assert.equal(cancelling.signal.aborted, true);
-      assert.deepEqual(received, Array(5).fill('/selected'));
-      await assert.rejects(client.selectSignInMethod!('fixture', interruptedSelection));
-      await assert.rejects(act({ action: 'click', selector: '#ordinary' }), /unavailable/);
-      await act({ action: 'open', url: origin + '/cancel' });
-      await act({ action: 'click', selector: '#ordinary' });
-      const deadline = Date.now() + 5000;
-      while (received.length < 6 && Date.now() < deadline) await delay(10);
-      assert.deepEqual(received, [...Array(5).fill('/selected'), '/ordinary']);
-    } finally {
-      await worker.close();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await rm(directory, { recursive: true, force: true });
@@ -6782,6 +6815,29 @@ test('chat retires reply targets without losing drafts or duplicating ambiguous 
         assert.equal(requests[3].text, draft);
         assert.ok(document.querySelector('[data-message-id="' + committed.clientMessageId + '"]'));
         assert.equal(document.querySelector('[role="alert"]'), null);
+        await act(async () => root.unmount());
+        committed = null;
+        saveDraft(null);
+        state = { ...state, hiddenMessageIds: [], messages };
+        root = createRoot(document.getElementById('root'));
+        await render();
+        await settle(hasDraft);
+        await reply(ids[0]);
+        await submit();
+        await settle(() => requests.length === 5);
+        await act(async () => releases.at(-1).reject(new TypeError('Synthetic ordinary reply response lost')));
+        await settle(() => hasDraft() && document.querySelector('.composer-reply'));
+        state = { ...state, messages: [], chatClearedAt: '2026-10-26T12:02:00.000000Z' };
+        await render();
+        await settle(() => hasDraft() && !document.querySelector('.composer-reply'));
+        await submit();
+        await settle(() => requests.length === 6);
+        assert.equal(requests[5].replyToMessageId, undefined);
+        assert.notEqual(requests[5].clientMessageId, requests[4].clientMessageId);
+        assert.equal(requests[5].chatClearedAt, state.chatClearedAt);
+        await act(async () => releases.at(-1).resolve(Response.json({
+          messageId: requests[5].clientMessageId, turnId: 'synthetic-fresh-chat-turn',
+        })));
       } finally {
         await act(async () => root.unmount());
         dom.window.close();
@@ -6972,7 +7028,8 @@ test('chat reloads older history after hidden confirmations exceed the ID window
         await settle(() => hasDraft() && !document.querySelector('.composer-reply'));
         assert.equal(JSON.parse(localStorage.getItem(draftKey)).reply, null);
         await submit();
-        await settle(() => document.querySelector('[role="alert"]')?.textContent.includes('may have been sent'));
+        await settle(() => hasDraft() &&
+          document.querySelector('[role="alert"]')?.textContent.includes('may have been sent'));
         assert.equal(sends.length, 2);
         assert.ok(hasDraft());
         await submit();
@@ -7363,17 +7420,31 @@ test('chat shows pending sends and active work before a model step', async () =>
         await render();
         assert.equal(Boolean(document.querySelector('.thinking')), false);
         assert.equal(Boolean(document.querySelector('[aria-label="Stop all work"]')), false);
-        state = { ...state, activity: [{ ...activity, step: 'Comparing **flight prices**' }, task] };
+        const recent = [{ id: 'synthetic-completed', summary: 'Read the synthetic report', site: null }];
+        state = { ...state, activity: [{ ...activity, step: 'Comparing **flight prices**', recent }, task] };
         await render();
         assert.equal(document.querySelectorAll('.thinking .working-text').length, 1);
         assert.match(document.querySelector('.thinking').textContent, /Comparing flight prices/);
         assert.ok(!document.querySelector('.thinking').textContent.includes('**'));
         assert.ok(!document.querySelector('.thinking').textContent.includes('hotel'));
+        const history = document.querySelector('.thinking details');
+        assert.equal(history.open, false);
+        assert.deepEqual(Array.from(history.querySelectorAll('ol > li'), entry => entry.textContent), ['Read the synthetic report']);
+        assert.equal(document.querySelector('[role="status"] [role="status"]'), null);
+        await act(async () => history.querySelector('summary').click());
+        await settle(() => history.open);
         await render({ streams: { 'synthetic-stream': 'Synthetic partial result' } });
-        assert.equal(Boolean(document.querySelector('.thinking')), false);
-        state = { ...state, activity: [{ ...activity, step: 'Checking the return journey' }] };
+        assert.equal(document.querySelector('.thinking').hidden, true);
+        assert.equal(document.querySelector('.thinking details'), history);
+        state = { ...state, activity: [{ ...activity, step: 'Checking the return journey', recent }] };
         await render();
-        assert.equal(document.querySelector('.thinking').textContent, 'Checking the return journey');
+        assert.equal(document.querySelector('.thinking').hidden, false);
+        assert.equal(document.querySelector('.thinking details'), history);
+        assert.equal(history.open, true);
+        assert.equal(document.querySelector('.thinking .live-line-current').textContent, 'Checking the return journey');
+        state = { ...state, activity: [{ ...activity, turnId: 'synthetic-next-turn', recent }] };
+        await render();
+        assert.equal(document.querySelector('.thinking details').open, false);
         state = { ...state, activity: [] };
         await render();
         assert.equal(Boolean(document.querySelector('.thinking')), false);
@@ -7549,6 +7620,120 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
         pageDataCache.clear();
         dom.window.close();
       }
+    `,
+  });
+  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+});
+
+test('a verified app connection opens chat only on request and keeps private details out of analytics', async () => {
+  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+    timeoutMs: 20_000,
+    input: String.raw`
+      import assert from 'node:assert/strict';
+      import { JSDOM } from 'jsdom';
+      const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://nod.fixture.invalid/apps', pretendToBeVisual: true });
+      Object.assign(globalThis, { window: dom.window, document: dom.window.document, localStorage: dom.window.localStorage,
+        IS_REACT_ACT_ENVIRONMENT: true, getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+        requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window), cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window) });
+      for (const name of ['Node', 'Element', 'HTMLElement', 'HTMLInputElement', 'HTMLTextAreaElement', 'HTMLButtonElement', 'Event', 'CustomEvent', 'MutationObserver', 'NodeFilter', 'DocumentFragment']) globalThis[name] = dom.window[name];
+      Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
+      window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+      window.HTMLElement.prototype.scrollTo = function() {};
+      const channels = [];
+      globalThis.BroadcastChannel = class { constructor() { channels.push(this); } close() {} };
+      window.open = () => ({ closed: false, location: { href: '' }, document: { title: '', body: { textContent: '' } }, close() { this.closed = true; } });
+      const { createElement, act } = await import('react');
+      const { createRoot } = await import('react-dom/client');
+      const { Apps } = await import('./src/web/pages/apps.tsx');
+      const { pageDataCache } = await import('./src/web/lib/page-data-cache.ts');
+      const { setRequestAccount } = await import('./src/web/lib/api.ts');
+      const { setupLinkHash } = await import('./src/web/lib/connection-url.ts');
+      const { configureAnalytics, setAnalyticsClient } = await import('./src/web/lib/analytics.ts');
+      const privateName = 'PRIVATE_CONNECTION_NAME';
+      const url = 'https://example.test/sign-in';
+      const hash = await setupLinkHash(url);
+      const attempt = 'A'.repeat(43);
+      let connected = false, statusReads = 0, failure;
+      const requests = [], captured = [];
+      const app = { slug: 'gmail', name: privateName, status: 'disconnected', triggersEnabled: false, direct: true };
+      globalThis.fetch = async (path, options = {}) => {
+        requests.push([path, options.method ?? 'GET']);
+        if (path === '/api/apps') return Response.json(connected ? [{ ...app, status: 'connected', connectionId: 'private-connection' }] : []);
+        if (path === '/api/apps/catalog') return Response.json([app]);
+        if (path === '/api/apps/gmail/connect') return Response.json({ url, attempt });
+        if (path === '/api/apps/setup-status') { statusReads++; return Response.json({ completed: connected ? [hash] : [], apps: [{ hash, slug: 'gmail', name: privateName, available: !failure, ...(failure ? { error: failure } : {}) }] }); }
+        throw new Error('Unexpected fixture request: ' + path);
+      };
+      setRequestAccount('synthetic-owner');
+      setAnalyticsClient({ init(_key, options) { this.options = options; }, capture(event, properties = {}) {
+        const value = this.options.before_send({ event, properties }); if (value) captured.push(value); return value;
+      }, _send_request() {}, set_config(options) { this.options = { ...this.options, ...options }; }, reset() {} });
+      configureAnalytics({ enabled: true, distinctId: 'synthetic-installation', environment: 'development' }, 'web');
+      const root = createRoot(document.querySelector('#root'));
+      const settle = async check => { for (let i = 0; i < 50; i++) { await act(async () => new Promise(resolve => setTimeout(resolve, 5))); if (check()) return; } assert.fail('The app state did not settle.'); };
+      try {
+        await act(async () => root.render(createElement(Apps, { onAsk() { assert.fail('Navigation must not send a request.'); } })));
+        await settle(() => document.querySelector('[data-connect-service="gmail"]'));
+        await act(async () => document.querySelector('[data-connect-service="gmail"]').click());
+        await settle(() => statusReads > 0 && channels.length > 0);
+        await act(async () => channels.at(-1).onmessage({ data: { service: 'gmail', attempt, connection: 'connected' } }));
+        await settle(() => statusReads > 1);
+        const handoff = () => document.querySelector('.notice-success .notice-actions button');
+        assert.equal(handoff(), null);
+        connected = true;
+        await act(async () => window.dispatchEvent(new Event('focus')));
+        await settle(() => captured.some(item => item.event === 'app_connection_completed'));
+        await settle(() => handoff());
+        assert.equal(window.location.pathname, '/apps');
+        assert.equal(requests.filter(([path]) => path === '/api/messages').length, 0);
+        await act(async () => handoff().click());
+        assert.equal(window.location.pathname, '/');
+        assert.equal(requests.filter(([path]) => path === '/api/messages').length, 0);
+        const clicks = captured.filter(item => item.event === 'app_connection_chat_requested');
+        assert.equal(clicks.length, 1);
+        assert.equal(JSON.stringify(captured).includes(privateName), false);
+        assert.equal(JSON.stringify(captured).includes(url), false);
+        assert.equal(JSON.stringify(captured).includes(hash), false);
+        configureAnalytics(undefined);
+        await act(async () => root.render(null));
+        pageDataCache.clear();
+        setRequestAccount('synthetic-owner-two');
+        connected = false;
+        statusReads = 0;
+        window.history.replaceState(null, '', '/apps');
+        await act(async () => root.render(createElement(Apps, { key: 'synthetic-owner-two', onAsk() { assert.fail('Navigation must not send a request.'); } })));
+        await settle(() => document.querySelector('[data-connect-service="gmail"]'));
+        assert.equal(handoff(), null);
+        await act(async () => document.querySelector('[data-connect-service="gmail"]').click());
+        await settle(() => statusReads > 0);
+        connected = true;
+        await act(async () => window.dispatchEvent(new Event('focus')));
+        await settle(() => handoff());
+        await act(async () => handoff().click());
+        assert.equal(window.location.pathname, '/');
+        assert.equal(captured.filter(item => item.event === 'app_connection_chat_requested').length, 1);
+        assert.equal(requests.filter(([path]) => path === '/api/messages').length, 0);
+        await act(async () => root.render(null));
+        pageDataCache.clear();
+        connected = false;
+        statusReads = 0;
+        window.history.replaceState(null, '', '/apps');
+        await act(async () => root.render(createElement(Apps, { key: 'failed-sign-in', onAsk() {} })));
+        await settle(() => document.querySelector('[data-connect-service="gmail"]'));
+        await act(async () => document.querySelector('[data-connect-service="gmail"]').click());
+        await settle(() => statusReads > 0);
+        failure = 'Sign-in could not finish: invalid_request: Synthetic refusal';
+        await act(async () => channels.at(-1).onmessage({ data: { service: 'gmail', attempt, connection: 'failed' } }));
+        await settle(() => document.body.textContent.includes(failure));
+        await act(async () => root.render(null));
+        pageDataCache.clear();
+        statusReads = 0;
+        failure = 'Sign-in could not finish: Synthetic polled refusal';
+        await act(async () => root.render(createElement(Apps, { key: 'polled-failure', onAsk() {} })));
+        await settle(() => document.querySelector('[data-connect-service="gmail"]'));
+        await act(async () => document.querySelector('[data-connect-service="gmail"]').click());
+        await settle(() => document.body.textContent.includes(failure));
+      } finally { await act(async () => root.unmount()); dom.window.close(); }
     `,
   });
   assert.equal(result.exitCode, 0, result.stdout + result.stderr);

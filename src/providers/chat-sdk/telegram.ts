@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import type { ChannelPairingRequest, MessagingAttachment } from '../../ports/messaging.ts';
 import { MessagingAttachmentError } from '../../ports/messaging.ts';
+import { modelServiceError } from '../model-error.ts';
 import { contactAttachment, locationAttachment, telegramContactCard } from './content.ts';
 import { sharedLocation } from '../../shared/channel-content.ts';
 
@@ -135,7 +136,17 @@ export function telegramAttachments(
           signal: operation,
           redirect: 'error',
         });
-        if (!info.ok) throw new Error('The Telegram file is unavailable.');
+        if (!info.ok) {
+          const failure = await modelServiceError(
+            info,
+            'Telegram getFile',
+            [token, encodeURIComponent(token)],
+            ['description', 'error_code'],
+          );
+          if (/file is too big/i.test(failure.reason ?? ''))
+            throw new MessagingAttachmentError(20 * 1024 * 1024);
+          throw failure;
+        }
         const parsed = z
           .object({
             ok: z.literal(true),

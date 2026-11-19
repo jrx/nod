@@ -256,7 +256,7 @@ jobs:
           key: desktop-electron-${{ matrix.arch }}-${{ hashFiles('desktop/pnpm-lock.yaml') }}
       - name: Install and build without signing credentials
         run: |
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --cpu=${{ matrix.arch }} --cpu=arm64
           pnpm --dir desktop install --frozen-lockfile
           pnpm run build
       - name: Verify native updates, signature rejection and profile preservation
@@ -323,7 +323,7 @@ jobs:
           key: desktop-electron-${{ matrix.arch }}-${{ hashFiles('desktop/pnpm-lock.yaml') }}
       - name: Install and build without signing credentials
         run: |
-          pnpm install --frozen-lockfile
+          pnpm install --frozen-lockfile --cpu=${{ matrix.arch }} --cpu=arm64
           pnpm --dir desktop install --frozen-lockfile
           pnpm run build
       - name: Wait for this Mac's runtime images

@@ -20,7 +20,10 @@ import {
 import { DesktopPreferencesSetup } from './steps/desktop-preferences';
 import { useBrowserTimeZone } from '../../hooks/use-browser-time-zone';
 import { modelReady } from '../../hooks/use-models';
+import { usePageData } from '../../hooks/use-page-data';
 import { api, ApiError, errorMessage } from '../../lib/api';
+import { subscribeAppEvents } from '../../lib/app-events';
+import { pageDataCache } from '../../lib/page-data-cache';
 import { analyticsForCurrentSession, captureAnalytics } from '../../lib/analytics';
 import { clearStored, readStep, writeStep } from './storage';
 import { Welcome } from './steps/welcome';
@@ -77,6 +80,8 @@ export function Onboarding({
 }) {
   useBrowserTimeZone();
   const desktop = desktopRuntimeAvailable();
+  const privacy = usageShared || (traces !== undefined && Boolean(onTraces));
+  const models = usePageData<ModelsResponse>('/api/models');
   const [position, setPosition] = useState<{
     step: SetupStep;
     arrived: StepProps['arrived'];
@@ -115,9 +120,14 @@ export function Onboarding({
       quiet: welcomed && step === 'email',
     };
   });
-  const { step, arrived } = position;
+  const { arrived } = position;
+  const step = position.step === 'privacy' && !privacy ? 'join' : position.step;
   const index = step === 'preferences' ? onboardingSteps.length : onboardingSteps.indexOf(step);
   const [preparation, setPreparation] = useState<'pending' | 'ready' | 'failed'>('pending');
+  const [preparationError, setPreparationError] = useState<{
+    message: string;
+    details?: string;
+  }>();
   const [finishing, setFinishing] = useState(0);
   const [waitingForServices, setWaitingForServices] = useState(false);
   const [completionFailed, setCompletionFailed] = useState(false);
@@ -126,13 +136,17 @@ export function Onboarding({
   const [runtimeStatus, setRuntimeStatus] = useState<DesktopStatus | null>(null);
   const [error, setError] = useState('');
   const [missing, setMissing] = useState<'brain' | 'email' | null>(null);
-  const [modelOk, setModelOk] = useState<boolean | null>(null);
+  const [skipModelStep, setSkipModelStep] = useState<boolean | null>(null);
+  const steps = onboardingSteps.filter(
+    (item) => (item !== 'brain' || skipModelStep !== true) && (item !== 'privacy' || privacy),
+  );
   const [mining, setMining] = useState(false);
   const emailSkipped = useRef(false);
   const started = useRef(false);
   const preparationRequest = useRef<AbortController | null>(null);
   const active = useRef(false);
   const retrying = useRef(false);
+  const initialModelsChecked = useRef(false);
   const main = useRef<HTMLElement>(null);
   const viewed = useRef<{
     owner: string;
@@ -143,6 +157,23 @@ export function Onboarding({
   useEffect(() => {
     desktopRendererReady();
   }, []);
+
+  useEffect(() => {
+    if (step !== position.step) setPosition({ step, arrived });
+  }, [step]);
+
+  useEffect(
+    () =>
+      subscribeAppEvents(user.id, {
+        open: () => pageDataCache.revalidateActive('/api/models'),
+        error() {},
+        message: (event) => {
+          if (JSON.parse(event.data).type === 'refresh')
+            pageDataCache.revalidateActive('/api/models');
+        },
+      }),
+    [user.id],
+  );
 
   useEffect(() => {
     writeStep({ owner: user.id, step, version: onboardingVersion });
@@ -174,11 +205,14 @@ export function Onboarding({
 
   useEffect(() => {
     let current = true;
-    void api<ModelsResponse>('/api/models')
-      .then((models) => {
+    void pageDataCache
+      .refresh('/api/models')
+      .then(() => {
         if (!current) return;
-        const ready = modelReady(models);
-        setModelOk(ready);
+        const latest = pageDataCache.getSnapshot<ModelsResponse>('/api/models');
+        const ready = !latest.error && modelReady(latest.data) && !latest.data?.selectionIssue;
+        initialModelsChecked.current = true;
+        setSkipModelStep(ready);
         if (!ready && index > onboardingSteps.indexOf('brain'))
           setPosition({ step: 'brain', arrived: 'forward' });
         if (ready)
@@ -187,12 +221,18 @@ export function Onboarding({
           );
       })
       .catch(() => {
-        if (current) setModelOk(false);
+        if (current) setSkipModelStep(false);
       });
     return () => {
       current = false;
     };
   }, [user.id]);
+
+  useEffect(() => {
+    if (!initialModelsChecked.current || !models.data) return;
+    const ready = modelReady(models.data) && !models.data.selectionIssue;
+    setSkipModelStep((previous) => previous !== false && ready);
+  }, [models.data]);
 
   useEffect(() => {
     active.current = true;
@@ -265,6 +305,7 @@ export function Onboarding({
     const request = new AbortController();
     preparationRequest.current = request;
     setPreparation('pending');
+    setPreparationError(undefined);
     try {
       const response = await api<AccountPreparationResponse>('/api/account/prepare', {
         method: 'POST',
@@ -273,9 +314,13 @@ export function Onboarding({
       });
       if (response.ok !== true) throw new Error('Setup could not be completed.');
       if (!request.signal.aborted) setPreparation('ready');
-    } catch {
+    } catch (cause) {
       if (!request.signal.aborted) {
         setPreparation('failed');
+        setPreparationError({
+          message: cause instanceof ApiError ? cause.message : 'Nod could not finish setup.',
+          details: cause instanceof ApiError ? `HTTP ${cause.status}` : errorMessage(cause),
+        });
         capture('ui_error', { area: 'onboarding', action: 'prepare' });
       }
     } finally {
@@ -311,8 +356,9 @@ export function Onboarding({
   }
 
   function go(offset: 1 | -1) {
-    let next = onboardingSteps[index + offset];
-    if (next === 'brain' && modelOk === true) next = onboardingSteps[index + offset * 2];
+    let at = index + offset;
+    while (onboardingSteps[at] && !steps.includes(onboardingSteps[at])) at += offset;
+    const next = onboardingSteps[at];
     if (next) {
       setError('');
       setCompletionFailed(false);
@@ -348,8 +394,7 @@ export function Onboarding({
     finishing &&
     (waitingForServices || preparation !== 'ready' || completionFailed || runtimeError)
   ) {
-    const failure =
-      runtimeError || error || (preparation === 'failed' ? 'Nod couldn’t finish setup.' : '');
+    const failure = runtimeError || error || preparationError?.message || '';
     const runtime = runtimeStatus?.runtime;
     const activeRuntime = runtime && runtime.phase !== 'ready' ? runtime : runtimeStatus;
     const title =
@@ -369,6 +414,7 @@ export function Onboarding({
               : 'Your workspace and browser are getting ready. This only happens once.'
         }
         error={failure || undefined}
+        details={!runtimeError && !error ? preparationError?.details : undefined}
       >
         {failure && missing && (
           <Button
@@ -396,15 +442,23 @@ export function Onboarding({
   const recovery = desktop && (runtimeError || error || saving || preparation === 'failed') && (
     <div className="ob-runtime">
       <Notice>
-        {runtimeError || error || (saving ? 'Trying setup again…' : 'Setup needs another try.')}{' '}
+        {runtimeError ||
+          error ||
+          preparationError?.message ||
+          (saving ? 'Trying setup again…' : 'Setup needs another try.')}{' '}
         <Button variant="ghost" disabled={saving} onClick={() => void retry()}>
           Try again
         </Button>
+        {!runtimeError && !error && preparationError?.details && (
+          <details className="setup-progress-details" data-analytics-private>
+            <summary>Details</summary>
+            <pre>{preparationError.details}</pre>
+          </details>
+        )}
       </Notice>
     </div>
   );
 
-  const steps = onboardingSteps.filter((item) => item !== 'brain' || modelOk !== true);
   if (step === 'preferences')
     return <DesktopPreferencesSetup notice={recovery} onReady={next} steps={steps} />;
 

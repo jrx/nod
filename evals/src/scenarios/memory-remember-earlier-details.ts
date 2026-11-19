@@ -78,6 +78,33 @@ export default scenario({
         }),
         { aspect: 'process', failure: 'overcaution' },
       ),
+      check(
+        'memory-learn-messages-accepted',
+        (run: Run) => {
+          const refused = run.tools.filter(
+            (call) =>
+              call.name === 'manage_personal_context' &&
+              call.input?.action === 'memory_learn' &&
+              call.input?.args?.messages?.length &&
+              call.isError &&
+              /could not use|own messages can be remembered|"code":"(invalid_|too_big)/.test(
+                call.output,
+              ),
+          );
+          return {
+            pass: refused.length === 0,
+            evidence: refused.length
+              ? refused
+                  .map(
+                    (call) =>
+                      `messages ${JSON.stringify(call.input.args.messages).slice(0, 200)} → ${call.output.slice(0, 200)}`,
+                  )
+                  .join('\n')
+              : 'no memory_learn call named a message the server could not use',
+          };
+        },
+        { aspect: 'process', failure: 'reasoning' },
+      ),
       check('no-external-writes', (run: Run) => run.writes.length === 0, {
         aspect: 'process',
         failure: 'scope',

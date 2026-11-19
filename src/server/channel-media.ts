@@ -14,8 +14,9 @@ export class ChannelMediaFailure extends Error {
       | 'transcription_unavailable'
       | 'speech_setup_required',
     readonly fileLimitMb?: number,
+    cause?: unknown,
   ) {
-    super(reason);
+    super(reason, cause === undefined ? undefined : { cause });
   }
 }
 
@@ -51,7 +52,7 @@ export function createChannelMedia(options: {
           signal.throwIfAborted();
           if (error instanceof MessagingAttachmentError)
             throw new ChannelMediaFailure('too_large', error.maxBytes / 1024 / 1024);
-          throw new ChannelMediaFailure('unavailable');
+          throw new ChannelMediaFailure('unavailable', undefined, error);
         }
         signal.throwIfAborted();
         total += bytes.length;

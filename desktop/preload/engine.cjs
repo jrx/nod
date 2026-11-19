@@ -74,6 +74,8 @@ contextBridge.exposeInMainWorld('nodDesktop', {
   ready: () => invoke('nod:renderer-ready'),
   updateStatus: () => invoke('nod:updates:status'),
   dismissUpdate: (version) => invoke('nod:updates:dismiss', version),
+  retryUpdate: (id) => invoke('nod:updates:retry', id),
+  downloadUpdate: () => invoke('nod:updates:download'),
   restartUpdate: () => invoke('nod:updates:restart'),
   onUpdateStatus: (listener) => {
     const receive = (_event, value) => listener(value);

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import Fastify from 'fastify';
 import pg from 'pg';
+import { markdownToPlainText } from 'chat';
 import { channelReply, createChannels } from '../src/server/channels.ts';
 import { createAgentReactionService } from '../src/server/agent-reactions.ts';
 import { createChatVerification } from '../src/server/chat-verification.ts';
@@ -15,8 +16,12 @@ import { createCommunication } from '../src/server/communication.ts';
 import { createVault } from '../src/server/vault.ts';
 import { locksTable } from '../src/server/locks.ts';
 import { createChatSdkTransport } from '../src/providers/chat-sdk/index.ts';
-import type { MessagingTransport } from '../src/ports/messaging.ts';
-import { createWhatsAppLinkedTransport } from '../src/providers/chat-sdk/whatsapp.ts';
+import { MessagingAttachmentError, type MessagingTransport } from '../src/ports/messaging.ts';
+import { telegramAttachments, telegramMessage } from '../src/providers/chat-sdk/telegram.ts';
+import {
+  createWhatsAppLinkedTransport,
+  type WhatsAppDrop,
+} from '../src/providers/chat-sdk/whatsapp.ts';
 import { combineMessagingTransports } from '../src/providers/chat-sdk/combined.ts';
 import { createChannelSessionStore } from '../src/server/channel-session.ts';
 import { createChannelMedia } from '../src/server/channel-media.ts';
@@ -627,6 +632,26 @@ const attachment = (name: string, mimeType: string, text: string) => ({
   read: async () => Buffer.from(text),
 });
 
+const audioFile = (name: string, mimeType: string, bytes: Buffer) => ({
+  name,
+  mimeType,
+  size: bytes.length,
+  read: async () => bytes,
+});
+
+const oggOpus = (channels: number) => {
+  const head = Buffer.concat([
+    Buffer.from('OpusHead'),
+    Buffer.from([1, channels, 0, 0, 0x80, 0xbb, 0, 0, 0, 0, 0]),
+  ]);
+  return Buffer.concat([
+    Buffer.from('OggS'),
+    Buffer.alloc(22),
+    Buffer.from([1, head.length]),
+    head,
+  ]);
+};
+
 const fixtureEnv = {
   TELEGRAM_ENABLED: 'true',
   TELEGRAM_BOT_TOKEN: '987:fixture-not-live',
@@ -640,6 +665,112 @@ const fixtureEnv = {
   WHATSAPP_ALLOWED_NUMBER: '351910000000',
   WHATSAPP_POLICY_CONFIRMED: 'true',
 };
+
+function describeChannelSchedule(
+  transport: MessagingTransport,
+  channel: string,
+  title: string,
+  prompt: string,
+) {
+  const definition = {
+    title,
+    prompt,
+    kind: 'recurring',
+    cron: '0 15 * * *',
+    timeZone: 'UTC',
+    enabled: true,
+  };
+  return createCommunication({
+    pool: { query: async () => ({ rows: [] }) } as unknown as pg.Pool,
+    ownerId: 'synthetic-owner',
+    canDeliverLiteral: (channelId, text, literal) =>
+      transport.canDeliverLiteral?.({ channelId, text, literal }) ?? false,
+    review: async (_instructions, value) =>
+      Object(value).purpose === 'confirmation_review'
+        ? { valid: true }
+        : { text: 'Create this schedule?', action: 'Create schedule' },
+  }).describe({
+    turn: { threadId: 'synthetic-thread', turnId: 'synthetic-turn' },
+    channel,
+    action: 'NOD_schedule_create',
+    args: { ...definition },
+    details: { scheduleDefinition: definition },
+  });
+}
+
+test('channel transports check literal instructions against their actual formatting and split rules', async (t) => {
+  const sdk = createChatSdkTransport({} as pg.Pool, fixtureEnv);
+  const linked = createWhatsAppLinkedTransport({
+    mode: 'bot',
+    store: {
+      open: async () => {
+        throw new Error('This check must not open a linked account.');
+      },
+    },
+  });
+  const combined = combineMessagingTransports(sdk, linked);
+  for (const [literal, telegram, whatsapp] of [
+    [
+      'Review boîte@example.test.\n    Never send email.\nKeep [source](https://records.example.test/item) and `data`.',
+      true,
+      true,
+    ],
+    [
+      `${'a'.repeat(3600)}\n[Source](https://records.example.test/item)\n    Never send email.`,
+      false,
+      true,
+    ],
+    [
+      `${'a'.repeat(4200)}\n[Source](https://records.example.test/item)\n    Never send email.`,
+      false,
+      false,
+    ],
+    ['Keep ``` as literal text. Never send email.', true, false],
+    ['Keep {{emoji:smile}} as literal text.', false, false],
+  ] as const) {
+    const fence = literal.includes('```') ? '````' : '```';
+    const text = `Instruction:\n\n${fence}\n${literal}\n${fence}\n\nCreate this schedule?`;
+    assert.equal(sdk.canDeliverLiteral!({ channelId: 'telegram', text, literal }), telegram);
+    assert.equal(sdk.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+    assert.equal(linked.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+    assert.equal(combined.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+    assert.equal(combined.canDeliverLiteral!({ channelId: 'telegram', text, literal }), telegram);
+    assert.equal(combined.canDeliverLiteral!({ channelId: 'unknown', text, literal }), false);
+  }
+  const literal = 'Keep *these literal markers* unchanged. Never send email.';
+  for (const [title, telegram, whatsapp] of [
+    ['Synthetic review', true, true],
+    ['{{emoji:smile}}', false, false],
+    ['```', true, false],
+  ] as const) {
+    await t.test(`checked title ${JSON.stringify(title)} preserves its channel facts`, async () => {
+      const { question: text } = await describeChannelSchedule(sdk, 'web', title, literal);
+      assert.equal(linked.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), whatsapp);
+      for (const transport of [sdk, combined]) {
+        assert.equal(
+          transport.canDeliverLiteral!({ channelId: 'telegram', text, literal }),
+          telegram,
+        );
+        assert.equal(
+          transport.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }),
+          whatsapp,
+        );
+      }
+    });
+  }
+  const block = `\`\`\`\n${literal}\n\`\`\``;
+  for (const text of [
+    `${block}\n\n> \`\`\`\n> Extra instruction\n> \`\`\``,
+    `${block}\n\n- Nested instruction:\n\n  \`\`\`\n  Extra instruction\n  \`\`\``,
+    `> \`\`\`\n> ${literal}\n> \`\`\``,
+  ]) {
+    await t.test('the sole literal block must be at the root with no nested extra block', () => {
+      for (const channelId of ['telegram', 'whatsapp'])
+        assert.equal(sdk.canDeliverLiteral!({ channelId, text, literal }), false);
+      assert.equal(linked.canDeliverLiteral!({ channelId: 'whatsapp', text, literal }), false);
+    });
+  }
+});
 
 test(
   'WhatsApp links privately, admits only its owner, fences echoes across restart, and reconnects without repeating sends',
@@ -667,6 +798,7 @@ test(
             quoted: unknown;
           }[] = [];
           const collected: InboundMessage[] = [];
+          const dropped: WhatsAppDrop[] = [];
           const reacted: string[] = [];
           const presence: string[][] = [];
           let downloads = 0;
@@ -684,6 +816,7 @@ test(
           const accountId = `linked:${own}`;
           const jid = `${owner}@s.whatsapp.net`;
           const store = createChannelSessionStore({ pool, ownerId: `fixture-${mode}`, keyStore });
+          let lidLookups = 0;
           const createSocket: Factory = (config) => {
             if (failConnect)
               throw Object.assign(new Error('synthetic-private-connect-error'), {
@@ -696,8 +829,14 @@ test(
               user: { id: `${own}:1@s.whatsapp.net`, lid: '55555555@lid', name: 'Fixture' },
               signalRepository: {
                 lidMapping: {
-                  getPNForLID: async (lid: string) =>
-                    ['55555555@lid', '66666666@lid'].includes(lid) ? jid : null,
+                  getPNForLID: async (lid: string) => {
+                    if (lid === '99999999@lid') throw new Error('Synthetic mapping failure.');
+                    return ['55555555@lid', '66666666@lid'].includes(lid) ? jid : null;
+                  },
+                  getLIDForPN: async (pn: string) => {
+                    if (++lidLookups === 2) throw new Error('Synthetic lookup failure.');
+                    return pn === jid ? '77777777@lid' : null;
+                  },
                 },
               },
               end: () => {},
@@ -758,6 +897,7 @@ test(
               },
               createSocket,
               download,
+              onDrop: (drop) => dropped.push(drop),
             });
           let transport = open();
           try {
@@ -818,6 +958,9 @@ test(
                   },
                 },
                 envelope('lid', '55555555@lid'),
+                envelope('unmapped-lid', '77777777@lid'),
+                envelope('unmapped-intruder', '88888888@lid', false),
+                envelope('unmapped-stranger', '99999999@lid', false),
                 ...(mode === 'self-chat'
                   ? [
                       {
@@ -849,8 +992,22 @@ test(
             );
             assert.deepEqual(
               collected.map((message) => message.messageId),
-              ['owner', 'image', 'quoted', 'lid'],
+              mode === 'bot'
+                ? ['owner', 'image', 'quoted', 'lid', 'unmapped-lid']
+                : ['owner', 'image', 'quoted', 'lid'],
             );
+            if (mode === 'bot') assert.equal(collected[4].threadId, '77777777@lid');
+            assert.deepEqual(
+              dropped.filter((drop) => drop.addressing === 'lid'),
+              mode === 'bot'
+                ? [
+                    { reason: 'lid_lookup_failed', mode: 'bot', addressing: 'lid', suppressed: 0 },
+                    { reason: 'sender_unmatched', mode: 'bot', addressing: 'lid', suppressed: 0 },
+                  ]
+                : [{ reason: 'self_chat_mismatch', mode: 'own', addressing: 'lid', suppressed: 0 }],
+            );
+            assert.ok(dropped.some((drop) => drop.reason === 'resend_ignored'));
+            assert.doesNotMatch(JSON.stringify(dropped), /\d{5,}|@/);
             assert.equal(collected[2].replyToMessageId, 'task-prompt');
             assert.deepEqual(reacted, ['task-prompt']);
             assert.equal(downloads, 0);
@@ -935,6 +1092,10 @@ test(
               collected.push(message);
             });
             const shared = collected.slice(-3);
+            assert.equal(
+              new Set(dropped.map((drop) => `${drop.reason}:${drop.addressing}`)).size,
+              dropped.length,
+            );
             assert.deepEqual(
               shared.map((message) => message.attachments![0].source),
               ['sticker', 'location', 'contact'],
@@ -976,10 +1137,11 @@ test(
               text: '**Task complete**',
               replyToMessageId: 'task-prompt',
               replyToText: 'Fixture task question',
-              attachments: [attachment('reply.ogg', 'audio/ogg', 'synthetic voice')],
+              attachments: [audioFile('reply.ogg', 'audio/ogg', oggOpus(1))],
             });
             assert.equal(sent[0].content.text, '*Task complete*');
             assert.equal(sent[1].content.ptt, true);
+            assert.equal(sent[1].content.mimetype, 'audio/ogg; codecs=opus');
             assert.deepEqual(
               result.ids,
               sent.map((message) => message.id),
@@ -988,6 +1150,69 @@ test(
               (sent[0].quoted as { message: { conversation: string } }).message.conversation,
               'Fixture task question',
             );
+            const schedulePrompt =
+              'Review boîte@example.test.\n    Never send email or change a source.';
+            const { question: scheduleQuestion } = await describeChannelSchedule(
+              transport,
+              'whatsapp',
+              'Synthetic daily review',
+              schedulePrompt,
+            );
+            const beforeSchedule = sent.length;
+            await transport.post({
+              channelId: 'whatsapp',
+              accountId,
+              threadId: jid,
+              text: scheduleQuestion,
+              replyToMessageId: 'task-prompt',
+              replyToText: 'Fixture task question',
+            });
+            assert.equal(sent.length, beforeSchedule + 1);
+            assert.ok(String(sent.at(-1)!.content.text).includes(schedulePrompt));
+            assert.ok(
+              String(sent.at(-1)!.content.text).includes('Schedule: Synthetic daily review'),
+            );
+            assert.equal((sent.at(-1)!.quoted as { key: { id: string } }).key.id, 'task-prompt');
+            await assert.rejects(
+              describeChannelSchedule(transport, 'whatsapp', '```', schedulePrompt),
+              /cannot show the complete schedule confirmation in this channel/,
+            );
+            assert.equal(sent.length, beforeSchedule + 1);
+            for (const [file, kind] of [
+              [
+                audioFile('reply.wav', 'audio/wav', Buffer.from('RIFF\0\0\0\0WAVEfmt ')),
+                'document',
+              ],
+              [audioFile('stereo.ogg', 'audio/ogg', oggOpus(2)), 'document'],
+              [
+                audioFile('vorbis.ogg', 'audio/ogg', Buffer.from('OggS synthetic vorbis')),
+                'document',
+              ],
+              [audioFile('reply.mp3', 'audio/mpeg', Buffer.from('ID3 synthetic')), 'audio'],
+              [
+                audioFile('reply.m4a', 'audio/mp4; codecs=mp4a.40.2', Buffer.from('synthetic')),
+                'audio',
+              ],
+            ] as const) {
+              const before = sent.length;
+              await transport.post({
+                channelId: 'whatsapp',
+                accountId,
+                threadId: jid,
+                text: 'Spoken result',
+                attachments: [file],
+              });
+              assert.deepEqual(
+                sent
+                  .slice(before)
+                  .map((message) => message.content.text ?? message.content.caption),
+                ['Spoken result', undefined],
+              );
+              const media = sent.at(-1)!.content;
+              assert.ok(media[kind], file.name);
+              assert.equal(media.ptt, undefined);
+              if (kind === 'document') assert.equal(media.fileName, file.name);
+            }
             const beforeImage = sent.length;
             const imageReply = await transport.post({
               channelId: 'whatsapp',
@@ -1293,6 +1518,128 @@ test(
   },
 );
 
+test('WhatsApp bot mode accepts a confirmed private ID when mapping lookups miss', async (t) => {
+  type Factory = NonNullable<Parameters<typeof createWhatsAppLinkedTransport>[0]['createSocket']>;
+  const events = new EventEmitter();
+  const allowedNumber = '12025550101';
+  const allowedJid = `${allowedNumber}@s.whatsapp.net`;
+  const otherJid = '12025550103@s.whatsapp.net';
+  const lid = '77777777@lid';
+  const otherLid = '88888888@lid';
+  const text = 'Fixture request';
+  let lookupPhone: string | null = null;
+  let lookupLid: string | null = null;
+  const getPNForLID = t.mock.fn(async (_lid: string) => lookupPhone);
+  const getLIDForPN = t.mock.fn(async (_pn: string) => lookupLid);
+  const dropped: WhatsAppDrop['reason'][] = [];
+  const transport = createWhatsAppLinkedTransport({
+    mode: 'bot',
+    allowedNumber,
+    store: {
+      open: async () => ({
+        get: async () => undefined,
+        set: async () => {},
+        clear: async () => {},
+        close: async () => {},
+      }),
+    },
+    createSocket: () =>
+      ({
+        ev: events,
+        user: { id: '12025550102:1@s.whatsapp.net' },
+        signalRepository: { lidMapping: { getPNForLID, getLIDForPN } },
+        end: () => {},
+      }) as unknown as ReturnType<Factory>,
+    onDrop: ({ reason }) => dropped.push(reason),
+  });
+  t.after(() => transport.close());
+  await transport.pairing!();
+  events.emit('connection.update', { connection: 'open' });
+  assert.equal((await transport.pairing!()).state, 'connected');
+
+  const upsert = (id: string, remoteJid: string) => {
+    events.emit('messages.upsert', {
+      type: 'notify',
+      messages: [
+        {
+          key: { id, remoteJid, fromMe: false, addressingMode: 'lid' },
+          messageTimestamp: Math.floor(Date.now() / 1000),
+          message: { conversation: text },
+        },
+      ],
+    });
+  };
+  const accepted: InboundMessage[] = [];
+  const accept = async (message: InboundMessage) => {
+    accepted.push(message);
+  };
+  upsert('before-mapping', lid);
+  await transport.poll!(accept);
+  assert.equal(accepted.length, 0);
+  assert.deepEqual(dropped, ['sender_unmatched']);
+  assert.deepEqual(getPNForLID.mock.calls[0]?.arguments, [lid]);
+  assert.deepEqual(getLIDForPN.mock.calls[0]?.arguments, [allowedJid]);
+
+  events.emit('lid-mapping.update', {
+    lid: '77777777:3@lid',
+    pn: `${allowedNumber}:2@s.whatsapp.net`,
+  });
+  events.emit('lid-mapping.update', { lid: otherLid, pn: otherJid });
+  upsert('from-owner', lid);
+  upsert('from-other-number', otherLid);
+  upsert('from-unverified-sender', '99999999@lid');
+  await transport.poll!(accept);
+  assert.deepEqual(
+    accepted.map(({ messageId, senderId, threadId, text }) => ({
+      messageId,
+      senderId,
+      threadId,
+      text,
+    })),
+    [{ messageId: 'from-owner', senderId: allowedNumber, threadId: lid, text }],
+  );
+
+  for (const [phone, privateId] of [
+    [otherJid, null],
+    [null, '99999999@lid'],
+  ]) {
+    lookupPhone = phone;
+    lookupLid = privateId;
+    upsert('with-conflicting-lookup', lid);
+    await transport.poll!(accept);
+  }
+  lookupPhone = lookupLid = null;
+  getPNForLID.mock.mockImplementationOnce(async () => {
+    events.emit('lid-mapping.update', { lid: '77777777:3@lid', pn: otherJid });
+    return allowedJid;
+  });
+  upsert('during-reassignment', lid);
+  await transport.poll!(accept);
+  for (const [id, phone, privateId] of [
+    ['after-reassignment', null, null],
+    ['stale-reverse-mapping', allowedJid, null],
+    ['stale-forward-mapping', null, lid],
+  ] as const) {
+    lookupPhone = phone;
+    lookupLid = privateId;
+    upsert(id, lid);
+    await transport.poll!(accept);
+  }
+  assert.deepEqual(
+    accepted.map(({ messageId }) => messageId),
+    ['from-owner'],
+  );
+
+  lookupPhone = lookupLid = null;
+  events.emit('lid-mapping.update', { lid, pn: allowedJid });
+  upsert('after-reverification', lid);
+  await transport.poll!(accept);
+  assert.deepEqual(
+    accepted.map(({ messageId }) => messageId),
+    ['from-owner', 'after-reverification'],
+  );
+});
+
 test('Telegram media keeps native replies and checks the sender before any download', async () => {
   const bytes = Buffer.from('synthetic image bytes');
   const requests: string[] = [];
@@ -1463,6 +1810,72 @@ test('Telegram media keeps native replies and checks the sender before any downl
     0,
   );
   assert.equal(requests.length, 0);
+});
+
+test('Telegram downloads stop at 20 MB whatever size the sender, Bot API or file server reports', async () => {
+  const limit = 20 * 1024 * 1024;
+  const message = telegramMessage.parse({
+    message_id: 1,
+    date: 1,
+    from: { id: 1, is_bot: false, first_name: 'Fixture' },
+    chat: { id: 1, type: 'private' },
+    document: { file_id: 'fixture-document' },
+  });
+  const download = (fileSize: number | undefined, file: () => Response) =>
+    telegramAttachments(message, 'token', async (input) =>
+      String(input).endsWith('/getFile')
+        ? Response.json({
+            ok: true,
+            result: { file_path: 'documents/fixture.bin', file_size: fileSize },
+          })
+        : file(),
+    )[0].read();
+  await assert.rejects(
+    download(limit + 1, () => new Response('unrequested')),
+    MessagingAttachmentError,
+  );
+  await assert.rejects(
+    download(
+      undefined,
+      () => new Response('short', { headers: { 'content-length': String(limit + 1) } }),
+    ),
+    MessagingAttachmentError,
+  );
+  await assert.rejects(
+    download(
+      undefined,
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new Uint8Array(limit));
+              controller.enqueue(new Uint8Array(1));
+              controller.close();
+            },
+          }),
+        ),
+    ),
+    MessagingAttachmentError,
+  );
+  assert.equal(
+    (await download(undefined, () => new Response(new Uint8Array(limit)))).byteLength,
+    limit,
+  );
+  const refused = (description: string) =>
+    telegramAttachments(message, 'token', async () =>
+      Response.json({ ok: false, error_code: 400, description }, { status: 400 }),
+    )[0].read();
+  await assert.rejects(
+    refused('Bad Request: file is too big'),
+    (error: unknown) => error instanceof MessagingAttachmentError && error.maxBytes === limit,
+  );
+  await assert.rejects(refused('Bad Request: invalid file_id for token'), (error: Error) => {
+    assert.equal(
+      error.message,
+      'Telegram getFile failed (HTTP 400): description: Bad Request: invalid file_id for [redacted]; error_code: 400',
+    );
+    return true;
+  });
 });
 
 test('speech uses a bounded transcription request and generates Ogg voice output without exposing credentials', async () => {
@@ -3841,6 +4254,32 @@ test(
   },
 );
 
+test('channel presentation keeps punctuated local addresses out of delivery wording', async () => {
+  for (const text of [
+    'Read http://localhost:5678.',
+    'Read "http://127.0.0.1:5678".',
+    'Read http://[::1]:5678, next.',
+    'Read http://localhost.:5678.',
+    'Read `http://localhost:5678`.',
+  ]) {
+    let calls = 0;
+    const delivered = await channelReply(text, {
+      threadId: 'owned-thread',
+      present: async (_threadId, input) => {
+        calls++;
+        assert.equal(input.kind, 'delivery');
+        if (input.kind === 'delivery') assert.equal(input.secureAction, true);
+        assert.doesNotMatch(JSON.stringify(input), /localhost|127\.0\.0\.1|\[::1\]|5678/);
+        return 'Open Nod to read this instruction.';
+      },
+    });
+    assert.equal(calls, 1);
+    assert.equal(delivered, 'Open Nod to read this instruction.');
+  }
+  const publicText = 'Read https://records.example.test:443.';
+  assert.equal(await channelReply(publicText, { threadId: 'owned-thread' }), publicText);
+});
+
 test('channel presentation isolates private links from the model and rejects unsafe generated output', async () => {
   const modelsLink = await channelReply('Use [Reconnect](/settings/models).', {
     threadId: 'owned-thread',
@@ -3918,6 +4357,7 @@ test(
       options: `-c search_path=${schema}`,
     });
     const threadId = await createFixtureTables(pool, 'local-development');
+    await pool.query('ALTER TABLE messages ADD COLUMN suggestions jsonb');
     const sent: { provider: string; body: Record<string, unknown> }[] = [];
     const handoffPresentations: unknown[] = [];
     const unavailableFiles: string[][] = [];
@@ -4200,6 +4640,13 @@ test(
       await channels.drain();
       assert.equal((await pool.query('SELECT * FROM turns')).rowCount, 2);
       assert.equal((await pool.query('SELECT * FROM channel_inbox')).rowCount, 2);
+      const literal = 'Review boîte@example.test. Never send email.';
+      const literalQuestion = `Instruction:\n\n\`\`\`\n${literal}\n\`\`\`\n\nSave this schedule?`;
+      for (const row of (await pool.query('SELECT channel FROM turns')).rows) {
+        assert.match(row.channel, /^(telegram|whatsapp):[a-f0-9]{32}$/);
+        assert.equal(channels.canDeliverLiteral(row.channel, literalQuestion, literal), true);
+      }
+      assert.equal(channels.canDeliverLiteral('unknown:identity', literalQuestion, literal), false);
       await addReply(
         'channel:telegram:987:123456:10',
         'Finish [securely](/credentials/private-token), [approve payment](/payments/private-token) or [add a card](/vault?add=card).',
@@ -4495,6 +4942,140 @@ test(
       }
       assert.ok(rejectedFormatting.includes('markdown'));
       rejectMarkdown = false;
+      await t.test(
+        'a checked schedule keeps its full text through Telegram plain fallback',
+        async () => {
+          const prompt = [
+            'Review boîte@example.test.',
+            '    Keep this indentation and `literal values`.',
+            'Read https://records.example.test/item.',
+            'Final limit: never send email or change a source.',
+          ].join('\n');
+          const definition = {
+            title: 'Synthetic daily review',
+            prompt,
+            kind: 'recurring',
+            cron: '0 15 * * *',
+            timeZone: 'UTC',
+            enabled: true,
+          };
+          const sourceId = 'channel:telegram:987:123456:10';
+          const source = (
+            await pool.query(
+              'SELECT t.id,t.channel FROM turns t JOIN channel_inbox i ON i.turn_id=t.id WHERE i.source_id=$1',
+              [sourceId],
+            )
+          ).rows[0];
+          let wordingCalls = 0;
+          const communication = createCommunication({
+            pool,
+            ownerId: 'local-development',
+            canDeliverLiteral: channels.canDeliverLiteral,
+            review: async (_instructions, value) => {
+              wordingCalls++;
+              if (Object(value).purpose === 'confirmation_review') {
+                assert.ok(Object(value).text.includes(prompt));
+                return { valid: true };
+              }
+              return { text: 'Create this schedule?', action: 'Create schedule' };
+            },
+          });
+          const proposal = {
+            turn: { threadId, turnId: source.id },
+            channel: source.channel,
+            action: 'NOD_schedule_create',
+            args: { ...definition },
+            details: { scheduleDefinition: definition },
+          };
+          const { question } = await communication.describe(proposal);
+          const expected = markdownToPlainText(question);
+          assert.ok(expected.includes(prompt));
+          assert.ok(expected.includes(`Schedule: ${definition.title}`));
+          const before = sent.length;
+          const rejectedBefore = rejectedFormatting.length;
+          const replyTarget = (
+            await pool.query(
+              "SELECT message_id,provider_message_id FROM channel_outbox WHERE source_id=$1 AND state='sent' ORDER BY updated_at,message_id LIMIT 1",
+              [sourceId],
+            )
+          ).rows[0];
+          assert.ok(replyTarget);
+          rejectMarkdown = true;
+          const messageId = await addReply(sourceId, question);
+          await pool.query('UPDATE messages SET reply_to_message_id=$2 WHERE id=$1', [
+            messageId,
+            replyTarget.message_id,
+          ]);
+          await channels.drain();
+          rejectMarkdown = false;
+          const delivered = sent.slice(before);
+          assert.equal(delivered.length, 1);
+          assert.equal(rejectedFormatting.length, rejectedBefore + 1);
+          assert.equal(delivered[0]!.provider, 'telegram');
+          assert.equal(delivered[0]!.body.parse_mode, undefined);
+          assert.equal(delivered[0]!.body.text, expected);
+          assert.equal(
+            Object(delivered[0]!.body.reply_parameters).message_id,
+            Number(replyTarget.provider_message_id.split(':').at(-1)),
+          );
+          assert.deepEqual(
+            (
+              await pool.query(
+                'SELECT state,provider_message_ids FROM channel_outbox WHERE message_id=$1',
+                [messageId],
+              )
+            ).rows[0],
+            { state: 'sent', provider_message_ids: [`123456:${before + 101}`] },
+          );
+          assert.equal(wordingCalls, 2);
+          definition.title = '{{emoji:smile}}';
+          proposal.args.title = definition.title;
+          await assert.rejects(
+            communication.describe(proposal),
+            /cannot show the complete schedule confirmation in this channel/,
+          );
+          assert.equal(wordingCalls, 2);
+          assert.equal(sent.length, before + 1);
+        },
+      );
+      await t.test(
+        'a checked schedule keeps its literal instruction on WhatsApp cloud',
+        async () => {
+          await pool.query(
+            "UPDATE channel_inbox SET received_at=now() WHERE source_id='channel:whatsapp:555000:wamid.good'",
+          );
+          const prompt = 'Review boîte@example.test.\n    Never send email or change a source.';
+          const { question } = await describeChannelSchedule(
+            transport,
+            'whatsapp',
+            'Synthetic daily review',
+            prompt,
+          );
+          const before = sent.length;
+          const messageId = await addReply('channel:whatsapp:555000:wamid.good', question);
+          await channels.drain();
+          const delivered = sent.slice(before);
+          assert.equal(delivered.length, 1);
+          assert.equal(delivered[0]!.provider, 'whatsapp');
+          const text = String(Object(delivered[0]!.body.text).body);
+          assert.ok(text.includes(prompt));
+          assert.ok(text.includes('Schedule: Synthetic daily review'));
+          assert.deepEqual(
+            (
+              await pool.query(
+                'SELECT state,provider_message_ids FROM channel_outbox WHERE message_id=$1',
+                [messageId],
+              )
+            ).rows[0],
+            { state: 'sent', provider_message_ids: [`wamid.fixture-out-${before + 1}`] },
+          );
+          await assert.rejects(
+            describeChannelSchedule(transport, 'whatsapp', '```', prompt),
+            /cannot show the complete schedule confirmation in this channel/,
+          );
+          assert.equal(sent.length, before + 1);
+        },
+      );
       const family = '👩‍👩‍👧‍👦';
       const accented = 'e\u0301';
       const beforeUnicode = sent.length;

@@ -1,3 +1,4 @@
+import { logFailure } from '../../ports/failure-log.ts';
 import {
   spawn,
   type ChildProcessWithoutNullStreams,
@@ -7,6 +8,10 @@ import { createHash } from 'node:crypto';
 import { serviceEnvironment } from '../process.ts';
 import type { ConnectedCli } from '../../ports/computer.ts';
 import { threadIdentity } from '../../ports/thread-identity.ts';
+import {
+  appEnvironmentNamePattern,
+  appEnvironmentNameMaxLength,
+} from '../../shared/app-definitions.ts';
 import type { CommandProcess } from '../command-process.ts';
 
 const cliInstallProgram = `import bz2,fcntl,gzip,hashlib,json,lzma,os,shutil,subprocess,sys
@@ -87,7 +92,7 @@ try:
  r=json.loads(line)
  if not isinstance(r['args'],list) or not all(isinstance(v,str) for v in r['args']): raise ValueError()
  env=r.get('environment',{})
- if not isinstance(env,dict) or not all(isinstance(k,str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}(?:TOKEN|KEY|SECRET|PASSWORD|_ID|_SID)',k) and isinstance(v,str) and v for k,v in env.items()): raise ValueError()
+ if not isinstance(env,dict) or not all(isinstance(k,str) and len(k)<=${appEnvironmentNameMaxLength} and re.fullmatch(${JSON.stringify(appEnvironmentNamePattern.source)},k) and isinstance(v,str) and v for k,v in env.items()): raise ValueError()
  limit=int(r['maxBytes'])
  timeout=float(r['timeoutMs'])/1000
  if limit<1 or not 0<timeout: raise ValueError()
@@ -240,7 +245,45 @@ if code and not last and not reason: output('stderr',log[-limit:])
 finish({'type':'exit','code':code,'reason':reason})
 `;
 
+const commandStopProgram = `import os,sys,signal,time
+proc=sys.argv[1]
+user=os.getuid()
+if not os.path.isdir(proc): sys.exit('The workspace has no %s to check its processes.'%proc)
+def scan():
+ table={}
+ for name in os.listdir(proc):
+  if not name.isdigit(): continue
+  try:
+   owner=os.stat(proc+'/'+name).st_uid
+   with open(proc+'/'+name+'/stat') as f: values=f.read().rsplit(')',1)[1].split()
+   table[int(name)]=(owner,values[0],int(values[1]),int(values[19]))
+  except (FileNotFoundError,ProcessLookupError): pass
+  except Exception as error: sys.exit('Nod could not read process %s: %s.'%(name,error))
+ ancestors=set()
+ pid=os.getpid()
+ while pid in table and pid not in ancestors:
+  ancestors.add(pid)
+  pid=table[pid][2]
+ try:
+  with open(proc+'/1/cmdline','rb') as f: init=os.path.basename(f.read().split(b'\\0')[0]) in [b'docker-init',b'tini']
+ except Exception as error: sys.exit('Nod could not read the workspace init process: %s.'%error)
+ children=sorted((started,pid) for pid,(_,_,parent,started) in table.items() if parent==1)
+ main=children[0][1] if init and children else None
+ return {pid for pid,(owner,state,_,_) in table.items() if owner==user and state not in ['Z','X'] and pid not in ancestors and pid not in [1,main]}
+deadline=time.monotonic()+10
+while True:
+ found=scan()
+ if not found: sys.exit(0)
+ if time.monotonic()>deadline: sys.exit('%d workspace processes are still running after SIGKILL.'%len(found))
+ for pid in found:
+  try: os.kill(pid,signal.SIGKILL)
+  except ProcessLookupError: pass
+  except OSError as error: sys.exit('Nod could not stop process %d: %s.'%(pid,error))
+ time.sleep(0.1)
+`;
+
 export class WorkspaceCommandError extends Error {
+  stop?: () => Promise<void>;
   constructor(
     readonly uncertain: boolean,
     message: string,
@@ -272,28 +315,47 @@ export async function runWorkspaceCommand(options: {
   if (!/^nod-workspace(?:-[a-zA-Z0-9_-]+)?$/.test(options.container))
     throw new Error('WORKSPACE_CONTAINER must identify a Nod workspace.');
   const id = threadIdentity(options.threadId);
-  return runSupervisedCommand({
-    ...options,
-    launch: () =>
-      (options.spawn ?? spawn)(
-        'docker',
-        [
-          'exec',
-          '-i',
-          '--user',
-          options.cli ? `${connectedUser(options.cli)}:1002` : 'node',
-          '--workdir',
-          options.cli ? '/var/tmp' : `/workspace/${id}`,
-          options.container,
-          '/usr/bin/python3',
-          '-I',
-          '-u',
-          '-c',
-          workspaceCommandProgram,
-        ],
-        { env: serviceEnvironment(), shell: false },
-      ),
-  });
+  const launch = (workdir: string) => () =>
+    (options.spawn ?? spawn)(
+      'docker',
+      [
+        'exec',
+        '-i',
+        '--user',
+        options.cli ? `${connectedUser(options.cli)}:1002` : 'node',
+        '--workdir',
+        workdir,
+        options.container,
+        '/usr/bin/python3',
+        '-I',
+        '-u',
+        '-c',
+        workspaceCommandProgram,
+      ],
+      { env: serviceEnvironment(), shell: false },
+    );
+  try {
+    return await runSupervisedCommand({
+      ...options,
+      launch: launch(options.cli ? '/var/tmp' : `/workspace/${id}`),
+    });
+  } catch (error) {
+    if (error instanceof WorkspaceCommandError && error.uncertain)
+      error.stop = async () => {
+        const result = await runSupervisedCommand({
+          args: ['/usr/bin/python3', '-I', '-c', commandStopProgram, '/proc'],
+          timeoutMs: 30_000,
+          maxBytes: 4096,
+          launch: launch('/var/tmp'),
+        });
+        if (result.exitCode)
+          throw new Error(
+            result.stderr.toString().trim() ||
+              `The process check exited with code ${result.exitCode}.`,
+          );
+      };
+    throw error;
+  }
 }
 
 function runSupervisedCommand(options: {
@@ -358,17 +420,16 @@ function runSupervisedCommand(options: {
       clearTimeout(drain);
       options.signal?.removeEventListener('abort', cancel);
     };
-    const unavailable = () => {
+    let transportError = '';
+    const unavailable = (reason: string) => {
       if (settled) return;
       settled = true;
+      logFailure('workspace_command_failed', new Error(reason));
       cleanup();
       child.stdin.destroy();
       child.kill('SIGKILL');
       reject(
-        new WorkspaceCommandError(
-          true,
-          'The workspace command did not stop safely. Restart Nod before continuing.',
-        ),
+        new WorkspaceCommandError(true, `The workspace command did not stop safely: ${reason}.`),
       );
     };
     function cancel() {
@@ -376,12 +437,19 @@ function runSupervisedCommand(options: {
       cancelling = true;
       clearTimeout(timer);
       if (!response) child.stdin.write('{"type":"cancel"}\n');
-      drain = setTimeout(unavailable, options.drainTimeoutMs ?? 8000);
+      const drainMs = options.drainTimeoutMs ?? 8000;
+      drain = setTimeout(
+        () => unavailable(`it did not confirm it stopped within ${drainMs / 1000} seconds`),
+        drainMs,
+      );
     }
     options.signal?.addEventListener('abort', cancel, { once: true });
-    child.on('error', unavailable);
-    child.stdin.on('error', unavailable);
-    child.stderr.resume();
+    child.on('error', (error) => unavailable(`its command stream failed (${error.message})`));
+    child.stdin.on('error', (error) => unavailable(`its command stream failed (${error.message})`));
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => {
+      transportError = (transportError + chunk).slice(-500);
+    });
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
       incoming += chunk;
@@ -411,14 +479,22 @@ function runSupervisedCommand(options: {
             else (frame.type === 'stdout' ? output : errors).push(bytes);
           } else throw new Error();
         } catch {
-          return unavailable();
+          return unavailable('its supervisor sent an invalid response');
         }
       }
-      if (Buffer.byteLength(incoming) > 32768) unavailable();
+      if (Buffer.byteLength(incoming) > 32768)
+        unavailable('its supervisor sent an invalid response');
     });
     child.on('close', (code) => {
       if (settled) return;
-      if (code !== 0 || !response || incoming) return unavailable();
+      if (code !== 0 || !response || incoming) {
+        const detail = [code === null ? '' : `exit code ${code}`, transportError.trim()]
+          .filter(Boolean)
+          .join(': ');
+        return unavailable(
+          `its command stream closed before the command confirmed it finished${detail ? ` (${detail})` : ''}`,
+        );
+      }
       settled = true;
       cleanup();
       if (options.signal?.aborted || response.reason === 'cancelled')

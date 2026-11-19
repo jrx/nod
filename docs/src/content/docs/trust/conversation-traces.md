@@ -5,7 +5,7 @@ sidebar:
   order: 12
 ---
 
-Conversation traces let the Nod team at n8n see how Nod handles real requests, so they can find and fix problems. They're off until you turn them on. Nod removes personal details on the machine running your assistant before sending a trace.
+Conversation traces let the Nod team at n8n see how Nod handles real requests, so they can find and fix problems. They're off until you turn them on. Nod masks secret values of at least eight characters that it knows, known secret formats and personal details it recognizes before sending a trace. Short secret values and other private content can remain.
 
 This page describes n8n's trace service, used by official desktop builds. A server operator can configure another receiver; that receiver controls access and retention.
 
@@ -26,20 +26,30 @@ The switch is separate from **Share usage data**, and you can turn either on wit
 
 While the switch is on, each request Nod makes to your model becomes one trace, from chats, tasks, helpers and background checks.
 
-| Sent, after scrubbing                                                                                                           | Never sent                                                                              |
-| ------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| The messages and tool results the model saw for that request, including text Nod read from [local files](/connect/local-files/) | Your account, installation or device identifier                                         |
-| Nod's instructions, without your saved memory, learned skills and formats                                                       | Images, which become `[image]`                                                          |
-| The names of the tools the model could use                                                                                      | Saved passwords, codes and cards, which Nod's model never sees                          |
-| The model's reply                                                                                                               | Checks of emails that may give access to an account                                     |
-| The model name, token counts and cost                                                                                           | Requests to decision services                                                           |
-|                                                                                                                                 | Separate requests to the models that write your memory, writing style or learned skills |
-|                                                                                                                                 | Its attention and review tasks, and any codemode step                                   |
-| Whether it came from chat, a task, a helper or a background check                                                               | Your usage analytics, which have their own switch                                       |
+Each trace can include, after redaction:
+
+- The messages and tool results the model saw, including text Nod read from [local files](/connect/local-files/).
+- Nod's instructions, without your saved memory, learned skills and formats.
+- The names of the tools the model could use.
+- The model's reply, name, token counts and cost.
+- Whether the request came from chat, a task, a helper or a background check.
+
+Nod excludes:
+
+- The original Nod session ID in trace metadata.
+- Images, which become `[image]`.
+- Checks of emails that may give access to an account.
+- Requests to decision services.
+- Separate requests to the models that write your memory, writing style or learned skills.
+- Attention and review tasks.
+- Codemode scripts and results.
+- Usage analytics, which have their own switch.
 
 Each trace includes the Nod version as `app_version` metadata when a valid release version or source revision is available.
 
 When available, a trace also records the observed request phase. A prepared payload does not prove that the request reached the provider. This field contains no transport headers or request content.
+
+The `request_kind` field distinguishes a one-token cache-warming request (`cache_warm`) from a regular request (`regular`). Regular requests include background checks. Neither kind proves that an owner received a useful result. Older traces without the field have an unknown kind.
 
 n8n's service sees the sending machine's IP address when it receives a trace. For a self-hosted assistant, that is the server's address. It doesn't add the address to the trace.
 
@@ -47,21 +57,21 @@ n8n's service sees the sending machine's IP address when it receives a trace. Fo
 
 Every trace passes through these layers on the machine running your assistant before it's sent.
 
-| Layer                       | What it removes                                                                                     | How it decides                                               |
-| --------------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| Known secrets               | Keys you saved, model and app keys, Nod's own tokens, and text shaped like a key, token or password | The exact values Nod knows, plus known key formats           |
-| Secret fields               | The value of fields such as `password`, `token` or `api_key` in tool arguments and app data         | The field name                                               |
-| Your name                   | The name on each app account you connected, such as Gmail or Slack, in full or in part              | An exact match                                               |
-| Your home folder            | The path of your user folder, which often contains your name, becomes `~`                           | An exact match                                               |
-| Nod's IDs                   | Task, message, connection and file IDs in messages and tool results                                 | The ID format; each gets a keyed hash that changes daily     |
-| Email addresses             | Every address, and the name written beside one, as in `Jane Doe <jane@example.com>`                 | The address format                                           |
-| Phone numbers               | Numbers that are valid in a country's numbering plan, using your region for local formats           | Google's libphonenumber rules                                |
-| Payment cards               | Card numbers from Visa, Mastercard, American Express and other issuers                              | The issuer prefix and the Luhn checksum                      |
-| Bank accounts               | IBANs                                                                                               | The country's length and the IBAN checksum                   |
-| Crypto wallets              | Bitcoin and Ethereum addresses                                                                      | The Bitcoin address checksum, or the Ethereum address format |
-| ID numbers                  | US Social Security, Spanish DNI and NIE, UK National Insurance, Brazilian CPF and Indian Aadhaar    | Each format's check digit or rules                           |
-| Network addresses           | IPv4, IPv6 and MAC addresses                                                                        | Address validation                                           |
-| Personal fields in app data | The value of fields such as `first_name`, `displayName`, `birthday`, `address` or `phone`           | The field name, whatever the value's type                    |
+| Layer                       | What it removes                                                                                     | How it decides                                                    |
+| --------------------------- | --------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Known secrets               | Keys you saved, model and app keys, Nod's own tokens, and text shaped like a key, token or password | Known values of at least eight characters, plus known key formats |
+| Secret fields               | The value of fields such as `password`, `token` or `api_key` in tool arguments and app data         | The field name                                                    |
+| Your name                   | The name on each app account you connected, such as Gmail or Slack, in full or in part              | An exact match                                                    |
+| Your home folder            | The path of your user folder, which often contains your name, becomes `~`                           | An exact match                                                    |
+| Nod's IDs                   | Task, message, connection and file IDs in messages and tool results                                 | The ID format; each gets a keyed hash that changes daily          |
+| Email addresses             | Every address, and the name written beside one, as in `Jane Doe <jane@example.com>`                 | The address format                                                |
+| Phone numbers               | Numbers that are valid in a country's numbering plan, using your region for local formats           | Google's libphonenumber rules                                     |
+| Payment cards               | Card numbers from Visa, Mastercard, American Express and other issuers                              | The issuer prefix and the Luhn checksum                           |
+| Bank accounts               | IBANs                                                                                               | The country's length and the IBAN checksum                        |
+| Crypto wallets              | Bitcoin and Ethereum addresses                                                                      | The Bitcoin address checksum, or the Ethereum address format      |
+| ID numbers                  | US Social Security, Spanish DNI and NIE, UK National Insurance, Brazilian CPF and Indian Aadhaar    | Each format's check digit or rules                                |
+| Network addresses           | IPv4, IPv6 and MAC addresses                                                                        | Address validation                                                |
+| Personal fields in app data | The value of fields such as `first_name`, `displayName`, `birthday`, `address` or `phone`           | The field name, whatever the value's type                         |
 
 Here's a synthetic request before and after scrubbing, for an owner called Marta in Spain:
 
@@ -75,20 +85,20 @@ He can call me on 612 345 678 or at the office, 203.0.113.42. Thanks, Marta
 He can call me on [phone] or at the office, [ip]. Thanks, [owner]
 ```
 
-The invoice number stays, because it isn't personal. Checks that need a valid number, such as the card checksum, keep ordinary numbers like order IDs and dates.
+The invoice number stays because it does not match these redaction rules.
 
 :::caution[Removal is automatic]
-Nod removes what it can recognize. A trace can still contain personal details written in other forms, such as another person's name in a sentence, a delivery address on a shopping page or other people's messages in an app such as Slack. Turn traces on only if you're comfortable with that.
+Nod removes what it can recognize. A trace can still contain private content in other forms, such as a short or unrecognized secret, account or device ID, another person's name, a delivery address or other people's messages in an app such as Slack. Turn traces on only if you're comfortable with that.
 :::
 
 ## How traces are pseudonymised
 
-- **No account or device ID.** A trace carries no account, installation or device identifier, and no analytics ID.
-- **IDs that expire.** The traces of one conversation are grouped under a random ID so the team can read them in order. A conversation is one chat, task or background check, and it gets a new ID after 30 minutes without a request to the model or when Nod restarts. Nod's own IDs on a trace and inside messages and tool results get a keyed hash that changes every day and whenever Nod restarts. Its key stays with the assistant, so these IDs alone don't link traces to you, to other conversations or to other Nod data such as feedback reports. Other content can still connect traces, such as a website address, a document link or an account handle.
+- **Session metadata.** Nod removes its original session ID from trace metadata and replaces its turn and run IDs with keyed hashes. Account or device IDs in conversation text or app results can remain.
+- **IDs that change.** The traces of one conversation are grouped under a random ID so the team can read them in order. A conversation is one chat, task or background check, and it gets a new ID after 30 minutes without a request to the model or when Nod restarts. Nod's own IDs on a trace and inside messages and tool results get a keyed hash that changes every day and whenever Nod restarts. The key stays with the assistant and hides the original IDs. Repeated IDs can still link traces within the same runtime and UTC day. Other content can also connect traces, such as a website address, a document link or an account handle.
 - **No owner context.** Nod replaces your saved memory, learned skills and format preferences with `[owner context omitted]`, including memory notes and learned skills it reads with a tool. Those reads keep only their action, such as `memory_read`, not the note path, search words or skill name. The attention and review tasks that read your saved memory are not traced at all, and a codemode step keeps neither its script nor its result, because a script can read memory or a connected account.
 - **No images.** Images are replaced with `[image]`.
 
-These steps remove the direct links to you. Traces are still pseudonymised, not anonymous: what a conversation says can identify you, for example a detail the scrubber doesn't recognize.
+These steps reduce direct links to you. Traces are still pseudonymised, not anonymous: what a conversation says can identify you, for example a detail the scrubber doesn't recognize.
 
 ## Where traces go
 

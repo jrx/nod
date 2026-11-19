@@ -617,6 +617,41 @@ export function createComposioProvider(options: {
           );
         }
       },
+      async offers(action, signal) {
+        actionToolkit(action);
+        const response = await client
+          .getClient()
+          .toolRouter.session.executeMeta(
+            value.sessionId,
+            {
+              slug: 'COMPOSIO_GET_TOOL_SCHEMAS',
+              arguments: { tool_slugs: [action], include: ['input_schema'] },
+            },
+            { signal, maxRetries: 0 },
+          )
+          .catch((error: unknown) => {
+            if (
+              error instanceof APIError &&
+              error.status === 404 &&
+              (error.error as { error?: unknown } | undefined)?.error === 'not_found'
+            )
+              return undefined;
+            throw error;
+          });
+        signal?.throwIfAborted();
+        if (!response) return false;
+        const missing = z.object({ not_found: z.array(z.string()).optional() });
+        const answer = z
+          .object({ data: missing.extend({ data: missing.optional() }) })
+          .safeParse(response);
+        return !(
+          answer.success &&
+          [
+            ...(answer.data.data.not_found ?? []),
+            ...(answer.data.data.data?.not_found ?? []),
+          ].includes(action)
+        );
+      },
       async execute(action, args, accountId, signal) {
         signal?.throwIfAborted();
         const toolkit = actionToolkit(action);
@@ -641,6 +676,13 @@ export function createComposioProvider(options: {
                 { status: 403 },
               );
             }
+            if (error instanceof APIError && error.status === 404)
+              throw Object.assign(
+                new Error(
+                  `The connection service answered ${action} with HTTP ${error.message}. If this action name did not come from SEARCH_TOOLS, find the exact name there before calling it again.`,
+                ),
+                { status: 404 },
+              );
             const kind = error instanceof Error ? error.constructor.name : '';
             const reason =
               kind === 'APIConnectionTimeoutError'

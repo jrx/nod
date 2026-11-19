@@ -47,6 +47,8 @@ How Nod counts usage depends on how you pay for the model.
 | A ChatGPT plan                                                                                                     | API-price estimate of what your plan covered | Doesn't count | Counts at API prices |
 | A model with no price, such as an [OpenAI-compatible server](/connect/local-models/), a free model or a token plan | **No price**                                 | Doesn't count | Doesn't count        |
 
+If Nod cannot save usage for a completed model request, voice reply, or transcription, it keeps the result and holds the unsaved usage in memory. Nod tries to save it before another model request, voice reply, or transcription. If that save fails, the new request stops. Saving usage again does not repeat completed work or an app action. If Nod restarts before it saves the usage, that usage can be lost from Usage and monthly-limit accounting.
+
 Costs are Nod's estimates from each model's API price. Your provider's bill is the final word. Any request whose API price Nod doesn't know shows **No price**, on a ChatGPT plan too, as does a voice reply or transcription without a known price.
 
 ## Set a monthly limit
@@ -94,7 +96,7 @@ In **Usage**, select the preparation allowance to change it. You can also say "S
 
 The allowance covers email privacy checks, source reviews, the observer, and tasks Nod starts from those changes. Plan usage counts toward preparation only at a known positive API-price estimate. A plan request without a known price does not start. Plan usage does not count toward the normal monthly spending limit. Your chat requests, schedules, and tasks keep their normal limits.
 
-Nod reserves an estimated maximum before each model request. Parallel requests share the same allowance. A request that cannot fit does not start. Usage shows held funds when the final cost is not yet recorded. An unknown model price blocks automatic preparation. All-zero prices also block it, because those values can mean that the price is unknown. Automatic preparation cannot generate speech. Request audio in chat.
+Nod reserves an estimated maximum before each model request. Parallel requests share the same allowance. A request that cannot fit does not start. Usage shows held funds when the final cost is not yet recorded. An unknown model price blocks automatic preparation. All-zero prices also block it, because those values can mean that the price is unknown. While a model it would use has no price, preparation doesn't start, and **Settings → Notifications** names that model. To turn it back on, choose a priced model in **Settings → Models**. Automatic preparation cannot generate speech. Request audio in chat.
 
 Conservative bounds can pause preparation before its recorded spending reaches the allowance. Preparation can continue next month, or after you raise the allowance. Your normal monthly limit and task check-ins still apply.
 

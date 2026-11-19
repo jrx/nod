@@ -31,15 +31,20 @@ import { artifactView, localArtifacts, type ArtifactService } from './artifacts.
 import {
   activeHandoffSql,
   activeThread,
+  chatRecovery,
   ownerStarted,
   pendingAnswerChoicesSql,
   reactToAssistantMessage,
   resetThread,
+  restartChatContext,
+  clearChatContext,
   resumeAfterHandoff,
   stopSignal,
+  messageIntakeSignal,
   stopThread,
   submitUserMessage,
 } from './thread.ts';
+import { reactionReplySql } from './turn-chain.ts';
 import { isMessageReaction } from '../shared/emoji.ts';
 import { accessKey, registerLocalAccess } from './access.ts';
 import { logFailure, withFailureLog, type FailureLogSink } from './failure-log.ts';
@@ -61,15 +66,11 @@ import { registerWorkAdmission, type WorkAdmission } from './work-admission.ts';
 import { registerAnalyticsRoutes, snapshotAnalytics, type CaptureAnalytics } from './analytics.ts';
 import { messagePreview } from './message-preview.ts';
 
-const reactionReplySql = (alias: 'm' | 'target') =>
-  `EXISTS (SELECT 1 FROM turns reaction_turn
-    WHERE reaction_turn.owner_id=${alias}.owner_id AND reaction_turn.message_id=${alias}.id
-      AND starts_with(reaction_turn.source_id,'reaction-reply:'))`;
 const messageFields = `m.id,m.role,m.text,CASE WHEN m.role='user' THEN m.display_text END AS "displayText",m.audio_caption AS "audioCaption",m.turn_id AS "turnId",m.created_at AS "createdAt",m.attachments,m.stream_id AS "streamId",m.reaction,m.assistant_reaction AS "assistantReaction",m.reply_to_message_id AS "replyToMessageId",m.suggestions,m.presentation,m.answer_choices AS "answerChoices",(${pendingAnswerChoicesSql}) AS "answerChoicesPending",
  (m.role='user' AND (m.approval_answer IS NOT NULL OR (m.question_answer IS NOT NULL AND m.text<>'' AND jsonb_array_length(m.attachments)=0))) AS "cardAnswer",
  CASE WHEN m.role='assistant' AND m.answer_choices IS NOT NULL THEN (SELECT json_build_object('answer',a.question_answer,'text',a.text) FROM messages a
    WHERE a.reply_to_message_id=m.id AND a.owner_id=m.owner_id AND a.role='user' AND a.question_answer IS NOT NULL AND a.text<>'' AND jsonb_array_length(a.attachments)=0 ORDER BY a.created_at,a.id LIMIT 1) END AS "choiceAnswer",
- CASE WHEN m.role='assistant' THEN (SELECT json_build_object('id',a.id,'status',a.status,'action',a.action,'title',a.title,'args',a.args,'active',u.status IN ('running','waiting'),'executionActive',e.status IN ('queued','running','waiting')) FROM approvals a
+ CASE WHEN m.role='assistant' THEN (SELECT json_build_object('id',a.id,'status',a.status,'action',a.action,'title',a.title,'args',a.args,'failure',CASE WHEN a.status IN ('expired','uncertain') AND jsonb_typeof(a.result->'error')='string' THEN a.result->>'error' END,'active',u.status IN ('running','waiting'),'executionActive',e.status IN ('queued','running','waiting')) FROM approvals a
    JOIN turns u ON u.id=a.turn_id AND u.owner_id=a.owner_id LEFT JOIN turns e ON e.id=a.execution_turn_id AND e.owner_id=a.owner_id
    WHERE a.confirmation_message_id=m.id AND a.owner_id=m.owner_id LIMIT 1) END AS "approval",
  CASE WHEN m.role='assistant' AND (m.answer_choices IS NOT NULL OR EXISTS (SELECT 1 FROM approvals a WHERE a.confirmation_message_id=m.id AND a.owner_id=m.owner_id))
@@ -96,6 +97,7 @@ type ApprovalRow = {
   title?: string | null;
   active: boolean;
   executionActive: boolean | null;
+  failure?: string | null;
 };
 type ChoiceAnswerRow = { answer: unknown; text: string };
 
@@ -165,6 +167,7 @@ function messageView(row: MessageRow): Message {
           approval: {
             id: approval.id,
             state: approvalState(approval),
+            ...(approval.failure ? { failure: approval.failure } : {}),
             ...approvalTitle(approval.action),
             ...(approval.title ? { title: approval.title } : {}),
             ...approvalContent(approval.action, approval.args),
@@ -250,6 +253,10 @@ export async function createApp(dependencies: AppDependencies = {}) {
     forceCloseConnections: true,
   });
   const streams = new Set<ServerResponse>();
+  const browserFrameAcks = new Map<
+    string,
+    { turnId: string; browserId: string; acknowledge(): void }
+  >();
   if (dependencies.failureLog)
     app.addHook('onRequest', (_request, _reply, done) =>
       withFailureLog(dependencies.failureLog!, done),
@@ -339,10 +346,16 @@ export async function createApp(dependencies: AppDependencies = {}) {
   app.get('/api/configuration', async () => publicConfiguration());
   app.get('/api/state', async () => {
     const thread = await activeThread(pool);
+    const cleared = (
+      await pool.query<{ at: string | null }>(
+        `SELECT to_char(chat_cleared_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS at FROM threads WHERE id=$1 AND owner_id=$2`,
+        [thread.id, ownerId],
+      )
+    ).rows[0]?.at;
     const messageRows = pool.query(
-      `SELECT ${messageFields} FROM (SELECT m.* FROM messages m WHERE m.owner_id=$1 AND m.thread_id=$2 AND m.hidden_at IS NULL AND ${chatMessageSql} ORDER BY date_trunc('milliseconds',m.created_at) DESC,m.id DESC LIMIT 151) m
+      `SELECT ${messageFields} FROM (SELECT m.* FROM messages m WHERE m.owner_id=$1 AND m.thread_id=$2 AND m.hidden_at IS NULL AND m.created_at>=COALESCE($3::timestamptz,'-infinity') AND ${chatMessageSql} ORDER BY date_trunc('milliseconds',m.created_at) DESC,m.id DESC LIMIT 151) m
          LEFT JOIN messages target ON target.id=m.reply_to_message_id AND target.owner_id=m.owner_id AND target.hidden_at IS NULL ORDER BY date_trunc('milliseconds',m.created_at),m.id`,
-      [ownerId, thread.id],
+      [ownerId, thread.id, cleared ?? null],
     );
     const hiddenMetadata = messageRows.then(({ rows }) =>
       pool.query<{ count: number; ids: string[]; visibleIds: string[] }>(
@@ -355,27 +368,35 @@ export async function createApp(dependencies: AppDependencies = {}) {
         [ownerId, thread.id, rows.map((message) => message.id)],
       ),
     );
-    const [messages, hiddenMessages, turns, pendingChoices, verificationRequests, activity] =
-      await Promise.all([
-        messageRows,
-        hiddenMetadata,
-        pool.query(
-          `SELECT ${turnFields} FROM turns u WHERE u.owner_id=$1 AND u.thread_id=$2 ORDER BY u.created_at DESC LIMIT 50`,
-          [ownerId, thread.id],
-        ),
-        pool.query<{ id: string }>(
-          `SELECT m.id FROM turns waiting JOIN LATERAL (
+    const [
+      messages,
+      hiddenMessages,
+      turns,
+      pendingChoices,
+      verificationRequests,
+      activity,
+      recovery,
+    ] = await Promise.all([
+      messageRows,
+      hiddenMetadata,
+      pool.query(
+        `SELECT ${turnFields} FROM turns u WHERE u.owner_id=$1 AND u.thread_id=$2 ORDER BY u.created_at DESC LIMIT 50`,
+        [ownerId, thread.id],
+      ),
+      pool.query<{ id: string }>(
+        `SELECT m.id FROM turns waiting JOIN LATERAL (
           SELECT m.* FROM messages m WHERE m.turn_id=waiting.id AND m.owner_id=waiting.owner_id
             AND m.thread_id=waiting.thread_id AND m.role='assistant' AND m.hidden_at IS NULL
           ORDER BY m.created_at DESC,m.id DESC LIMIT 1
         ) m ON true
         WHERE waiting.owner_id=$1 AND waiting.thread_id=$2 AND waiting.status='waiting'
           AND waiting.waiting_reason='question' AND ${pendingAnswerChoicesSql}`,
-          [ownerId, thread.id],
-        ),
-        dependencies.verification?.pending() ?? [],
-        dependencies.activity?.() ?? [],
-      ]);
+        [ownerId, thread.id],
+      ),
+      dependencies.verification?.pending() ?? [],
+      dependencies.activity?.() ?? [],
+      chatRecovery(thread.id),
+    ]);
     const hasEarlierMessages = messages.rows.length > 150;
     const visibleIds = new Set(hiddenMessages.rows[0]!.visibleIds);
     const visibleMessages = messages.rows
@@ -389,6 +410,8 @@ export async function createApp(dependencies: AppDependencies = {}) {
     const planning = dependencies.planningTasks?.();
     return {
       threadId: thread.id,
+      ...(cleared ? { chatClearedAt: cleared } : {}),
+      ...(recovery ? { chatRecovery: recovery } : {}),
       tasks: await dependencies.taskLedger?.(),
       hasEarlierMessages,
       hiddenMessageCount: hiddenMessages.rows[0]!.count,
@@ -477,7 +500,7 @@ export async function createApp(dependencies: AppDependencies = {}) {
     const rows = await pool.query(
       `SELECT ${messageFields} FROM messages m
       LEFT JOIN messages target ON target.id=m.reply_to_message_id AND target.owner_id=m.owner_id AND target.hidden_at IS NULL
-      WHERE m.owner_id=$1 AND m.thread_id=$4 AND m.hidden_at IS NULL AND ${chatMessageSql} AND ($2::timestamptz IS NULL OR date_trunc('milliseconds',m.created_at) < $2 OR (date_trunc('milliseconds',m.created_at) = $2 AND $3::uuid IS NOT NULL AND m.id < $3))
+      WHERE m.owner_id=$1 AND m.thread_id=$4 AND m.hidden_at IS NULL AND m.created_at>=COALESCE((SELECT chat_cleared_at FROM threads WHERE id=$4 AND owner_id=$1),'-infinity') AND ${chatMessageSql} AND ($2::timestamptz IS NULL OR date_trunc('milliseconds',m.created_at) < $2 OR (date_trunc('milliseconds',m.created_at) = $2 AND $3::uuid IS NOT NULL AND m.id < $3))
       ORDER BY date_trunc('milliseconds',m.created_at) DESC,m.id DESC LIMIT 61`,
       [ownerId, query.before ?? null, query.beforeId ?? null, thread.id],
     );
@@ -515,6 +538,13 @@ export async function createApp(dependencies: AppDependencies = {}) {
       return reset;
     }, threadId);
   });
+  app.post('/api/conversation/restart-context', async (request) => {
+    const { threadId, turnId } = z
+      .object({ threadId: z.uuid(), turnId: z.uuid() })
+      .strict()
+      .parse(request.body);
+    return restartChatContext(threadId, turnId);
+  });
   app.post('/api/messages', textMessageOptions, async (request) => {
     const arrival = stopSignal();
     const input = messageInput
@@ -534,6 +564,20 @@ export async function createApp(dependencies: AppDependencies = {}) {
       )
       .parse(request.body);
     const clientMessageId = input.clientMessageId ?? randomUUID();
+    if (
+      input.text.trim().toLowerCase() === '/clear' &&
+      (!input.questionAnswer ||
+        ('custom' in input.questionAnswer && input.questionAnswer.custom === true)) &&
+      !input.approvalAnswer &&
+      !input.verificationRequestId
+    ) {
+      if (input.attachmentIds.length)
+        throw Object.assign(new Error('Send /clear as a text message without attachments.'), {
+          statusCode: 400,
+        });
+      return clearChatContext(input.threadId, clientMessageId);
+    }
+    const signal = await messageIntakeSignal(arrival, input);
     const verification =
       (input.questionAnswer && !('custom' in input.questionAnswer)) || input.approvalAnswer
         ? undefined
@@ -541,6 +585,7 @@ export async function createApp(dependencies: AppDependencies = {}) {
             ...input,
             clientMessageId,
             channel: 'web',
+            signal,
           });
     if (verification) return verification;
     if (input.verificationRequestId)
@@ -570,6 +615,7 @@ export async function createApp(dependencies: AppDependencies = {}) {
         replyQuote: input.replyQuote,
         seenMessageId: input.seenMessageId,
         threadId: input.threadId,
+        chatClearedAt: input.chatClearedAt,
         clientMessageId,
         questionAnswer: input.questionAnswer,
         approvalAnswer: input.approvalAnswer,
@@ -757,7 +803,9 @@ export async function createApp(dependencies: AppDependencies = {}) {
   app.get('/api/browser-handoff/stream', async (request, reply) => {
     const view = dependencies.computer?.view;
     if (!view) return reply.code(404).send({ error: 'The browser is unavailable.' });
-    const { turnId } = z.object({ turnId: z.uuid() }).parse(request.query);
+    const { turnId, view: viewId } = z
+      .object({ turnId: z.uuid(), view: z.string().min(1).max(120).optional() })
+      .parse(request.query);
     const browserId = await handoffBrowser(turnId);
     if (!browserId) return reply.code(423).send({ error: handoffClosed });
     const controller = new AbortController();
@@ -822,12 +870,28 @@ export async function createApp(dependencies: AppDependencies = {}) {
       while (!next.done && !controller.signal.aborted) {
         const length = Buffer.alloc(4);
         length.writeUInt32BE(next.value.length);
+        let acknowledge: Promise<void> | undefined;
+        if (viewId) {
+          acknowledge = new Promise<void>((resolve) => {
+            const finish = () => {
+              if (browserFrameAcks.get(viewId)?.acknowledge === finish)
+                browserFrameAcks.delete(viewId);
+              controller.signal.removeEventListener('abort', finish);
+              resolve();
+            };
+            browserFrameAcks.set(viewId, { turnId, browserId, acknowledge: finish });
+            controller.signal.addEventListener('abort', finish, { once: true });
+            if (controller.signal.aborted) finish();
+          });
+        }
         reply.raw.write(length);
         if (!reply.raw.write(next.value))
           await new Promise((resolve) => {
             reply.raw.once('drain', resolve);
             reply.raw.once('close', resolve);
           });
+        await acknowledge;
+        if (controller.signal.aborted) break;
         next = await frames.next();
         if (next.done && !controller.signal.aborted) {
           frames = open();
@@ -842,6 +906,19 @@ export async function createApp(dependencies: AppDependencies = {}) {
       void frames.return?.().catch(() => {});
       if (reply.raw.headersSent) reply.raw.end();
     }
+  });
+  app.post('/api/browser-handoff/frame-ack', async (request, reply) => {
+    const { turnId, view } = z
+      .object({ turnId: z.uuid(), view: z.string().min(1).max(120) })
+      .strict()
+      .parse(request.body);
+    const pending = browserFrameAcks.get(view);
+    if (!pending || pending.turnId !== turnId)
+      return reply.code(409).send({ error: 'The browser frame is no longer waiting.' });
+    if ((await handoffBrowser(turnId)) !== pending.browserId)
+      return reply.code(423).send({ error: handoffClosed });
+    pending.acknowledge();
+    return { ok: true };
   });
   app.post('/api/browser-handoff', async (request, reply) => {
     const body = z

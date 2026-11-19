@@ -81,8 +81,8 @@ export function SetupProgress({
           {line && <p className="setup-progress-meta">{line}</p>}
         </div>
         {error && details && (
-          <details className="setup-progress-details" open data-analytics-private>
-            <summary>Technical details</summary>
+          <details className="setup-progress-details" data-analytics-private>
+            <summary>Details</summary>
             <pre>{details}</pre>
           </details>
         )}

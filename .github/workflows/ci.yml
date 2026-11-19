@@ -18,40 +18,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  scope:
-    name: Select checks for changed files
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 5
-    outputs:
-      types: ${{ steps.scope.outputs.types }}
-      build: ${{ steps.scope.outputs.build }}
-      integration: ${{ steps.scope.outputs.integration }}
-      desktop: ${{ steps.scope.outputs.desktop }}
-      macos: ${{ steps.scope.outputs.macos }}
-      windows: ${{ steps.scope.outputs.windows }}
-      n8n: ${{ steps.scope.outputs.n8n }}
-      evals: ${{ steps.scope.outputs.evals }}
-      images: ${{ steps.scope.outputs.images }}
-      network: ${{ steps.scope.outputs.network }}
-      ci: ${{ steps.scope.outputs.ci }}
-      test_files: ${{ steps.scope.outputs.test_files }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
-        with:
-          node-version: '24.21.0'
-      - name: Read the changed paths
-        id: scope
-        env:
-          CI_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || '' }}
-        run: node .github/scripts/ci-scope.mjs
-
   notes:
     name: Delete Git notes
-    needs: scope
+    needs: checks
     if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -68,38 +37,166 @@ jobs:
               echo "Deleted $ref"
             done
 
-  quality:
-    name: Formatting, types and client build
-    needs: scope
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
+  checks:
+    name: Checks, tests and build
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 15
+    outputs:
+      types: ${{ steps.scope.outputs.types }}
+      build: ${{ steps.scope.outputs.build }}
+      integration: ${{ steps.scope.outputs.integration }}
+      desktop: ${{ steps.scope.outputs.desktop }}
+      macos: ${{ steps.scope.outputs.macos }}
+      windows: ${{ steps.scope.outputs.windows }}
+      n8n: ${{ steps.scope.outputs.n8n }}
+      evals: ${{ steps.scope.outputs.evals }}
+      images: ${{ steps.scope.outputs.images }}
+      network: ${{ steps.scope.outputs.network }}
+      ci: ${{ steps.scope.outputs.ci }}
+      test_files: ${{ steps.scope.outputs.test_files }}
+      desktop_test_files: ${{ steps.scope.outputs.desktop_test_files }}
+      quality_checks: ${{ steps.scope.outputs.quality_checks }}
+      format_files: ${{ steps.scope.outputs.format_files }}
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: nod
+          POSTGRES_PASSWORD: nod-ci
+          POSTGRES_DB: nod_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U nod -d nod_ci"
+          --health-interval 1s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      CI: 'true'
+      TEST_DATABASE_URL: postgresql://nod:nod-ci@127.0.0.1:5432/nod_ci
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: ${{ (github.head_ref == 'release/desktop' || github.ref == 'refs/heads/release/desktop') && '0' || '1' }}
+          fetch-depth: ${{ (github.head_ref == 'release/desktop' || github.ref == 'refs/heads/release/desktop') && '0' || '2' }}
           persist-credentials: false
-      - name: Install tooling and dependencies
+      - name: Install tooling and dependencies once
         uses: ./.github/actions/setup-node
-      - name: Check CI selection and required results
-        run: node --test .github/scripts/ci-scope.test.mjs
-      - name: Check formatting
-        run: pnpm run format:check
-      - name: Check types and import boundaries
-        if: needs.scope.outputs.types == 'true'
-        run: pnpm run lint
-      - name: Build the web and desktop clients
-        if: needs.scope.outputs.build == 'true'
-        run: pnpm exec vite build && node desktop/scripts/build-ui.mjs
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: .local/ci-test-timings
+          key: ci-test-timings-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ci-test-timings-v2-
+            ci-test-timings-v1-
+      - name: Select tests with the installed tools
+        id: scope
+        env:
+          CI_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || '' }}
+          CI_TEST_TIMINGS: .local/ci-test-timings
+        run: node .github/scripts/ci-scope.mjs
+      - name: Require valid check selection
+        shell: node {0}
+        env:
+          CI_SCOPE_RESULT: ${{ steps.scope.outcome }}
+          CI_SCOPE: ${{ toJSON(steps.scope.outputs) }}
+        run: |
+          if (process.env.CI_SCOPE_RESULT !== 'success')
+            throw new Error('CI could not select the required checks.');
+          const scope = JSON.parse(process.env.CI_SCOPE);
+          for (const name of ['types', 'build', 'integration', 'desktop', 'macos', 'windows', 'n8n', 'evals', 'images', 'network', 'ci']) {
+            if (!['true', 'false'].includes(scope[name]))
+              throw new Error(`The ${name} scope is missing or invalid.`);
+          }
+      - name: Prepare the browser fixture without building an image
+        if: steps.scope.outputs.integration == 'true'
+        shell: bash
+        run: |
+          missing=()
+          for program in Xvfb xauth xdotool ffmpeg; do
+            command -v "$program" >/dev/null || missing+=("${program,,}")
+          done
+          if (( ${#missing[@]} )); then
+            sudo apt-get update -qq
+            sudo apt-get install --yes --no-install-recommends "${missing[@]}"
+          fi
+          if ! command -v chromium >/dev/null; then
+            chrome="$(command -v google-chrome || command -v google-chrome-stable)"
+            sudo ln -s "$chrome" /usr/bin/chromium
+          fi
+          sudo ln -s "$PWD" /app
+          mkdir -p "$RUNNER_TEMP/integration-timings"
+      - name: Install desktop tooling without downloading Electron
+        if: steps.scope.outputs.desktop == 'true'
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: pnpm --dir desktop install --frozen-lockfile
+      - name: Run checks in parallel with shared setup
+        shell: bash
+        env:
+          NOD_FORMAT_FILES: ${{ steps.scope.outputs.format_files }}
+          NOD_CHECK_LINT: ${{ contains(fromJSON(steps.scope.outputs.quality_checks), 'lint') }}
+          NOD_CHECK_TYPES: ${{ steps.scope.outputs.types }}
+          NOD_CHECK_BUILD: ${{ steps.scope.outputs.build }}
+          NOD_CHECK_INTEGRATION: ${{ steps.scope.outputs.integration }}
+          NOD_CHECK_DESKTOP: ${{ steps.scope.outputs.desktop }}
+          NOD_CHECK_EVALS: ${{ steps.scope.outputs.evals }}
+          NOD_CHECK_N8N: ${{ steps.scope.outputs.n8n }}
+          NOD_CHECK_NETWORK: ${{ steps.scope.outputs.network }}
+          NOD_TEST_FILES: ${{ steps.scope.outputs.test_files }}
+          NOD_DESKTOP_TEST_FILES: ${{ steps.scope.outputs.desktop_test_files }}
+          NOD_TEST_TIMINGS: ${{ runner.temp }}/integration-timings/1.json
+          NOD_TEST_NATIVE_DOWNLOAD: 'true'
+          NOD_TEST_BROWSER_EXECUTABLE: /usr/bin/chromium
+          NOD_DESKTOP_RELEASE_ACCEPTANCE: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
+        run: |
+          pids=()
+          (node --test .github/scripts/ci-scope.test.mjs && node .github/scripts/ci-scope.mjs --format) &
+          pids+=("$!")
+          pnpm run check:apps &
+          pids+=("$!")
+          if [[ "$NOD_CHECK_LINT" == true ]]; then
+            pnpm run lint &
+            pids+=("$!")
+          fi
+          if [[ "$NOD_CHECK_TYPES" == true ]]; then
+            pnpm run typecheck &
+            pids+=("$!")
+          fi
+          if [[ "$NOD_CHECK_BUILD" == true || "$NOD_CHECK_INTEGRATION" == true ]]; then
+            (pnpm exec vite build && node desktop/scripts/build-ui.mjs &&
+              if [[ "$NOD_CHECK_INTEGRATION" == true ]]; then node scripts/test-integration.mjs --run; fi) &
+            pids+=("$!")
+          fi
+          if [[ "$NOD_CHECK_DESKTOP" == true ]]; then
+            node .github/scripts/ci-scope.mjs --desktop-tests &
+            pids+=("$!")
+          fi
+          if [[ "$NOD_CHECK_EVALS" == true ]]; then
+            (pnpm --dir evals run check && pnpm --dir evals test) &
+            pids+=("$!")
+          fi
+          if [[ "$NOD_CHECK_N8N" == true ]]; then
+            node --test deployment/n8n/*.test.mjs &
+            pids+=("$!")
+          fi
+          if [[ "$NOD_CHECK_NETWORK" == true ]]; then
+            sudo env NOD_TEST_RUNTIME_NETWORK=1 "$(command -v node)" --test --test-name-pattern='workload firewall refresh' desktop/test/runtime-assets.test.mjs &
+            pids+=("$!")
+          fi
+          status=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || status=1
+          done
+          exit "$status"
       - name: Check the release version and source
         if: >-
-          (github.event_name == 'pull_request' &&
-           github.head_ref == 'release/desktop' &&
-           github.event.pull_request.head.repo.full_name == github.repository) ||
+          (github.event_name == 'pull_request' && github.head_ref == 'release/desktop' &&
+          github.event.pull_request.head.repo.full_name == github.repository) ||
           github.ref == 'refs/heads/release/desktop'
         run: node .github/scripts/prepare-desktop-release.mjs --check
-      - name: Install verified actionlint 1.7.12
-        if: needs.scope.outputs.ci == 'true'
+      - name: Check workflow syntax and expressions
+        if: steps.scope.outputs.ci == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -107,154 +204,32 @@ jobs:
           gh release download v1.7.12 --repo rhysd/actionlint --pattern actionlint_1.7.12_linux_amd64.tar.gz --output "$RUNNER_TEMP/actionlint.tar.gz"
           printf '%s  %s\n' '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' "$RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --status
           tar --extract --gzip --file "$RUNNER_TEMP/actionlint.tar.gz" --directory "$RUNNER_TEMP/actionlint" actionlint
-      - name: Check workflow syntax and expressions
-        if: needs.scope.outputs.ci == 'true'
-        run: >-
-          "$RUNNER_TEMP/actionlint/actionlint" -shellcheck= -pyflakes=
-          -ignore 'label "blacksmith-.*" is unknown'
-          -ignore 'unexpected key "queue" for "concurrency" section'
-
-  integration:
-    name: Linux integration tests
-    needs: scope
-    if: needs.scope.outputs.integration == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:17-alpine
+          "$RUNNER_TEMP/actionlint/actionlint" -shellcheck= -pyflakes= -ignore 'label "blacksmith-.*" is unknown' -ignore 'unexpected key "queue" for "concurrency" section'
+      - name: Save test file times
+        if: always() && steps.scope.outputs.integration == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: integration-timings-1
+          path: ${{ runner.temp }}/integration-timings/*.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Merge test file times
+        if: success() && steps.scope.outputs.integration == 'true'
         env:
-          POSTGRES_USER: nod
-          POSTGRES_PASSWORD: nod-ci
-          POSTGRES_DB: nod_ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -h 127.0.0.1 -U nod -d nod_ci"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
-    env:
-      CI: 'true'
-      TEST_DATABASE_URL: postgresql://nod:nod-ci@127.0.0.1:5432/nod_ci
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+          CI_TEST_TIMINGS: .local/ci-test-timings
+          CI_NEW_TEST_TIMINGS: ${{ runner.temp }}/integration-timings
+        run: node .github/scripts/ci-tests.mjs
+      - name: Cache test times for later runs
+        if: success() && steps.scope.outputs.integration == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
-          persist-credentials: false
-      - name: Set up the integration image cache
-        uses: useblacksmith/setup-docker-builder@06dd9c83a5d541274d2e3ac67625560979275267
-        with:
-          cache-key: n8n-io/nod/ci-integration
-      - name: Build the integration fixture
-        run: docker buildx build --load --platform linux/amd64 --file scripts/Dockerfile.integration --tag nod-ci-integration .
-      - name: Build the web fixture and run the selected tests
-        env:
-          NOD_TEST_FILES: ${{ needs.scope.outputs.test_files }}
-        run: >-
-          docker run --rm --network host --shm-size=1g
-          --env TEST_DATABASE_URL
-          --env NOD_TEST_FILES
-          --env NOD_TEST_NATIVE_DOWNLOAD=true
-          --env NOD_TEST_BROWSER_EXECUTABLE=/usr/bin/chromium
-          --volume "$PWD/src:/app/src:ro"
-          --volume "$PWD/tests:/app/tests:ro"
-          --volume "$PWD/scripts:/app/scripts:ro"
-          --volume "$PWD/public:/app/public:ro"
-          --volume "$PWD/desktop/main:/app/desktop/main:ro"
-          --volume "$PWD/desktop/preload:/app/desktop/preload:ro"
-          --volume "$PWD/desktop/ui:/app/desktop/ui:ro"
-          --volume "$PWD/deployment/self-host:/app/deployment/self-host:ro"
-          --volume "$PWD/tsconfig.json:/app/tsconfig.json:ro"
-          --volume "$PWD/vite.config.ts:/app/vite.config.ts:ro"
-          --volume "$PWD/index.html:/app/index.html:ro"
-          --tmpfs /app/.local:uid=1000,gid=1000
-          --tmpfs /app/dist:uid=1000,gid=1000
-          --tmpfs /app/node_modules/.vite-temp:uid=1000,gid=1000
-          --init --entrypoint sh nod-ci-integration
-          -c 'node_modules/.bin/vite build && node scripts/test-integration.mjs --run'
-
-  desktop:
-    name: Desktop contracts and network isolation
-    needs: scope
-    if: needs.scope.outputs.desktop == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 15
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Install tooling and dependencies
-        uses: ./.github/actions/setup-node
-      - name: Install desktop tooling without downloading Electron
-        env:
-          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-        run: pnpm --dir desktop install --frozen-lockfile
-      - name: Check desktop lifecycle, storage and release contracts
-        run: pnpm run desktop:test
-      - name: Check desktop network isolation during restart
-        if: needs.scope.outputs.network == 'true'
-        run: >-
-          sudo env NOD_TEST_RUNTIME_NETWORK=1 "$(command -v node)"
-          --test --test-name-pattern='workload firewall refresh'
-          desktop/test/runtime-assets.test.mjs
-
-  evals:
-    name: Eval harness contracts
-    needs: scope
-    if: needs.scope.outputs.evals == 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 10
-    services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: nod
-          POSTGRES_PASSWORD: nod-ci
-          POSTGRES_DB: nod_ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -h 127.0.0.1 -U nod -d nod_ci"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
-    env:
-      CI: 'true'
-      TEST_DATABASE_URL: postgresql://nod:nod-ci@127.0.0.1:5432/nod_ci
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Install tooling and dependencies
-        uses: ./.github/actions/setup-node
-      - name: Check the eval harness with disposable schemas
-        run: |
-          pnpm --dir evals run check
-          pnpm --dir evals test
-
-  n8n:
-    name: n8n delivery contracts
-    needs: scope
-    if: needs.scope.outputs.n8n == 'true'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 10
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Install tooling and dependencies
-        uses: ./.github/actions/setup-node
-      - name: Check n8n delivery contracts
-        run: node --test deployment/n8n/*.test.mjs
+          path: .local/ci-test-timings
+          key: ci-test-timings-v2-${{ github.run_id }}-${{ github.run_attempt }}
 
   images:
     name: Container and self-host checks
-    needs: scope
-    if: needs.scope.outputs.images == 'true'
+    needs: checks
+    if: needs.checks.outputs.images == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 25
     steps:
@@ -275,11 +250,11 @@ jobs:
           docker buildx build --load --platform linux/amd64 --file deployment/self-host/Dockerfile --tag nod-server:ci .
           docker tag nod-ci-browser nod-browser:ci
           docker tag nod-ci-workspace nod-workspace:ci
-      - name: Check workspace egress in source and self-host deployments
-        if: needs.scope.outputs.images == 'true'
+      - name: Check workspace egress and command recovery in the workspace image
+        if: needs.checks.outputs.images == 'true'
         env:
           NOD_TEST_WORKSPACE_IMAGE: nod-ci-workspace
-        run: pnpm exec tsx --test --test-name-pattern='workspace egress' tests/sandbox.test.ts
+        run: pnpm exec tsx --test --test-name-pattern='workspace egress|fully detached' tests/sandbox.test.ts
       - name: Verify the single-user server deployment and token rotation
         env:
           NOD_IMAGE_TAG: ci
@@ -289,28 +264,10 @@ jobs:
       - name: Verify automatic RTK savings and unfiltered exports
         run: node --import tsx scripts/eval-rtk.ts --smoke --image nod-ci-workspace
 
-  checks:
-    name: Checks, tests and build
-    needs: [scope, quality, integration, desktop, macos, windows, n8n, evals, images, secrets]
-    if: ${{ !cancelled() }}
-    runs-on: blacksmith-2vcpu-ubuntu-2404
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
-        with:
-          node-version: '24.21.0'
-      - name: Require every selected check to pass
-        env:
-          CI_NEEDS: ${{ toJSON(needs) }}
-        run: node .github/scripts/ci-scope.mjs --require-checks
-
   macos:
     name: macOS native identity and updates (${{ matrix.arch }})
-    needs: scope
-    if: needs.scope.outputs.macos == 'true'
+    needs: checks
+    if: needs.checks.outputs.macos == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -349,8 +306,8 @@ jobs:
 
   windows:
     name: Windows setup and installer
-    needs: scope
-    if: needs.scope.outputs.windows == 'true'
+    needs: checks
+    if: needs.checks.outputs.windows == 'true'
     runs-on: windows-2025
     timeout-minutes: 35
     env:

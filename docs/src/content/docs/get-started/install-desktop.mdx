@@ -77,7 +77,7 @@ You need Windows 11 x64. A local assistant also needs WSL
 
 1. Download the latest [Windows x64 installer](https://github.com/n8n-io/nod/releases/latest/download/nod-Setup-x64.exe) from GitHub.
 
-2. Run `nod-Setup-x64.exe`. Windows shows n8n GmbH as the publisher, though SmartScreen can still warn about a new release. The installer adds Nod to the Start menu.
+2. Run `nod-Setup-x64.exe`. Windows shows n8n GmbH as the publisher, though SmartScreen can still warn about a new release. The installer installs Nod for your Windows account and opens it. It adds Nod to the Start menu. An existing installation keeps its current folder.
 
 3. At Welcome, choose **Connect to a server** to use an existing assistant, or **Get started** to start a local one. Local setup offers an optional email connection, a few optional questions about you, a model if none works yet, a choice about conversation traces, which also says basic usage data is shared by default for new owners and can be turned off in **Settings → Privacy & data**, and an optional email address for updates about Nod and other n8n products, with its own consent checkbox. Discord and forum links are also in **Settings → General**. Other apps can be connected later from the first chat or **Apps**. Nod tries to turn on **Open at login** when local setup finishes. If the operating system blocks this setting, setup still finishes. After the first chat introduction, choose **Enable notifications** if you want Nod to alert you while you’re away. Windows notification settings control delivery. You can change these preferences later in Settings.
 
@@ -161,11 +161,23 @@ On Linux, quit Nod, then download, check, and install the next bundle with the [
 
 Nod checks for updates after it starts, every six hours while it's open, and after your computer wakes if a check is due. Checks continue when an update is already downloaded, so a newer release can replace it before you restart.
 
+Downloads run in the background. If a check fails, Nod retries after one minute. Further failures increase the wait, up to 15 minutes. Waking your computer also retries a failed check. On Windows, interrupted downloads keep their saved bytes across retries and app launches. Nod checks complete files before it uses them again. It downloads a local runtime pack only when that pack changed.
+
 To check now, select **Check for Updates…** in the **Nod** menu on a Mac, or from the menu bar or tray icon. This stays available alongside **Restart to update** when an update is ready. While a check or download runs, its menu item shows progress and restart waits until it finishes.
+
+If an update check, preparation or download fails, the app shows the failed step and its error reason. You can keep using Nod. Select **Try again** to check and download again, or **Retry restart** if a downloaded update could not restart Nod. A restart retry uses the downloaded update. Select **Download Nod** to open the official installation page in your browser. It does not install or restart Nod. **Dismiss** hides the same automatic failure during this app session. A different failure appears again. Automatic checks keep their retry timing and do not open an error dialog. A manual check or restart also offers the download page in its error dialog.
+
+If installation fails after Nod has stopped, a dialog shows the error reason. **Retry installation** uses the downloaded update. **Download Nod** opens the official installation page and quits the stopped app. **Quit without updating** closes the app. Your data stays in place.
 
 Newer Nod builds show an in-app notice when an update finishes downloading. It names the new version and offers **Restart to update** or **Later**. Select **Release notes** in the notice to open that version's GitHub release page in your browser. **Later** hides the notice for that version during the current app session; **Restart to update** stays in the menu. Older builds may show only the menu action, so use **Check for Updates…** there to check immediately. If Nod is in the middle of a task, it asks before restarting, and you can ask it to continue afterwards. While it shuts down to install, Nod shows **Updating Nod…**, then opens again where you left it, with any unsent message still in the box. Nod keeps your profile, keys and data. A completed installation does not repeat onboarding after an update.
 
-On Windows, the restart runs the new installer in the background and opens Nod again when it's done.
+On a Mac, the new version can take a minute or two to open after the window closes, because macOS copies and checks the new app first. If you open Nod during that time, it closes again right away and the new version opens when the install finishes.
+
+Nod 0.8.4 and earlier on a Mac cancel the update when you open them while it installs, so Nod opens on the old version again. Select **Restart to update** once more and wait until Nod opens by itself. If it still opens on the old version, quit Nod and run the [Terminal installer](#install-nod). It keeps your profile, keys and data.
+
+A ready update also installs when you choose **Quit Nod**. Nod stays closed until you open it again. On Windows, the installer runs in the background after Nod stops. On a Mac, the native updater applies the downloaded update after exit. Closing the window keeps Nod running and does not install an update. To use the update now, choose **Restart to update**. On Windows, this runs the installer in the background and opens Nod again when it finishes.
+
+Nod versions before 0.7.0 on Windows can't install their own updates. Restarting to update closes Nod without installing, and the next start offers the same update again. Quit Nod from the tray icon, then download and run the latest [Windows x64 installer](https://github.com/n8n-io/nod/releases/latest/download/nod-Setup-x64.exe). It installs over the old version and keeps your profile, keys and data. Later updates install from the app.
 
 Updating a connected desktop client does not update its server. Follow [Server operations](/deploy/server-operations/) to update the server separately.
 
@@ -201,14 +213,17 @@ If you deleted Nod's folders by hand, Nod removes the private computer they leav
 
 ## Troubleshooting
 
-| Problem                                                 | Try this                                                                                                                                                                                                                                            |
-| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS blocks the first launch                           | Install the newest release. On a managed Mac, ask your IT team to allow Nod.                                                                                                                                                                        |
-| Setup stops with an error                               | Select **Try again**. If it fails again, send the error with **Send feedback…** from the menu bar or tray icon.                                                                                                                                     |
-| Nod asks for a runtime file                             | Select **Choose runtime file** and pick the `nod-Runtime-…` file from the same release.                                                                                                                                                             |
-| Windows can't download the runtime                      | Put `nod-Runtime-win32-x64.tar.gz` from the same release next to `nod-Setup-x64.exe` and run the installer again.                                                                                                                                   |
-| Windows downloads the same update again after a restart | Nod 0.6.2 and earlier can't install updates on Windows. Quit Nod from the tray icon, then download and run the [newest Windows installer](https://github.com/n8n-io/nod/releases/latest/download/nod-Setup-x64.exe) once. Your data stays in place. |
-| A scheduled task didn't run                             | Check that the machine running your assistant was awake and Nod was running. For a remote assistant, check the server.                                                                                                                              |
+If a setup error shows **Details**, select it to read more information.
+
+| Problem                                                 | Try this                                                                                                                                                                                                                                                               |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| macOS blocks the first launch                           | Install the newest release. On a managed Mac, ask your IT team to allow Nod.                                                                                                                                                                                           |
+| Setup stops with an error                               | Select **Try again**, or **Report bug** to restart Nod and open a report once it's back. If Nod can't restart, select **Show startup log**. When connected to a server, select **Reconnect to server**.                                                                |
+| Nod asks for a runtime file                             | Select **Choose runtime file** and pick the `nod-Runtime-…` file from the same release.                                                                                                                                                                                |
+| Windows can't download the runtime                      | Put `nod-Runtime-win32-x64.tar.gz` from the same release next to `nod-Setup-x64.exe` and run the installer again.                                                                                                                                                      |
+| Windows downloads the same update again after a restart | Nod 0.6.2 and earlier can't install updates on Windows. Quit Nod from the tray icon, then download and run the [newest Windows installer](https://github.com/n8n-io/nod/releases/latest/download/nod-Setup-x64.exe) once. Your data stays in place.                    |
+| A Mac update opens the old version again                | Nod 0.8.4 and earlier cancel an update when you open them while it installs. Select **Restart to update** and wait until Nod opens by itself. If it still opens on the old version, quit Nod and run the [Terminal installer](#install-nod). Your data stays in place. |
+| A scheduled task didn't run                             | Check that the machine running your assistant was awake and Nod was running. For a remote assistant, check the server.                                                                                                                                                 |
 
 ### A failed Mac update blocks a new install
 
@@ -226,7 +241,7 @@ After a failed update, the ShipIt update job can stay loaded. A new copy of Nod 
 
 3. Download the newest DMG from the [releases page](https://github.com/n8n-io/nod/releases). Replace the copy in **Applications**, then open it.
 
-These commands remove only the update job and its cache. They keep your profile, conversations, saved keys and private computer. If Nod still does not open, [send feedback](/deploy/troubleshooting/#send-feedback-with-a-diagnostic-report).
+These commands remove only the update job and its cache. They keep your profile, conversations, saved keys and private computer. If Nod still does not open, [report a bug](/deploy/troubleshooting/#report-a-bug-with-a-diagnostic-report).
 
 :::caution
 Don't delete the profile or the private computer to fix a problem. You'd lose your conversations, workspace and saved keys.

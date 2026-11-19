@@ -120,7 +120,15 @@ function useApproval(approval: MessageApproval, disabled: boolean, onAnswer?: An
   };
 }
 
-function ApprovalStatus({ state, sends = false }: { state: ApprovalState; sends?: boolean }) {
+function ApprovalStatus({
+  state,
+  sends = false,
+  notRun = false,
+}: {
+  state: ApprovalState;
+  sends?: boolean;
+  notRun?: boolean;
+}) {
   return (
     <span className="action-card-status" data-state={state} role="status">
       {state === 'working' && <LoaderCircle size={16} className="spin" aria-hidden="true" />}
@@ -136,7 +144,9 @@ function ApprovalStatus({ state, sends = false }: { state: ApprovalState; sends?
             : 'Done'
           : state === 'declined'
             ? 'Cancelled'
-            : 'Expired'}
+            : notRun
+              ? 'Not run'
+              : 'Expired'}
     </span>
   );
 }
@@ -207,12 +217,23 @@ export function ApprovalChoiceCard({
         <div className="choice-card-list" role="group" aria-label="Your answer">
           <div className="choice-card-row choice-card-chosen">
             {state !== 'expired' && <ChoiceBadge index={chosen} on />}
-            <ChoiceCopy label={state === 'expired' ? 'Expired' : rows[chosen]!} />
+            <ChoiceCopy
+              label={
+                state === 'expired' ? (approval.failure ? 'Not run' : 'Expired') : rows[chosen]!
+              }
+            />
             {(state === 'working' || state === 'done') && <ApprovalStatus state={state} />}
           </div>
         </div>
       )}
       {state === 'uncertain' && <UncertainNote app={approval.app} />}
+      {approval.failure && (
+        <div className="choice-card-footer">
+          <p className="choice-card-error" role="alert">
+            {approval.failure}
+          </p>
+        </div>
+      )}
       {error && (
         <div className="choice-card-footer">
           <p className="choice-card-error" role="alert">
@@ -263,12 +284,21 @@ export function ApprovalCard({ approval, disabled = false, onAnswer, children }:
           <UncertainNote app={approval.app} />
         ) : (
           <div className="action-card-footer">
-            <ApprovalStatus state={state} sends={verb === 'Send'} />
+            <ApprovalStatus
+              state={state}
+              sends={verb === 'Send'}
+              notRun={Boolean(approval.failure)}
+            />
           </div>
         )
       }
     >
       {children}
+      {approval.failure && (
+        <p className="action-card-error" role="alert">
+          {approval.failure}
+        </p>
+      )}
     </ActionCard>
   );
 }

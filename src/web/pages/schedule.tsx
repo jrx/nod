@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { CalendarClock, LoaderCircle, Play, Sparkles } from '../components/icons';
+import { CalendarClock, LoaderCircle, Play, Sparkles, Square } from '../components/icons';
 import type { Schedule, ScheduleHistory, ScheduleRun } from '../../shared/contracts';
 import { StatusIcon, statusLabels } from '../components/turn-status';
 import { usePageData } from '../hooks/use-page-data';
@@ -31,6 +31,7 @@ export function ScheduleRow({
   const [showRuns, setShowRuns] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [runError, setRunError] = useState('');
   const [resultTurnId, setResultTurnId] = useState<string>();
   const pendingRun = useRef<{ requestId: string; expectedRevision: number } | null>(null);
@@ -47,6 +48,8 @@ export function ScheduleRow({
     !schedule.enabled &&
     schedule.lastRun &&
     Boolean(schedule.runAt && Date.parse(schedule.runAt) <= Date.now());
+  const questionMessageId =
+    schedule.activeRun?.status === 'waiting' ? schedule.activeRun.questionMessageId : null;
   const runLabel = starting
     ? 'Starting…'
     : schedule.activeRun
@@ -100,6 +103,47 @@ export function ScheduleRow({
       }
     }
   }
+  async function stopRun() {
+    const turnId = schedule.activeRun?.turnId;
+    if (working.current || !turnId) return;
+    working.current = true;
+    setStopping(true);
+    setRunError('');
+    const accountVersion = requestAccountVersion();
+    try {
+      await api(
+        `${schedulesPath}/${encodeURIComponent(schedule.id)}/runs/${encodeURIComponent(turnId)}/stop`,
+        {
+          method: 'POST',
+          signal: AbortSignal.timeout(45_000),
+        },
+      );
+      if (accountVersion !== requestAccountVersion()) return;
+      pageDataCache.update<Schedule[]>(
+        schedulesPath,
+        (items) =>
+          items?.map((item) =>
+            item.id === schedule.id && item.activeRun?.turnId === turnId
+              ? { ...item, activeRun: null }
+              : item,
+          ) ?? null,
+      );
+    } catch (cause) {
+      if (accountVersion === requestAccountVersion())
+        setRunError(
+          uncertainScheduleMutation(cause)
+            ? `Could not confirm that this run stopped. ${errorMessage(cause)} Check its status before trying again.`
+            : errorMessage(cause),
+        );
+    } finally {
+      working.current = false;
+      setStopping(false);
+      if (accountVersion === requestAccountVersion()) {
+        pageDataCache.revalidateActive('/api/schedule-runs');
+        void pageDataCache.refresh(schedulesPath, true);
+      }
+    }
+  }
   return (
     <article className="saved-plan">
       <div className="saved-plan-title">
@@ -144,11 +188,24 @@ export function ScheduleRow({
             <Button
               variant="outline"
               size="sm"
-              disabled={starting || Boolean(schedule.activeRun) || change.busy || change.uncertain}
+              disabled={
+                starting ||
+                Boolean(schedule.activeRun && !questionMessageId) ||
+                change.busy ||
+                change.uncertain
+              }
               aria-label={`${runLabel} for ${schedule.title}`}
               aria-busy={starting}
               aria-live="polite"
-              onClick={() => void runNow()}
+              onClick={() => {
+                if (questionMessageId)
+                  window.dispatchEvent(
+                    new CustomEvent('nod:focus-message', {
+                      detail: { messageId: questionMessageId },
+                    }),
+                  );
+                else void runNow();
+              }}
             >
               {starting ? (
                 <LoaderCircle size={16} className="spin" aria-hidden="true" />
@@ -159,6 +216,23 @@ export function ScheduleRow({
               )}
               {runLabel}
             </Button>
+            {schedule.activeRun && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={stopping || starting}
+                aria-label={`Stop this run for ${schedule.title}`}
+                aria-busy={stopping}
+                onClick={() => void stopRun()}
+              >
+                {stopping ? (
+                  <LoaderCircle size={16} className="spin" aria-hidden="true" />
+                ) : (
+                  <Square size={16} aria-hidden="true" />
+                )}
+                {stopping ? 'Stopping…' : 'Stop this run'}
+              </Button>
+            )}
             <ScheduleEditor schedule={schedule} change={change} />
             <Button
               variant="ghost"

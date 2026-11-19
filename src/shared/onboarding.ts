@@ -98,7 +98,7 @@ export type SuggestedTask = {
   title: string;
   source: string;
   kind?: 'now' | 'ongoing';
-  origin?: 'learned' | 'common';
+  origin?: 'learned' | 'common' | 'fixed';
 };
 export type TaskSuggestions = {
   intro: string;
