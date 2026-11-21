@@ -60,7 +60,6 @@ jobs:
             desktop/pnpm-lock.yaml
       - name: Install build tools and Flatpak runtimes
         run: |
-          sudo add-apt-repository --yes ppa:flatpak/stable
           sudo apt-get update
           sudo apt-get install -y dbus flatpak flatpak-builder python3-dbusmock zstd
           if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then

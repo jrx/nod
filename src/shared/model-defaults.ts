@@ -56,6 +56,7 @@ export const memoryModels: Partial<Record<ModelProvider, string>> = {
 export function defaultModel(provider: ModelProvider, models: ModelChoice[], method?: ModelMethod) {
   if (provider === 'amazon-bedrock' && models.length > 1) return undefined;
   const preferred =
+    (provider === 'openai' && models.find((model) => model.id === 'gpt-6.2-sol')) ||
     (method === 'subscription' && models.find((model) => model.id === 'gpt-6-sol')) ||
     models.find((model) => model.id === agentModels[provider]);
   if (preferred || provider === 'google') return preferred;

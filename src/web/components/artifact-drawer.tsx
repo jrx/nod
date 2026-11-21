@@ -11,6 +11,7 @@ import {
 } from 'react';
 import {
   Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CodeXml,
@@ -506,19 +507,23 @@ function ArtifactDrawer({
           <div className="artifact-drawer-title">
             <h2>
               {items.length > 1 ? (
-                <Tooltip content={current.name}>
-                  <select
-                    aria-label="Choose a file"
-                    value={current.id}
-                    onChange={(event) => onSelect(event.target.value)}
-                  >
-                    {items.map((item) => (
-                      <option value={item.id} key={item.id}>
-                        {item.name}
-                      </option>
-                    ))}
-                  </select>
-                </Tooltip>
+                <span className="artifact-drawer-picker">
+                  <span aria-hidden="true">{current.name}</span>
+                  <ChevronDown size={12} aria-hidden="true" />
+                  <Tooltip content={current.name}>
+                    <select
+                      aria-label="Choose a file"
+                      value={current.id}
+                      onChange={(event) => onSelect(event.target.value)}
+                    >
+                      {items.map((item) => (
+                        <option value={item.id} key={item.id}>
+                          {item.name}
+                        </option>
+                      ))}
+                    </select>
+                  </Tooltip>
+                </span>
               ) : (
                 <Tooltip content={current.name}>
                   <span>{current.name}</span>

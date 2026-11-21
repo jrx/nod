@@ -1,4 +1,5 @@
-import { post } from './api';
+import type { AppSetupStatus } from '../../shared/contracts';
+import { api, post } from './api';
 
 const loopback = new Set(['localhost', '127.0.0.1', '[::1]']);
 
@@ -47,4 +48,18 @@ export function cancelSetup(url: string) {
   void setupLinkHash(url)
     .then((hash) => post('/api/apps/setup-cancel', { hash }))
     .catch(() => {});
+}
+
+export async function readSetup(url: string, signal?: AbortSignal) {
+  const hash = await setupLinkHash(url);
+  const result = await api<AppSetupStatus>('/api/apps/setup-status', {
+    method: 'POST',
+    body: JSON.stringify({ hashes: [hash], pairingUrl: url }),
+    signal: AbortSignal.any([AbortSignal.timeout(10_000), ...(signal ? [signal] : [])]),
+    cache: 'no-store',
+  });
+  return {
+    completed: result.completed.includes(hash),
+    app: result.apps.find((app) => app.hash === hash),
+  };
 }

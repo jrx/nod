@@ -1,0 +1,20 @@
+{
+  "$schema": "https://nod.n8n.io/docs/schemas/apps/v1/app.schema.json",
+  "displayName": "Notion",
+  "icon": "./io.n8n.nod/icon.svg",
+  "categories": ["Productivity"],
+  "connection": {
+    "type": "mcp",
+    "server": "notion",
+    "authentication": ["oauth2"]
+  },
+  "prompts": [
+    "Find the project plan and summarize its open decisions.",
+    "Turn these notes into a draft page for my project."
+  ],
+  "requirements": ["A Notion account with access to the pages you want to use."],
+  "limitations": [
+    "Notion permissions limit the pages and workspaces this connection can access.",
+    "This app does not start automatic monitoring from its MCP connection alone."
+  ]
+}

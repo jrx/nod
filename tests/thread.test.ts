@@ -7,7 +7,7 @@ import {
 } from '../src/shared/answer-choices.ts';
 import assert from 'node:assert/strict';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -25,17 +25,25 @@ import {
   type FeedbackReceipt,
   type FeedbackSubmission,
 } from '../src/shared/feedback.ts';
-import { ModelRequestError, type RuntimeContext, type RuntimeResult } from '../src/ports/agent.ts';
+import {
+  ContextLimitError,
+  ModelRequestError,
+  OutputLimitError,
+  ToolFailureError,
+  type RuntimeContext,
+  type RuntimeResult,
+} from '../src/ports/agent.ts';
 import type { ConnectedApp } from '../src/ports/integrations.ts';
 import type { MemoryCurator } from '../src/ports/memory-curator.ts';
 import { ObjectStoreConflict, type PrivateObjectStore } from '../src/ports/object-storage.ts';
-import { createAgentRuntime } from '../src/runtime/index.ts';
+import { createAgentRuntime, webTarget } from '../src/runtime/index.ts';
 import { compactOwnerContext, firstInstruction, ownerContext } from '../src/runtime/prompt.ts';
 import { createPreferencesStore } from '../src/server/preferences.ts';
 import type { ThreadDependencies } from '../src/server/thread.ts';
 import type {
   Artifact,
   Connection,
+  Message,
   SubmitMessageResponse,
   Task,
   Turn,
@@ -417,7 +425,6 @@ test(
     vault.registerRoutes(app);
     createAccountSession({
       accounts,
-      origin: `http://localhost:${port}`,
       localUser: { id: ownerId, name: 'You', email: null, avatarUrl: null },
       start: () => onboarding.complete(),
     }).register(app);
@@ -487,7 +494,7 @@ test(
 
     let limitReached = false;
     const interruptedText = 'Synthetic interrupted turn.';
-    const modelErrors = new Map<string, string>();
+    const modelErrors = new Map<string, string | ModelRequestError>();
     let beforeRuntimeFailure = async (_context: RuntimeContext) => {};
     let presentInterruption: NonNullable<ThreadDependencies['present']> = async () =>
       interruptedText;
@@ -602,6 +609,12 @@ test(
           return { status: 'succeeded' };
         }
         if (context.prompt === 'limit race fixture') throw new Error(spendingLimitReached);
+        if (context.prompt === 'unexpected failure fixture')
+          throw new Error('Synthetic runtime failure.');
+        if (context.prompt === 'output limit fixture')
+          throw new OutputLimitError('Synthetic output limit.');
+        if (context.prompt === 'tool refusal fixture')
+          throw new ToolFailureError('The bash tool failed five times. Trust refused the command.');
         if (context.prompt.startsWith('session-fixture')) {
           await sessionGates.get(context.prompt);
           return { status: 'succeeded' };
@@ -693,7 +706,8 @@ test(
           stagedReads.set(context.prompt, await readFile(context.attachments[0].path, 'utf8'));
         workspaceListings.set(context.prompt, await readdir(context.workspacePath));
         const modelError = modelErrors.get(context.prompt);
-        if (modelError) throw new ModelRequestError(modelError);
+        if (modelError)
+          throw typeof modelError === 'string' ? new ModelRequestError(modelError) : modelError;
         if (context.prompt === 'runtime-failure') {
           await beforeRuntimeFailure(context);
           throw Object.assign(new Error('Synthetic runtime failure for private-fixture'), {
@@ -1619,6 +1633,7 @@ test(
           { channel: 'telegram:fixture', sourceId, replyToMessageId: targetId },
           {
             answer: async () => undefined,
+            close: async () => {},
             accept: async () => {
               enter();
               await proceed;
@@ -2598,6 +2613,113 @@ test(
         }
       });
 
+      await t.test('task checks exclude withdrawn requests from model input', async (t) => {
+        await waitFor(settledThread);
+        const previousChecks = dependencies.taskChecks;
+        dependencies.taskChecks = undefined;
+        t.after(() => {
+          dependencies.taskChecks = previousChecks;
+        });
+        for (const [status, withdrawn, copied] of [
+          ['succeeded', false, false],
+          ['cancelled', false, false],
+          ['cancelled', true, false],
+          ['failed', true, false],
+          ['succeeded', false, true],
+        ] as const) {
+          await t.test(`${status}, withdrawn=${withdrawn}, copied=${copied}`, async () => {
+            const id = randomUUID();
+            const turnId = randomUUID();
+            const messageId = randomUUID();
+            const prompt = `Synthetic task request ${id}`;
+            await db.pool.query(
+              `INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,background,started_at,finished_at,withdrawn,message_id)
+               VALUES($1,$2,$3,$4,'user',$5,$6,true,now(),now(),$7,$8)`,
+              [turnId, ownerId, threadId, id, prompt, status, withdrawn, messageId],
+            );
+            await db.pool.query(
+              "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'user',$5)",
+              [messageId, ownerId, threadId, turnId, prompt],
+            );
+            if (copied) {
+              const original = randomUUID();
+              await db.pool.query(
+                `INSERT INTO turns(id,owner_id,thread_id,session_id,source,prompt,status,background,started_at,finished_at,withdrawn)
+                 VALUES($1,$2,$3,$4,'user',$5,'failed',true,now()-interval '1 minute',now()-interval '1 minute',true)`,
+                [original, ownerId, threadId, id, prompt],
+              );
+              await db.pool.query(
+                "UPDATE turns SET source='resume',parent_turn_id=$2,prompt=$3,message_id=NULL WHERE id=$1",
+                [turnId, original, `Synthetic old check\nThe request was: ${prompt}`],
+              );
+              await db.pool.query('UPDATE messages SET turn_id=$2 WHERE id=$1', [
+                messageId,
+                original,
+              ]);
+            }
+            await db.pool.query(
+              `INSERT INTO tasks(id,owner_id,turn_id,session_id,title,done_when,now_text,next_check)
+               VALUES($1,$2,$3,$1,'Synthetic tracked work','Synthetic reply arrived','Waiting',date_trunc('milliseconds',now())-interval '1 minute')`,
+              [id, ownerId, turnId],
+            );
+            t.after(async () => {
+              await request('POST', `/api/tasks/${id}/stop`);
+              await db.pool.query('UPDATE turns SET task_id=NULL WHERE session_id=$1', [id]);
+              await db.pool.query('DELETE FROM tasks WHERE id=$1', [id]);
+            });
+            await Promise.all([tasks.resumeDue(threadId), tasks.resumeDue(threadId)]);
+            const checks = (
+              await db.pool.query<{ id: string; prompt: string; parent_turn_id: string }>(
+                "SELECT id,prompt,parent_turn_id FROM turns WHERE session_id=$1 AND source_id LIKE 'task-check:%'",
+                [id],
+              )
+            ).rows;
+            assert.equal(checks.length, 1);
+            const check = checks[0]!;
+            assert.equal(check.parent_turn_id, turnId);
+            assert.equal(check.prompt.includes(prompt), !withdrawn && !copied);
+            await waitFor(settled(check.id));
+            const context = ran(check.id)!;
+            assert.equal(context.sessionId, id);
+            assert.equal(context.prompt.includes(prompt), !withdrawn && !copied);
+            assert.equal(
+              context.history.some(({ text }) => text === prompt),
+              !withdrawn && !copied,
+            );
+            if (withdrawn)
+              assert.equal(context.withdrawnRequest, status === 'failed' ? 'failed' : 'stopped');
+            const saved = (
+              await db.pool.query('SELECT next_check,state FROM tasks WHERE id=$1', [id])
+            ).rows[0];
+            assert.equal(saved.next_check, null);
+            assert.equal(saved.state, 'open');
+            const detail = await request('GET', '/api/tasks');
+            assert.equal(detail.statusCode, 200);
+            assert.equal(JSON.stringify(detail.json()).includes(prompt), false);
+            if (copied) {
+              const renewed = randomUUID();
+              const renewedPrompt = 'Synthetic new owner request';
+              await db.pool.query(
+                `INSERT INTO turns(id,owner_id,thread_id,session_id,parent_turn_id,source,prompt,status,background,started_at,finished_at)
+                 VALUES($1,$2,$3,$4,$5,'user',$6,'succeeded',true,now(),now())`,
+                [renewed, ownerId, threadId, id, check.id, renewedPrompt],
+              );
+              await thread.resumeTurn(renewed, `synthetic-renewed:${id}`, 'Synthetic new check');
+              const next = (
+                await db.pool.query<{ id: string; prompt: string }>(
+                  'SELECT id,prompt FROM turns WHERE source_id=$1',
+                  [`synthetic-renewed:${id}`],
+                )
+              ).rows[0]!;
+              assert.equal(next.prompt.includes(renewedPrompt), true);
+              assert.equal(next.prompt.includes(prompt), false);
+              await waitFor(settled(next.id));
+              assert.equal(ran(next.id)!.prompt.includes(renewedPrompt), true);
+            }
+          });
+        }
+      });
+
       await t.test('a failed task check enqueue keeps its planned time', async (t) => {
         await waitFor(settledThread);
         const previousChecks = dependencies.taskChecks;
@@ -2727,6 +2849,65 @@ test(
         assert.equal(await turnStatus(background), 'failed');
         assert.equal(ran(background), undefined);
       });
+
+      await t.test(
+        'a failed usage check leaves queued input separate from a completed response',
+        async () => {
+          const prompt = `usage-intake-${randomUUID()}`;
+          const originalRun = dependencies.runTurn;
+          const originalLimit = dependencies.spendingLimit;
+          let unavailable = false;
+          block(prompt);
+          dependencies.spendingLimit = async () => {
+            if (unavailable) throw new Error('Synthetic usage persistence unavailable.');
+            return (await originalLimit?.()) ?? null;
+          };
+          dependencies.runTurn = async (context) => {
+            if (context.prompt !== prompt) return originalRun(context);
+            runs.push(context);
+            await waiting.get(prompt);
+            unavailable = true;
+            try {
+              assert.deepEqual(await context.takeMessages!(), []);
+            } finally {
+              unavailable = false;
+            }
+            await context.reply('The first synthetic result is complete.');
+            return { status: 'succeeded' };
+          };
+          try {
+            const first = await thread.submitUserMessage(prompt);
+            await waitFor(() => Boolean(ran(first.turnId)));
+            const queued = await thread.submitUserMessage('Keep this synthetic request separate.');
+            assert.equal(await turnStatus(queued.turnId), 'queued');
+            release(prompt);
+            await waitFor(settled(first.turnId));
+            await waitFor(settled(queued.turnId));
+            assert.equal(await turnStatus(first.turnId), 'succeeded');
+            assert.equal(await turnStatus(queued.turnId), 'succeeded');
+            assert.ok(ran(queued.turnId));
+            assert.equal(
+              (await db.pool.query('SELECT turn_id FROM messages WHERE id=$1', [queued.messageId]))
+                .rows[0].turn_id,
+              queued.turnId,
+            );
+            assert.equal(
+              (
+                await db.pool.query(
+                  "SELECT count(*)::int AS count FROM messages WHERE turn_id=$1 AND text='The first synthetic result is complete.'",
+                  [first.turnId],
+                )
+              ).rows[0].count,
+              1,
+            );
+          } finally {
+            unavailable = false;
+            release(prompt);
+            dependencies.runTurn = originalRun;
+            dependencies.spendingLimit = originalLimit;
+          }
+        },
+      );
 
       await t.test('a scheduled turn continues when cache policy lookup fails', async (t) => {
         const previous = dependencies.scheduleCache;
@@ -3019,6 +3200,29 @@ test(
           await completed(input.turnId, 'immediate', true, 'no_reply');
           const delivered = await taskTurn(input.messageId);
           await completed(delivered, 'background', true, 'reply');
+          const workOf = async (id: string) =>
+            (await request('GET', '/api/state'))
+              .json()
+              .messages.find((entry: { id: string }) => entry.id === id)?.work;
+          assert.deepEqual(await workOf(input.messageId), {
+            kind: 'task',
+            id: taskId,
+            title: 'Synthetic analytics task',
+            turnId: delivered,
+          });
+          assert.equal(await workOf(start.messageId), undefined);
+          const quoted = async (turnId: string) =>
+            (
+              (await request('GET', '/api/state')).json().messages as Array<{
+                role: string;
+                turnId: string | null;
+                replyTo?: { id: string; role: string } | null;
+              }>
+            )
+              .filter((entry) => entry.role === 'assistant' && entry.turnId === turnId)
+              .map((entry) => entry.replyTo && [entry.replyTo.id, entry.replyTo.role]);
+          assert.deepEqual(await quoted(created), [[start.messageId, 'user']]);
+          assert.deepEqual(await quoted(delivered), [[input.messageId, 'user']]);
           const continued = await thread.enqueueTurn('Synthetic task continuation', {
             source: 'resume',
             sessionId: taskId,
@@ -3196,6 +3400,85 @@ test(
           }
         },
       );
+
+      await t.test('an unexpected turn failure offers a bug report', async () => {
+        const failed = await thread.submitUserMessage('unexpected failure fixture');
+        await waitFor(settled(failed.turnId));
+        const shown = async () =>
+          (
+            await db.pool.query(
+              "SELECT presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+              [failed.turnId, `failure:${failed.turnId}`],
+            )
+          ).rows.map((row) => row.presentation);
+        await waitFor(async () => (await shown()).length === 1);
+        const card = (await shown())[0];
+        assert.equal(card.type, 'bug-report');
+        const draft = (
+          await db.pool.query('SELECT owner_id,summary FROM feedback_drafts WHERE id=$1', [
+            card.draftId,
+          ])
+        ).rows[0];
+        assert.equal(draft.owner_id, ownerId);
+        assert.equal(draft.summary, card.summary);
+        assert.doesNotMatch(draft.summary, /Synthetic runtime failure/);
+      });
+
+      await t.test('a reply cut off at its output limit offers no bug report', async () => {
+        const failed = await thread.submitUserMessage('output limit fixture');
+        await waitFor(settled(failed.turnId));
+        const shown = async () =>
+          (
+            await db.pool.query(
+              "SELECT presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+              [failed.turnId, `failure:${failed.turnId}`],
+            )
+          ).rows.map((row) => row.presentation);
+        await waitFor(async () => (await shown()).length === 1);
+        assert.equal((await shown())[0]?.type, undefined);
+        const turn = (
+          await db.pool.query('SELECT status,error,withdrawn FROM turns WHERE id=$1', [
+            failed.turnId,
+          ])
+        ).rows[0];
+        assert.deepEqual(turn, {
+          status: 'failed',
+          error: 'Synthetic output limit.',
+          withdrawn: false,
+        });
+      });
+
+      await t.test('an exhausted tool refusal reports the cause without a bug report', async () => {
+        const drafts = (await db.pool.query('SELECT count(*) FROM feedback_drafts')).rows[0].count;
+        const failed = await thread.submitUserMessage('tool refusal fixture');
+        await waitFor(settled(failed.turnId));
+        await waitFor(
+          async () =>
+            (
+              await db.pool.query(
+                "SELECT 1 FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                [failed.turnId, `failure:${failed.turnId}`],
+              )
+            ).rowCount === 1,
+        );
+        const shown = (
+          await db.pool.query(
+            "SELECT text,presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+            [failed.turnId, `failure:${failed.turnId}`],
+          )
+        ).rows;
+        assert.equal(shown.length, 1);
+        assert.match(
+          (await db.pool.query('SELECT error FROM turns WHERE id=$1', [failed.turnId])).rows[0]
+            .error,
+          /Trust refused the command/,
+        );
+        assert.equal(shown[0].presentation, null);
+        assert.equal(
+          (await db.pool.query('SELECT count(*) FROM feedback_drafts')).rows[0].count,
+          drafts,
+        );
+      });
 
       await t.test('a reached spending limit pauses all but owner messages', async (t) => {
         const raced = await thread.submitUserMessage('limit race fixture');
@@ -5243,6 +5526,7 @@ test(
             const calls: string[] = [];
             const guarded = thread.createUserMessageService({
               confirmAction: {
+                close: async () => {},
                 answer: async () => {
                   calls.push('classify');
                   return undefined;
@@ -5538,6 +5822,25 @@ test(
           );
           await thread.stopThread();
           await waitFor(settledThread);
+          await onboarding.complete('Alex');
+          assert.equal(onboarding.planning(), undefined);
+          assert.equal(
+            (
+              await db.pool.query(
+                'SELECT 1 FROM onboarding_suggestions WHERE greeted_at IS NOT NULL',
+              )
+            ).rowCount,
+            0,
+          );
+          assert.equal(
+            (
+              await db.pool.query(
+                'SELECT 1 FROM messages WHERE owner_id=$1 AND turn_id IS NULL AND role=$2',
+                [ownerId, 'assistant'],
+              )
+            ).rowCount,
+            0,
+          );
           t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-24T12:00:00Z') });
           currentApps = [
             {
@@ -6092,6 +6395,12 @@ test(
           await failing.complete('Sam');
           await failing.delivered();
           assert.deepEqual(await ownerCards(ownerId), before);
+          assert.deepEqual(
+            (await ownerCards('synthetic-other-owner'))[0].suggestions.tasks.map(
+              (task: { origin?: string }) => task.origin,
+            ),
+            ['fixed', 'fixed', 'fixed', 'common', 'common'],
+          );
           const firstGreeting = (
             await db.pool.query(
               'SELECT greeting_message_id FROM onboarding_suggestions WHERE owner_id=$1',
@@ -6249,6 +6558,786 @@ test(
             ],
           );
           planAnswer = () => null;
+        },
+      );
+
+      await t.test(
+        'a successful reply clears an earlier context failure without a restart',
+        async () => {
+          await waitFor(settledThread);
+          const question = await thread.submitUserMessage('ask-question');
+          await waitFor(settled(question.turnId));
+          const prompt = 'Synthetic context failure before a successful answer';
+          modelErrors.set(prompt, new ContextLimitError('Synthetic context window exceeded.'));
+          try {
+            const failed = await thread.submitUserMessage(prompt);
+            await waitFor(settled(failed.turnId));
+            const state = (await request('GET', '/api/state')).json();
+            assert.deepEqual(state.chatRecovery, { turnId: failed.turnId });
+            const asked = state.messages.find(
+              (message: { role: string; turnId: string }) =>
+                message.role === 'assistant' && message.turnId === question.turnId,
+            );
+            assert.ok(asked);
+            const answer = await thread.submitUserMessage('Synthetic successful answer', [], {
+              replyToMessageId: asked.id,
+            });
+            await waitFor(settled(answer.turnId));
+            assert.equal(await turnStatus(answer.turnId), 'succeeded');
+            assert.equal((await request('GET', '/api/state')).json().chatRecovery, undefined);
+            assert.equal(
+              (
+                await request('POST', '/api/conversation/restart-context', {
+                  threadId: failed.threadId,
+                  turnId: failed.turnId,
+                })
+              ).statusCode,
+              409,
+            );
+          } finally {
+            modelErrors.delete(prompt);
+          }
+        },
+      );
+
+      await t.test(
+        'clear keeps admitted task and schedule instructions while stopping chat',
+        async () => {
+          const { captureOwnerInstructions, validateOwnerInstructions } =
+            await import('../src/server/owner-instructions.ts');
+          const { turnOrigin } = await import('../src/server/approvals.ts');
+          const restriction = 'Do not publish synthetic project data.';
+          const earlier = await thread.submitUserMessage(restriction);
+          await waitFor(settled(earlier.turnId));
+          const prompt =
+            'Monitor the synthetic project for seven days and send its daily synthetic report.';
+          let task: Task | undefined;
+          let schedule: { id: string } | undefined;
+          let child: RuntimeContext | undefined;
+          let releaseMain!: () => void;
+          let releaseChild!: () => void;
+          const mainHeld = new Promise<void>((resolve) => {
+            releaseMain = resolve;
+          });
+          const childHeld = new Promise<void>((resolve) => {
+            releaseChild = resolve;
+          });
+          inspectObserver = async (context) => {
+            if (context.taskContext?.title === 'Synthetic seven-day monitor') {
+              child = context;
+              await childHeld;
+              return { status: 'succeeded' };
+            }
+            if (context.prompt === prompt) {
+              task = (await context.task!({
+                action: 'start',
+                title: 'Synthetic seven-day monitor',
+                message: 'The synthetic monitor is saved.',
+                doneWhen: 'Seven synthetic daily reports are saved.',
+                now: 'Check the synthetic project.',
+              })) as Task;
+              await mainHeld;
+              throw new ModelRequestError('Synthetic late creator failure.');
+            }
+          };
+          const creator = await thread.submitUserMessage(prompt);
+          try {
+            await waitFor(() => Boolean(task) && Boolean(child));
+            const origin = await turnOrigin(child!.turnId);
+            assert.ok(origin);
+            const capture = () =>
+              captureOwnerInstructions(
+                db.pool,
+                ownerId,
+                creator.threadId,
+                origin.messageIds,
+                task!.id,
+                new Date(0),
+                child!.turnId,
+              );
+            const before = await capture();
+            assert.ok(before?.authorizingIds.includes(creator.messageId));
+            const priorLimit = before?.words.userMessages?.find(
+              (message) => message.text === restriction,
+            );
+            assert.ok(priorLimit);
+            assert.equal(priorLimit.canAuthorize, false);
+            const args = {
+              title: 'Synthetic saved monitor',
+              prompt: 'Read the synthetic project report daily.',
+              kind: 'recurring',
+              cron: '0 9 * * *',
+              timeZone: 'UTC',
+            };
+            const chatEvidence = await captureOwnerInstructions(
+              db.pool,
+              ownerId,
+              creator.threadId,
+              [creator.messageId],
+              null,
+              new Date(0),
+              creator.turnId,
+            );
+            const prepared = await personal.prepareScheduleChange('schedule_create', args);
+            schedule = (await personal.manage('schedule_create', args, {
+              turnId: creator.turnId,
+              sourceMessageId: creator.messageId,
+              instructionChange: { ...prepared, evidence: chatEvidence!.evidence },
+            })) as { id: string };
+            const savedEvidence = (
+              await db.pool.query('SELECT authority FROM schedules WHERE id=$1', [schedule.id])
+            ).rows[0].authority;
+            await validateOwnerInstructions(db.pool, ownerId, savedEvidence);
+            const response = await request('POST', '/api/messages', {
+              threadId: creator.threadId,
+              text: '/clear',
+              clientMessageId: randomUUID(),
+            });
+            assert.equal(response.statusCode, 200, response.body);
+            await waitFor(async () => (await turnStatus(creator.turnId)) === 'cancelled');
+            assert.equal(child!.signal.aborted, false);
+            const record = (
+              await db.pool.query('SELECT state,source_message_id FROM tasks WHERE id=$1', [
+                task!.id,
+              ])
+            ).rows[0];
+            assert.equal(record.state, 'open');
+            const after = await capture();
+            await validateOwnerInstructions(db.pool, ownerId, savedEvidence);
+            assert.deepEqual(
+              after?.words.userMessages?.find((message) => message.text === restriction),
+              priorLimit,
+            );
+            releaseMain();
+            const freshPrompt = 'Give the synthetic monitor status only.';
+            block(freshPrompt);
+            const fresh = await thread.submitUserMessage(freshPrompt);
+            await waitFor(() => Boolean(ran(fresh.turnId)));
+            try {
+              const newChat = await captureOwnerInstructions(
+                db.pool,
+                ownerId,
+                creator.threadId,
+                [fresh.messageId],
+                null,
+                new Date(Date.now() - 86_400_000),
+                fresh.turnId,
+              );
+              assert.equal(newChat?.authorizingIds.includes(creator.messageId) ?? false, false);
+              assert.ok(newChat?.authorizingIds.includes(fresh.messageId));
+              const { createTrust } = await import('../src/server/trust.ts');
+              const oldGrant = await createTrust({
+                pool: db.pool,
+                ownerId,
+                review: async () => ({ run: true, because: prompt }),
+              }).check(
+                { threadId: creator.threadId, turnId: fresh.turnId },
+                'SYNTHETIC_SEND_REPORT',
+                { target: 'synthetic-report' },
+              );
+              assert.equal(oldGrant.confirm, true);
+              assert.deepEqual(
+                (
+                  await db.pool.query('SELECT status,withdrawn,error FROM turns WHERE id=$1', [
+                    creator.turnId,
+                  ])
+                ).rows[0],
+                { status: 'cancelled', withdrawn: false, error: null },
+              );
+              assert.ok((await capture())?.authorizingIds.includes(creator.messageId));
+              await validateOwnerInstructions(db.pool, ownerId, savedEvidence);
+            } finally {
+              release(freshPrompt);
+              await waitFor(settled(fresh.turnId));
+            }
+            assert.ok(
+              after?.authorizingIds.includes(creator.messageId),
+              'The active independent task lost its owner authority after /clear.',
+            );
+          } finally {
+            releaseMain();
+            releaseChild();
+            inspectObserver = undefined;
+            if (task) await request('POST', `/api/tasks/${task.id}/stop`);
+            await waitFor(settled(creator.turnId));
+            if (child) await waitFor(settled(child.turnId));
+            if (schedule) {
+              const removed = await app.inject({
+                method: 'DELETE',
+                url: `/api/schedules/${schedule.id}`,
+                headers,
+              });
+              assert.equal(removed.statusCode, 200, removed.body);
+            }
+            if (task) {
+              await db.pool.query('UPDATE turns SET task_id=NULL WHERE task_id=$1', [task.id]);
+              await db.pool.query('DELETE FROM tasks WHERE id=$1', [task.id]);
+            }
+          }
+        },
+      );
+
+      await t.test('clear keeps earlier Stop and model failure withdrawals', async (t) => {
+        const { validateOwnerInstructions } = await import('../src/server/owner-instructions.ts');
+        for (const kind of ['Stop', 'model failure'] as const) {
+          await t.test(kind, async () => {
+            await waitFor(settledThread);
+            const prompt = `Synthetic owner request before ${kind} and clear`;
+            block(prompt);
+            const submitted = await thread.submitUserMessage(prompt);
+            try {
+              await waitFor(() => Boolean(ran(submitted.turnId)));
+              const evidence = {
+                messages: [{ id: submitted.messageId, text: prompt, at: new Date().toISOString() }],
+              };
+              await validateOwnerInstructions(db.pool, ownerId, evidence);
+              if (kind === 'Stop') await request('POST', '/api/thread/stop');
+              else {
+                modelErrors.set(prompt, 'Synthetic model failure before clear.');
+                release(prompt);
+              }
+              await waitFor(settled(submitted.turnId));
+              const clear = await request('POST', '/api/messages', {
+                threadId: submitted.threadId,
+                text: '/clear',
+                clientMessageId: randomUUID(),
+              });
+              assert.equal(clear.statusCode, 200, clear.body);
+              assert.equal(
+                (await db.pool.query('SELECT withdrawn FROM turns WHERE id=$1', [submitted.turnId]))
+                  .rows[0].withdrawn,
+                true,
+              );
+              await assert.rejects(
+                validateOwnerInstructions(db.pool, ownerId, evidence),
+                /withdrawn or unavailable/,
+              );
+            } finally {
+              release(prompt);
+              modelErrors.delete(prompt);
+              await waitFor(settled(submitted.turnId));
+            }
+          });
+        }
+      });
+
+      await t.test(
+        'clear starts fresh chat without a model and keeps independent work',
+        async () => {
+          await waitFor(settledThread);
+          const threadId = (await thread.activeThread()).id;
+          const earlierPrompt = 'Synthetic earlier chat before clear';
+          const earlier = await thread.submitUserMessage(earlierPrompt);
+          await waitFor(settled(earlier.turnId));
+          const backgroundPrompt = 'Synthetic independent work during clear';
+          const runningPrompt = 'Synthetic current chat before clear';
+          const nextPrompt = 'Synthetic new request after clear';
+          block(backgroundPrompt);
+          block(runningPrompt);
+          modelErrors.set('/clear', 'Synthetic unavailable model');
+          const background = await thread.enqueueTurn(backgroundPrompt, {
+            source: 'schedule',
+            background: true,
+          });
+          const running = await thread.submitUserMessage(runningPrompt);
+          try {
+            await waitFor(() => Boolean(ran(background)) && Boolean(ran(running.turnId)));
+            const independent = ran(background)!;
+            const file = join(independent.workspacePath, 'clear-kept.txt');
+            await writeFile(file, 'Synthetic saved work');
+            const clientMessageId = randomUUID();
+            const clear = () =>
+              request('POST', '/api/messages', {
+                threadId,
+                text: '/clear',
+                clientMessageId,
+              });
+            const [response, concurrent] = await Promise.all([clear(), clear()]);
+            assert.equal(response.statusCode, 200, response.body);
+            const cleared = response.json() as SubmitMessageResponse;
+            assert.deepEqual(concurrent.json(), cleared);
+            assert.equal(await turnStatus(cleared.turnId), 'succeeded');
+            await waitFor(settled(cleared.turnId));
+            assert.equal(Boolean(ran(cleared.turnId)), false);
+            assert.equal(await turnStatus(running.turnId), 'cancelled');
+            assert.equal(independent.signal.aborted, false);
+            assert.equal(await turnStatus(background), 'running');
+            assert.equal(await readFile(file, 'utf8'), 'Synthetic saved work');
+            const state = (await request('GET', '/api/state')).json();
+            assert.equal(state.threadId, threadId);
+            assert.equal(typeof state.chatClearedAt, 'string');
+            assert.equal(
+              state.messages.some((message: Message) => message.id === earlier.messageId),
+              false,
+            );
+            assert.equal(
+              (await request('GET', '/api/messages'))
+                .json()
+                .messages.some((message: Message) => message.id === earlier.messageId),
+              false,
+            );
+            assert.equal(
+              (
+                await request(
+                  'GET',
+                  '/api/messages/search?q=Synthetic%20earlier%20chat%20before%20clear',
+                )
+              )
+                .json()
+                .some((message: Message) => message.id === earlier.messageId),
+              true,
+            );
+            assert.equal(
+              (await personal.recall(earlierPrompt, undefined, null)).some(
+                ({ id }) => id === earlier.messageId,
+              ),
+              false,
+            );
+            block(nextPrompt);
+            const next = await thread.submitUserMessage(nextPrompt);
+            await waitFor(() => Boolean(ran(next.turnId)));
+            const context = ran(next.turnId)!;
+            assert.ok(context.contextRestart);
+            assert.equal(
+              context.history.some(({ text }) => text === earlierPrompt),
+              false,
+            );
+            assert.deepEqual((await clear()).json(), cleared);
+            assert.equal(context.signal.aborted, false);
+            assert.equal(await turnStatus(next.turnId), 'running');
+            assert.equal(
+              (await request('GET', '/api/state')).json().chatClearedAt,
+              state.chatClearedAt,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId: randomUUID(),
+                  text: '/clear',
+                  clientMessageId: randomUUID(),
+                })
+              ).statusCode,
+              409,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId,
+                  text: '/clear',
+                  clientMessageId: earlier.messageId,
+                })
+              ).statusCode,
+              409,
+            );
+            release(nextPrompt);
+            await waitFor(settled(next.turnId));
+            const attachment = await storeArtifact(
+              Buffer.from('Synthetic clear attachment'),
+              'clear.txt',
+              'text/plain',
+              threadId,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId,
+                  text: '/clear',
+                  attachmentIds: [attachment.id],
+                  clientMessageId: randomUUID(),
+                })
+              ).statusCode,
+              400,
+            );
+            assert.equal(
+              (await sendAudio({ threadId, text: '/clear', clientMessageId: randomUUID() }))
+                .statusCode,
+              400,
+            );
+            assert.equal(
+              (
+                await request('POST', '/api/messages', {
+                  threadId,
+                  text: 'Synthetic stale client input',
+                  clientMessageId: randomUUID(),
+                  chatClearedAt: null,
+                })
+              ).statusCode,
+              409,
+            );
+            const arrival = thread.stopSignal();
+            await db.pool
+              .query(`CREATE FUNCTION reject_clear() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+              IF NEW.text='/clear' THEN RAISE EXCEPTION 'Synthetic clear failure'; END IF;
+              RETURN NEW; END $$;
+              CREATE TRIGGER reject_clear BEFORE INSERT ON messages FOR EACH ROW EXECUTE FUNCTION reject_clear()`);
+            try {
+              assert.equal(
+                (
+                  await request('POST', '/api/messages', {
+                    threadId,
+                    text: '/clear',
+                    clientMessageId: randomUUID(),
+                  })
+                ).statusCode,
+                500,
+              );
+            } finally {
+              await db.pool.query(
+                'DROP TRIGGER reject_clear ON messages; DROP FUNCTION reject_clear()',
+              );
+            }
+            assert.equal(
+              (await request('GET', '/api/state')).json().chatClearedAt,
+              state.chatClearedAt,
+            );
+            const afterRollback = await thread.submitUserMessage(
+              'Synthetic input after failed clear',
+              [],
+              {
+                stopSignal: arrival,
+              },
+            );
+            await waitFor(settled(afterRollback.turnId));
+            assert.equal(await turnStatus(afterRollback.turnId), 'succeeded');
+          } finally {
+            modelErrors.delete('/clear');
+            release(backgroundPrompt);
+            release(runningPrompt);
+            release(nextPrompt);
+            await waitFor(settled(background));
+            await waitFor(settled(running.turnId));
+          }
+        },
+      );
+
+      await t.test(
+        'clear cancels earlier text and audio intake but keeps an addressed task reply',
+        async (t) => {
+          await waitFor(settledThread);
+          const threadId = (await thread.activeThread()).id;
+          const taskId = randomUUID();
+          const anchor = randomUUID();
+          const origin = await thread.enqueueTurn('Synthetic task before clear intake', {
+            source: 'task',
+            sessionId: taskId,
+            background: true,
+          });
+          await waitFor(settled(origin));
+          await db.pool.query(
+            "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant','Synthetic task question')",
+            [anchor, ownerId, threadId, origin],
+          );
+          await db.pool.query(
+            "INSERT INTO tasks(id,owner_id,turn_id,session_id,message_id,title,done_when,now_text,applied_revision) VALUES($1,$2,$3,$1,$4,'Synthetic independent task','Synthetic reply arrived','Waiting',1)",
+            [taskId, ownerId, origin, anchor],
+          );
+          await db.pool.query('UPDATE turns SET task_id=$1 WHERE id=$2', [taskId, origin]);
+          const statusMessage = randomUUID();
+          await db.pool.query(
+            "INSERT INTO messages(id,owner_id,thread_id,role,text,reply_to_message_id) VALUES($1,$2,$3,'assistant','Synthetic task status',$4)",
+            [statusMessage, ownerId, threadId, anchor],
+          );
+          const mainText = 'Synthetic main input still being read';
+          const taskText = 'Synthetic addressed task input still being read';
+          const reading = new Set<string>();
+          let releaseReading!: () => void;
+          const held = new Promise<void>((resolve) => {
+            releaseReading = resolve;
+          });
+          const accept = verification.accept.bind(verification);
+          t.mock.method(verification, 'accept', async (...args: Parameters<typeof accept>) => {
+            if (args[0] === mainText || args[0] === taskText) {
+              reading.add(args[0]);
+              await held;
+              return undefined;
+            }
+            return accept(...args);
+          });
+          let releaseAudio!: () => void;
+          transcriptionGate = new Promise<void>((resolve) => {
+            releaseAudio = resolve;
+          });
+          const previousTranscript = transcript;
+          const previousReady = chatReady;
+          transcript = 'Synthetic audio input before clear';
+          const audioCount = transcriptions.length;
+          const mainMessageId = randomUUID();
+          const audioMessageId = randomUUID();
+          const artifactCount = (await db.pool.query('SELECT count(*)::int AS n FROM artifacts'))
+            .rows[0].n;
+          const main = request('POST', '/api/messages', {
+            threadId,
+            text: mainText,
+            clientMessageId: mainMessageId,
+          }).then((response) => response);
+          const task = request('POST', '/api/messages', {
+            threadId,
+            text: taskText,
+            clientMessageId: randomUUID(),
+            replyToMessageId: statusMessage,
+            chatClearedAt: null,
+          }).then((response) => response);
+          const audio = sendAudio({ threadId, clientMessageId: audioMessageId }).then(
+            (response) => response,
+          );
+          try {
+            await waitFor(() => reading.size === 2 && transcriptions.length > audioCount);
+            chatReady = false;
+            const cleared = await request('POST', '/api/messages', {
+              threadId,
+              text: '/clear',
+              clientMessageId: randomUUID(),
+            });
+            assert.equal(cleared.statusCode, 200, cleared.body);
+            chatReady = previousReady;
+            releaseReading();
+            releaseAudio();
+            const [mainResult, taskResult, audioResult] = await Promise.all([main, task, audio]);
+            for (const response of [mainResult, audioResult]) {
+              assert.equal(response.statusCode, 409, response.body);
+              assert.equal(response.json().retryable, true);
+            }
+            assert.equal(
+              (
+                await db.pool.query('SELECT id FROM messages WHERE id=ANY($1::uuid[])', [
+                  [mainMessageId, audioMessageId],
+                ])
+              ).rowCount,
+              0,
+            );
+            assert.equal(
+              (await db.pool.query('SELECT count(*)::int AS n FROM artifacts')).rows[0].n,
+              artifactCount,
+            );
+            assert.equal(
+              (
+                await db.pool.query('SELECT response FROM audio_messages WHERE message_id=$1', [
+                  audioMessageId,
+                ])
+              ).rows[0].response,
+              null,
+            );
+            const freshState = (await request('GET', '/api/state')).json();
+            assert.equal(
+              freshState.messages.some(
+                (message: Message) => message.id === mainMessageId || message.id === audioMessageId,
+              ),
+              false,
+            );
+            assert.equal(
+              (await request('GET', '/api/messages'))
+                .json()
+                .messages.some(
+                  (message: Message) =>
+                    message.id === mainMessageId || message.id === audioMessageId,
+                ),
+              false,
+            );
+            assert.equal(taskResult.statusCode, 200, taskResult.body);
+            const continued = taskResult.json().turnId as string;
+            await waitFor(settled(continued));
+            assert.equal(ran(continued)!.sessionId, taskId);
+            assert.equal(ran(continued)!.prompt, taskText);
+            assert.equal(await turnStatus(continued), 'succeeded');
+            transcriptionGate = undefined;
+            assert.equal(
+              (await sendAudio({ threadId, clientMessageId: audioMessageId })).statusCode,
+              409,
+            );
+            const resent = await sendAudio({ threadId, clientMessageId: randomUUID() });
+            assert.equal(resent.statusCode, 200, resent.body);
+            await waitFor(settled(resent.json().turnId));
+          } finally {
+            chatReady = previousReady;
+            releaseReading();
+            releaseAudio();
+            await Promise.allSettled([main, task, audio]);
+            transcriptionGate = undefined;
+            transcript = previousTranscript;
+            await request('POST', `/api/tasks/${taskId}/stop`);
+            await db.pool.query('UPDATE turns SET task_id=NULL WHERE session_id=$1', [taskId]);
+            await db.pool.query('DELETE FROM tasks WHERE id=$1', [taskId]);
+          }
+        },
+      );
+
+      await t.test('chat-app clear saves one visible acknowledgement in Nod', async () => {
+        const { createChannels } = await import('../src/server/channels.ts');
+        const threadId = (await thread.activeThread()).id;
+        for (const provider of ['telegram', 'whatsapp']) {
+          let pending = true;
+          const posts: string[] = [];
+          const channels = await createChannels(db.pool, {
+            ownerId,
+            transport: {
+              channels: [
+                {
+                  id: provider,
+                  status: 'configured',
+                  missing: [],
+                  accountId: 'synthetic-clear',
+                  allowedSenderIds: ['111'],
+                },
+              ],
+              poll: async (accept) => {
+                if (!pending) return;
+                pending = false;
+                await accept({
+                  channelId: provider,
+                  accountId: 'synthetic-clear',
+                  senderId: '111',
+                  messageId: randomUUID(),
+                  threadId: 'synthetic-chat',
+                  text: '/clear',
+                  sentAt: new Date(),
+                });
+              },
+              receive: async () => ({ status: 200, body: {} }),
+              post: async ({ text }) => {
+                posts.push(text);
+                return { id: 'synthetic-sent-clear' };
+              },
+              close: async () => {},
+            },
+            subscribe: () => () => {},
+            intervalMs: 600_000,
+            activeThread: (client) => thread.activeThread(client),
+            taskCommand: tasks.chatCommand,
+            submit: async () => {
+              throw new Error('Clear must not start a model turn.');
+            },
+          });
+          try {
+            await channels.drain();
+            assert.deepEqual(posts, [thread.chatClearedMessage]);
+            for (const path of ['/api/state', '/api/messages']) {
+              const messages = (await request('GET', path)).json().messages as Message[];
+              assert.equal(
+                messages.filter(
+                  ({ role, text }) => role === 'assistant' && text === thread.chatClearedMessage,
+                ).length,
+                1,
+              );
+            }
+            const boundary = (await request('GET', '/api/state')).json().chatClearedAt;
+            await channels.drain();
+            assert.equal(posts.length, 1);
+            assert.equal((await request('GET', '/api/state')).json().chatClearedAt, boundary);
+            assert.equal((await thread.activeThread()).id, threadId);
+          } finally {
+            await channels.close();
+          }
+        }
+      });
+
+      await t.test(
+        'a context restart keeps chat, files and independent work and refuses stale requests',
+        async () => {
+          await waitFor(settledThread);
+          const threadId = (await thread.activeThread()).id;
+          const backgroundPrompt = 'Synthetic independent work during context recovery';
+          const failedPrompt = 'Synthetic chat context failure';
+          block(backgroundPrompt);
+          modelErrors.set(
+            failedPrompt,
+            new ContextLimitError('Synthetic context window exceeded.'),
+          );
+          const background = await thread.enqueueTurn(backgroundPrompt, {
+            source: 'schedule',
+            background: true,
+          });
+          try {
+            await waitFor(() => Boolean(ran(background)));
+            const held = ran(background)!;
+            const file = join(held.workspacePath, 'context-recovery.txt');
+            await writeFile(file, 'Synthetic saved work');
+            const earlierPrompt = 'Synthetic completed chat before context recovery';
+            const earlier = await thread.submitUserMessage(earlierPrompt);
+            await waitFor(settled(earlier.turnId));
+            const question = await thread.submitUserMessage('ask-question');
+            await waitFor(settled(question.turnId));
+            const failed = await thread.submitUserMessage(failedPrompt);
+            await waitFor(settled(failed.turnId));
+            assert.equal(await turnStatus(failed.turnId), 'failed');
+            assert.equal(await turnStatus(question.turnId), 'waiting');
+            await waitFor(async () =>
+              Boolean(
+                (
+                  await db.pool.query('SELECT 1 FROM messages WHERE turn_id=$1 AND stream_id=$2', [
+                    failed.turnId,
+                    `context-failure:${failed.turnId}`,
+                  ])
+                ).rowCount,
+              ),
+            );
+            const state = (await request('GET', '/api/state')).json();
+            assert.deepEqual(state.chatRecovery, { turnId: failed.turnId });
+            const messageIds = state.messages.map((message: { id: string }) => message.id);
+            const restart = (input = { threadId, turnId: failed.turnId }) =>
+              request('POST', '/api/conversation/restart-context', input);
+            assert.equal(
+              (
+                await app.inject({
+                  method: 'POST',
+                  url: '/api/conversation/restart-context',
+                  headers: { host: headers.host },
+                  payload: { threadId, turnId: failed.turnId },
+                })
+              ).statusCode,
+              401,
+            );
+            for (const input of [
+              { threadId: randomUUID(), turnId: failed.turnId },
+              { threadId, turnId: randomUUID() },
+              { threadId, turnId: background },
+            ])
+              assert.equal((await restart(input)).statusCode, 409);
+            const previousNodeEnv = process.env.NODE_ENV;
+            process.env.NODE_ENV = 'production';
+            try {
+              assert.equal((await restart()).statusCode, 200);
+            } finally {
+              if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+              else process.env.NODE_ENV = previousNodeEnv;
+            }
+            const recovered = (await request('GET', '/api/state')).json();
+            assert.equal(recovered.threadId, threadId);
+            assert.equal(recovered.chatRecovery, undefined);
+            assert.ok(
+              messageIds.every((id: string) =>
+                recovered.messages.some((message: { id: string }) => message.id === id),
+              ),
+            );
+            assert.equal((await restart()).statusCode, 409);
+            assert.equal(held.signal.aborted, false);
+            assert.equal(held.contextRestart, undefined);
+            assert.equal(await turnStatus(background), 'running');
+            assert.equal(await readFile(file, 'utf8'), 'Synthetic saved work');
+            const next = await thread.submitUserMessage('Synthetic request after context recovery');
+            await waitFor(settled(next.turnId));
+            const context = ran(next.turnId)!;
+            assert.equal(context.threadId, threadId);
+            assert.equal(context.sessionId, threadId);
+            assert.equal(context.workspacePath, held.workspacePath);
+            assert.ok(context.contextRestart);
+            assert.ok(context.history.every((message) => !message.text.includes(failedPrompt)));
+            assert.ok(context.history.every((message) => !message.text.includes(earlierPrompt)));
+            assert.equal(
+              (await request('GET', '/api/messages/search?q=Synthetic%20chat%20context%20failure'))
+                .json()
+                .some((message: { turnId: string }) => message.turnId === failed.turnId),
+              true,
+            );
+            assert.equal(
+              (await db.pool.query('SELECT archived_at FROM threads WHERE id=$1', [threadId]))
+                .rows[0].archived_at,
+              null,
+            );
+          } finally {
+            modelErrors.delete(failedPrompt);
+            release(backgroundPrompt);
+            await waitFor(settled(background));
+          }
         },
       );
 
@@ -8031,7 +9120,7 @@ test(
                           /check-in/,
                         );
                         await tool('ask_user').execute({
-                          question: 'The synthetic check used six dollars. Continue?',
+                          question: 'The synthetic check used {spent}. Continue?',
                         });
                       },
                     }),
@@ -8070,10 +9159,12 @@ test(
                   assert.equal(await engine.due(), paused);
                   const question = (
                     await db.pool.query(
-                      "SELECT id FROM messages WHERE turn_id=$1 AND owner_id=$2 AND role='assistant'",
+                      "SELECT id,text FROM messages WHERE turn_id=$1 AND owner_id=$2 AND role='assistant'",
                       [paused, ownerId],
                     )
                   ).rows[0];
+                  assert.match(question.text, /\$6\b/);
+                  assert.doesNotMatch(question.text, /\{spent\}/);
                   const answer = await userMessages.submit('Continue the synthetic observer.', [], {
                     replyToMessageId: question.id,
                   });
@@ -10308,7 +11399,17 @@ test(
               assert.equal(turn.status, 'failed');
               assert.equal(presentedFailures.length, 0);
               assert.ok(shown.includes(turn.error));
+              assert.equal(
+                (
+                  await db.pool.query(
+                    "SELECT presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                    [submitted.turnId, `model-failure:${submitted.turnId}`],
+                  )
+                ).rows[0].presentation,
+                null,
+              );
               assert.match(shown, /Synthetic alternative connection\./);
+              assert.equal((await request('GET', '/api/state')).json().chatRecovery, undefined);
               assert.match(shown, /\]\(\/settings\/models\)/);
               assert.ok(turn.error.length <= 2000);
               assert.ok(turn.error.startsWith(prefix));
@@ -10328,6 +11429,148 @@ test(
             for (const item of cases) modelErrors.delete(item.prompt);
             presentInterruption = previousPresenter;
             delete dependencies.modelAlternative;
+          }
+        },
+      );
+
+      await t.test(
+        'a model request that found no network states that cause instead of model settings',
+        async () => {
+          dependencies.modelAlternative = () => 'Synthetic alternative connection.';
+          const prefix =
+            'The model request failed: anthropic / fixture-model: Connection error.: getaddrinfo ENOTFOUND synthetic-offline.invalid';
+          const cases = [
+            { prompt: 'offline desktop schedule fixture', code: 'ENOTFOUND', desktop: true },
+            {
+              prompt: 'offline desktop chat fixture',
+              code: 'EAI_AGAIN',
+              desktop: true,
+              chat: true,
+            },
+            { prompt: 'offline server schedule fixture', code: 'ENETUNREACH', desktop: false },
+            {
+              prompt: 'offline owner endpoint schedule fixture',
+              code: 'ENOTFOUND',
+              desktop: true,
+              provider: 'compatible',
+            },
+            {
+              prompt: 'offline azure endpoint schedule fixture',
+              code: 'EAI_AGAIN',
+              desktop: true,
+              provider: 'azure',
+            },
+            {
+              prompt: 'offline bedrock schedule fixture',
+              code: 'ENOTFOUND',
+              desktop: true,
+              provider: 'amazon-bedrock',
+            },
+          ];
+          const previousWorkModel = dependencies.workModel;
+          try {
+            for (const item of cases) {
+              const raw = `${prefix} (transport cause: ${item.code}) [request phase: request]`;
+              modelErrors.set(item.prompt, raw);
+              dependencies.desktopRuntime = item.desktop;
+              dependencies.workModel = async () => ({
+                selection: { connectionId: randomUUID(), modelId: 'fixture-model', effort: 'low' },
+                provider: item.provider ?? 'anthropic',
+                name: 'fixture-model',
+              });
+              const scheduleId = randomUUID();
+              const turnId = item.chat
+                ? (await thread.submitUserMessage(item.prompt)).turnId
+                : await transaction(async (client) => {
+                    await client.query(
+                      `INSERT INTO schedules(id,owner_id,title,prompt,cron,time_zone,next_run_at,revision)
+                       VALUES($1,$2,$3,$4,'0 8 * * *','Europe/Lisbon',now()+interval '1 day',3)`,
+                      [scheduleId, ownerId, item.prompt, item.prompt],
+                    );
+                    const id = await thread.enqueueTurn(item.prompt, {
+                      source: 'schedule',
+                      sourceId: `schedule:${scheduleId}:${randomUUID()}`,
+                      client,
+                    });
+                    await client.query(
+                      `INSERT INTO schedule_runs(id,owner_id,schedule_id,schedule_revision,job_id,title,turn_id,scheduled_for,time_zone)
+                       VALUES($1,$2,$3,0,$4,$5,$6,now()-interval '72 minutes','Europe/Lisbon')`,
+                      [randomUUID(), ownerId, scheduleId, randomUUID(), item.prompt, id],
+                    );
+                    return id;
+                  }, db.pool);
+              await waitFor(settled(turnId));
+              const streamId = `${item.provider ? 'model' : 'offline'}-failure:${turnId}`;
+              await waitFor(async () =>
+                Boolean(
+                  (
+                    await db.pool.query(
+                      "SELECT 1 FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                      [turnId, streamId],
+                    )
+                  ).rowCount,
+                ),
+              );
+              const turn = (
+                await db.pool.query('SELECT status,error FROM turns WHERE id=$1', [turnId])
+              ).rows[0] as { status: string; error: string };
+              const { text: shown, presentation } = (
+                await db.pool.query(
+                  "SELECT text,presentation FROM messages WHERE turn_id=$1 AND role='assistant' AND stream_id=$2",
+                  [turnId, streamId],
+                )
+              ).rows[0] as { text: string; presentation: Record<string, unknown> | null };
+              const hinted = /\]\(https:\/\/nod\.n8n\.io\/docs\/deploy\/self-host\/\)/;
+              if (item.chat) assert.equal(presentation, null);
+              else
+                assert.deepEqual(
+                  {
+                    type: presentation?.type,
+                    scheduleId: presentation?.scheduleId,
+                    outcome: presentation?.outcome,
+                    code: presentation?.code,
+                    link: presentation?.link,
+                    late:
+                      Date.parse(String(presentation?.startedAt)) -
+                        Date.parse(String(presentation?.dueAt)) >
+                      600_000,
+                    next: typeof presentation?.nextRunAt,
+                    revision: presentation?.revision,
+                  },
+                  {
+                    type: 'schedule-run',
+                    scheduleId,
+                    outcome: 'failed',
+                    code: item.provider ? undefined : item.code,
+                    link: item.provider ? 'models' : item.desktop ? 'server' : undefined,
+                    late: true,
+                    next: 'string',
+                    revision: 0,
+                  },
+                );
+              assert.equal(turn.status, 'failed');
+              assert.ok(shown.includes(turn.error));
+              if (item.provider) {
+                assert.equal(turn.error, raw);
+                assert.match(shown, /\]\(\/settings\/models\)/);
+                assert.doesNotMatch(shown, hinted);
+                continue;
+              }
+              assert.match(turn.error, /\bAnthropic\b/);
+              assert.ok(turn.error.includes(`(${item.code})`));
+              assert.doesNotMatch(
+                turn.error,
+                /transport cause|request phase|getaddrinfo|synthetic-offline/,
+              );
+              assert.doesNotMatch(shown, /settings\/models|Synthetic alternative connection/);
+              if (item.desktop && !item.chat) assert.match(shown, hinted);
+              else assert.doesNotMatch(shown, hinted);
+            }
+          } finally {
+            for (const item of cases) modelErrors.delete(item.prompt);
+            delete dependencies.modelAlternative;
+            delete dependencies.desktopRuntime;
+            dependencies.workModel = previousWorkModel;
           }
         },
       );
@@ -10656,7 +11899,7 @@ test(
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
   async () => {
     const { pool, ownerId, store, post, memory, close } = await memoryFixture();
-    const { state, curator } = scriptedCurator();
+    const { calls, state, curator } = scriptedCurator();
     const learning = createMemoryLearning({ pool, ownerId, memory, curator });
     const add = (area: string, slug: string, text: string) => (m: number) => ({
       op: 'add',
@@ -10684,6 +11927,17 @@ test(
         archived: [],
       });
       assert.equal(await memory.context(), `${path}: ${short}`);
+      const invented = randomUUID();
+      const asked = calls.length;
+      await assert.rejects(
+        learning.remember({ messages: [invented] }, first.sourceMessageId),
+        (error: Error) => error.message.includes(invented),
+      );
+      await assert.rejects(
+        learning.remember({ messages: [short] }, first.sourceMessageId),
+        (error: Error) => error.name !== 'ZodError' && !error.message.includes(short),
+      );
+      assert.equal(calls.length, asked);
       const reopened = createMemoryService({ pool, ownerId, store });
       assert.equal(((await reopened.read({ path })) as { text: string }).text, short);
       const detailed = 'Make progress reports detailed from now on.';
@@ -10786,6 +12040,55 @@ test(
       await remember([add('about', 'before-clear', beforeClear)], beforeClearMessage);
       assert.equal((await memory.view()).notes.length, 1);
       curator.curate = curate;
+
+      const tea = 'I drink synthetic green tea every morning.';
+      const unquoted = add('about', 'coffee', 'Drinks synthetic black coffee.');
+      const secret = 'The store key is sk-fixturefixture1234.';
+      const leaked = (m: number) => ({ ...add('about', 'key', secret)(m), quote: tea });
+      const notesBefore = (await memory.view()).notes.length;
+      await assert.rejects(
+        remember([unquoted, leaked], await post(tea)),
+        (error: Error) =>
+          /quote/.test(error.message) &&
+          /secret/.test(error.message) &&
+          /Nothing was saved/.test(error.message) &&
+          !error.message.includes('sk-fixture'),
+      );
+      assert.equal((await memory.view()).notes.length, notesBefore);
+      await assert.rejects(
+        remember([add('about', 'tea', tea), unquoted], await post(tea)),
+        /quote/,
+      );
+      assert.equal((await memory.view()).notes.length, notesBefore);
+      await remember([add('about', 'tea', tea)], await post(tea));
+      const moved = 'I switched from synthetic green tea to coffee.';
+      await assert.rejects(
+        remember(
+          [
+            (m: number) => ({
+              op: 'archive',
+              path: 'about/tea',
+              reason: 'obsolete',
+              m: [m],
+              quote: moved,
+            }),
+            unquoted,
+            add('about', 'switch', moved),
+          ],
+          await post(moved),
+        ),
+        /Nothing was saved/,
+      );
+      assert.ok((await memory.view()).notes.some((note) => note.path === 'about/tea'));
+
+      const older = await post('My synthetic library card renews in March.');
+      for (let index = 0; index < 10; index++) await post(`Synthetic filler ${index}.`);
+      const renewal = await post('Remember that renewal month.');
+      state.answer = () => ({ ops: [] });
+      await learning.remember({}, renewal.sourceMessageId);
+      assert.doesNotMatch(JSON.stringify(calls.at(-1)!.input), /renews in March/);
+      await learning.remember({ messages: [older.id] }, renewal.sourceMessageId);
+      assert.match(JSON.stringify(calls.at(-1)!.input), /renews in March/);
     } finally {
       await close();
     }
@@ -11187,6 +12490,119 @@ test(
 );
 
 test(
+  'bug report drafts send their stored summary once, after a rejected attempt, and only for their owner',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  async (t) => {
+    const f = await feedbackFixture(t);
+    await f.pool.query(`CREATE TABLE IF NOT EXISTS feedback_drafts (
+      id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid NOT NULL,
+      summary text NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    const owner = await f.open();
+    const other = await f.open();
+    const id = randomUUID();
+    await f.pool.query(
+      'INSERT INTO feedback_drafts(id,owner_id,thread_id,summary) VALUES($1,$2,$3,$4)',
+      [id, owner.ownerId, randomUUID(), 'Synthetic draft summary.'],
+    );
+    const send = {
+      method: 'POST' as const,
+      url: `/api/feedback/drafts/${id}/send`,
+      payload: { reportId: null },
+    };
+    assert.equal(
+      (await other.app.inject({ method: 'GET', url: `/api/feedback/drafts/${id}` })).statusCode,
+      404,
+    );
+    assert.equal((await other.app.inject(send)).statusCode, 404);
+    assert.equal(f.state.envelopes.length, 0);
+    f.state.receiptStatus = 'rejected';
+    assert.equal((await owner.app.inject(send)).json().status, 'rejected');
+    assert.equal(
+      (await owner.app.inject({ method: 'GET', url: `/api/feedback/drafts/${id}` })).json().receipt,
+      null,
+    );
+    assert.equal(
+      (await owner.app.inject({ method: 'GET', url: `/api/feedback/${id}` })).json().status,
+      'rejected',
+    );
+    f.state.receiptStatus = 'submitted';
+    assert.equal((await owner.app.inject(send)).json().status, 'submitted');
+    assert.equal((await owner.app.inject(send)).json().status, 'submitted');
+    assert.equal(f.state.envelopes.length, 2);
+    assert.equal(f.state.envelopes[1]!.submissionId, id);
+    assert.equal(f.state.envelopes[1]!.feedback, 'Synthetic draft summary.');
+    assert.equal(
+      (await owner.app.inject({ method: 'GET', url: `/api/feedback/drafts/${id}` })).json().receipt
+        .status,
+      'submitted',
+    );
+    const uncertain = randomUUID();
+    await f.pool.query(
+      'INSERT INTO feedback_drafts(id,owner_id,thread_id,summary) VALUES($1,$2,$3,$4)',
+      [uncertain, owner.ownerId, randomUUID(), 'Synthetic uncertain summary.'],
+    );
+    const resend = { ...send, url: `/api/feedback/drafts/${uncertain}/send` };
+    f.state.receiptStatus = 'unknown';
+    assert.equal((await owner.app.inject(resend)).json().status, 'unknown');
+    f.state.receiptStatus = 'submitted';
+    assert.equal((await owner.app.inject(resend)).json().status, 'unknown');
+    assert.equal(f.state.envelopes.length, 3);
+    const claimed = randomUUID();
+    await f.pool.query(
+      'INSERT INTO feedback_drafts(id,owner_id,thread_id,summary) VALUES($1,$2,$3,$4)',
+      [claimed, owner.ownerId, randomUUID(), 'Synthetic claimed summary.'],
+    );
+    assert.equal(
+      (await owner.app.inject({ method: 'GET', url: `/api/feedback/${claimed}` })).json().status,
+      'rejected',
+    );
+    assert.equal(
+      (await owner.app.inject({ ...send, url: `/api/feedback/drafts/${claimed}/send` })).json()
+        .status,
+      'submitted',
+    );
+    assert.equal(f.state.envelopes.length, 4);
+    await f.pool.query(
+      "UPDATE feedback_submissions SET created_at=now()-interval '10 minutes' WHERE owner_id=$1 AND id=$2",
+      [owner.ownerId, uncertain],
+    );
+    const held: Array<() => void> = [];
+    let arrived = () => {};
+    const holding = (count: number) =>
+      new Promise<void>((done) => {
+        arrived = () => held.length >= count && done();
+        arrived();
+      });
+    f.state.beforeDeliver = () =>
+      held.length < 3
+        ? new Promise<void>((done) => {
+            held.push(done);
+            arrived();
+          })
+        : Promise.resolve();
+    f.state.receiptStatus = 'rejected';
+    const check = () => owner.app.inject({ method: 'GET', url: `/api/feedback/${uncertain}` });
+    const early = check();
+    await holding(1);
+    const late = check();
+    await holding(2);
+    held[0]!();
+    assert.equal((await early).json().status, 'rejected');
+    const retry = owner.app.inject(resend);
+    await holding(3);
+    held[1]!();
+    assert.equal((await late).json().status, 'unknown');
+    f.state.receiptStatus = 'submitted';
+    assert.equal((await owner.app.inject(resend)).json().status, 'unknown');
+    assert.equal(f.state.envelopes.length, 5);
+    held[2]!();
+    assert.equal((await retry).json().status, 'submitted');
+    f.state.beforeDeliver = undefined;
+  },
+);
+
+test(
   'feedback reports and their delivery status stay with their owner',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
   async (t) => {
@@ -11442,13 +12858,18 @@ test(
       CREATE TABLE app_connections(id uuid,owner_id text,slug text,account_id text,account_active boolean,revoked boolean,callback_expires timestamptz,triggers_enabled boolean,watch_failures integer,inbox_failed boolean,inbox_reconnect_required boolean,account_checked_at timestamptz,inbox_checked_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE browser_connections(id uuid,owner_id text,state text,checked_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE discovered_connections(id uuid,owner_id text,reconnect_required boolean,replaced_at timestamptz,paths jsonb,created_at timestamptz DEFAULT now());
-      CREATE TABLE model_connections(id uuid,owner_id text,provider text,method text,status text,managed boolean,created_at timestamptz DEFAULT now());
+      CREATE TABLE model_connections(id uuid,owner_id text,provider text,method text,status text,managed boolean,models jsonb,request_failures jsonb,created_at timestamptz DEFAULT now());
+      CREATE TABLE model_settings(owner_id text,selection jsonb,routes jsonb);
+      CREATE TABLE preferences(owner_id text,notification_rule text,time_zone text,quiet_start text,quiet_end text,quiet_hours_enabled boolean,locale text,hour_cycle text,rules text,speech_reply text,proactive_paused boolean,local_files_enabled boolean);
+      CREATE TABLE spending_limits(owner_id text,monthly_usd double precision,task_usd double precision,preparation_usd double precision);
+      CREATE TABLE channel_settings(owner_id text,provider text,enabled boolean,summary jsonb,updated_at timestamptz DEFAULT now());
       CREATE TABLE integration_events(id text,owner_id text,slug text,state text,created_at timestamptz DEFAULT now());
       CREATE TABLE schedules(id uuid,owner_id text,kind text,enabled boolean,delivery_channel text,next_run_at timestamptz,created_at timestamptz DEFAULT now());
       CREATE TABLE schedule_runs(id uuid,owner_id text,schedule_id uuid,turn_id uuid,created_at timestamptz DEFAULT now());
       CREATE TABLE channel_inbox(source_id text,owner_id text,provider text,state text,turn_id uuid,created_at timestamptz DEFAULT now());
       CREATE TABLE channel_outbox(source_id text,state text,reason text,updated_at timestamptz DEFAULT now());
     `);
+    let modelConnection = '';
     const ownerId = randomUUID();
     const otherOwner = randomUUID();
     const turnId = randomUUID();
@@ -11588,8 +13009,31 @@ test(
         ],
       );
       await f.pool.query(
-        `INSERT INTO model_connections(id,owner_id,provider,method,status,managed) VALUES($1,$2,$3,'api_key','reconnect',false)`,
-        [randomUUID(), owner, privateText],
+        `INSERT INTO model_connections(id,owner_id,provider,method,status,managed,models,request_failures) VALUES($1,$2,$3,'api_key','reconnect',false,$4,'{}')`,
+        [
+          (modelConnection = randomUUID()),
+          owner,
+          privateText,
+          JSON.stringify([
+            { id: 'qwen2.5-coder:7b', name: privateText, contextWindow: 8192, efforts: ['low'] },
+            { id: 'models/Marta Vidal/private.gguf', contextWindow: 4096 },
+            { id: 'C:/Users/owner/private.gguf', contextWindow: 4096 },
+            { id: 'customer-jane/private-model', contextWindow: 4096 },
+          ]),
+        ],
+      );
+      await f.pool.query(`INSERT INTO model_settings VALUES($1,$2,'{"background":"light"}')`, [
+        owner,
+        { connectionId: modelConnection, modelId: 'qwen2.5-coder:7b', effort: 'low' },
+      ]);
+      await f.pool.query(
+        `INSERT INTO preferences VALUES($1,$2,'Europe/Lisbon','22:00','08:00',true,'pt-PT','auto',$2,'auto',true,false)`,
+        [owner, privateText],
+      );
+      await f.pool.query(`INSERT INTO spending_limits VALUES($1,200,5,5)`, [owner]);
+      await f.pool.query(
+        `INSERT INTO channel_settings(owner_id,provider,enabled,summary) VALUES($1,'whatsapp',true,$2)`,
+        [owner, { accountName: privateText, linkMode: 'self-chat', connectionState: 'logged_out' }],
       );
       await f.pool.query(
         `INSERT INTO integration_events(id,owner_id,slug,state) VALUES($1,$2,'gmail','processing')`,
@@ -11626,11 +13070,130 @@ test(
       ownerId,
       sanitize: redactor.value,
     });
+    const failureJournal = await createFeedbackLog({
+      dataRoot: logRoot,
+      ownerId,
+      name: 'failures',
+      sanitize: redactor.value,
+    });
     t.after(async () => {
       await journal.close();
+      await failureJournal.close();
       await rm(logRoot, { recursive: true, force: true });
     });
+    await mkdir(join(logRoot, 'logs'));
+    await writeFile(
+      join(logRoot, 'logs', 'startup.log'),
+      `${new Date(Date.now() - 5000).toISOString()} update check result=offered version=9.9.9 for Marta Vidal\n`,
+    );
     const scope = { turnId, sessionId, runId: childRun, parentRunId: mainRun, callId };
+    const { createBrowserWorkerFixture } = await import('./browser-fixture.ts');
+    const { withFailureLog } = await import('../src/ports/failure-log.ts');
+    let pickerGuard = 'control_covered';
+    const refusePicker = async () => {
+      throw Object.assign(new Error(privateText), {
+        signInGuard: pickerGuard,
+        cause: privateText,
+      });
+    };
+    const bridge = await createBrowserWorkerFixture({
+      computer: fakeComputer({
+        signInMethods: refusePicker,
+        selectSignInMethod: refusePicker,
+      }),
+    });
+    try {
+      const client = bridge.client('/synthetic/diagnostic-picker');
+      for (const [method, guard] of [
+        ['signInMethods', 'control_covered'],
+        ['signInMethods', 'control_changed'],
+        ['selectSignInMethod', 'control_changed'],
+      ]) {
+        pickerGuard = guard;
+        await assert.rejects(
+          withFailureLog(
+            (event, error, context) =>
+              failureJournal.record('failure', { event, error, context }, scope),
+            () =>
+              method === 'signInMethods'
+                ? client.signInMethods!('task', 'https://example.test', [
+                    { label: privateValues[0], selector: `[data-account="${privateValues[1]}"]` },
+                  ])
+                : client.selectSignInMethod!('task', {
+                    origin: 'https://example.test',
+                    document: 'synthetic-document',
+                    methodId: randomUUID(),
+                  }),
+          ),
+          (error: unknown) => {
+            assert.equal(Object(error).signInGuard, guard);
+            assert.ok(privateValues.every((value) => !Object(error).message.includes(value)));
+            return true;
+          },
+        );
+      }
+    } finally {
+      await bridge.close();
+    }
+    const { createDecisionModel } = await import('../src/providers/decisions.ts');
+    const { createMailCheck } = await import('../src/server/mail-check.ts');
+    const { privateEmailResult } = await import('../src/server/integration-result.ts');
+    for (const response of [
+      () => Response.json({ error: { message: privateText, code: privateText } }, { status: 503 }),
+      () => new Response(`{"private":${JSON.stringify(privateText)}`, { status: 200 }),
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error(privateText));
+            },
+          }),
+          { status: 200 },
+        ),
+    ]) {
+      const model = createDecisionModel({
+        resolve: async () => ({ provider: 'openrouter', key: privateText }),
+        fetch: async () => response(),
+      });
+      const check = createMailCheck({
+        decisions: model,
+        curator: {
+          id: 'unused',
+          configured: false,
+          async curate() {
+            assert.fail('A failed decision must not use another model.');
+          },
+        },
+      });
+      const result = await withFailureLog(
+        (event, error) => failureJournal.record('failure', { event, error }, scope),
+        () =>
+          privateEmailResult(
+            {
+              messages: [
+                {
+                  id: 'synthetic-mail',
+                  from: 'sender@example.test',
+                  subject: privateText,
+                  body: privateText,
+                },
+              ],
+            },
+            check,
+          ),
+      );
+      assert.ok(privateValues.every((value) => !JSON.stringify(result).includes(value)));
+    }
+    for (let index = 0; index < 3; index++)
+      failureJournal.record(
+        'failure',
+        {
+          event: 'browser_bridge_failed',
+          error: new Error('bridge exited'),
+          context: { reason: 'exit', exitCode: 137, count: 2 },
+        },
+        scope,
+      );
     journal.record(
       'tool_start',
       {
@@ -11683,6 +13246,11 @@ test(
         },
       ],
       logs: () => journal.snapshot(),
+      failures: () => failureJournal.snapshot(),
+      dataRoot: logRoot,
+      trustModel: 'llm',
+      client: { stream: 'closed' as const, savedMessages: 4, renderedMessages: 3 },
+      environment: { NOD_OS_VERSION: '15.1.0', NOD_ELECTRON_VERSION: privateText },
       errors: [
         {
           type: 'render' as const,
@@ -11717,8 +13285,9 @@ test(
       'future-message',
     ])
       assert.ok(!encoded.includes(omitted), omitted);
-    assert.doesNotMatch(encoded, /\d{4}-\d{2}-\d{2}T/);
     const report = JSON.parse(encoded);
+    assert.doesNotMatch(encoded.replace(report.generatedAt, ''), /\d{4}-\d{2}-\d{2}T/);
+    assert.ok(Math.abs(Date.parse(report.generatedAt) - Date.now()) < 60_000);
     assert.equal(report.format, 'nod-feedback-report-v3');
     assert.equal(report.coverage.contentIncluded, true);
     assert.equal(report.coverage.redaction, 'best-effort');
@@ -11781,14 +13350,86 @@ test(
     );
     assert.equal(report.modelUsage.length, 1);
     assert.equal(report.modelUsage[0].runId, child.runId);
-    assert.equal(report.logs.length, 3);
+    assert.equal(report.logs.length, 2);
     assert.equal(report.logs[0].runId, child.runId);
     assert.equal(report.logs[0].parentRunId, child.parentRunId);
     assert.equal(report.logs[0].callId, report.logs[1].callId);
     assert.equal(report.logs[0].data.tool, 'apps');
     assert.equal(report.logs[0].data.input.query, 'Find the failed workflow');
     assert.equal(report.logs[1].data.output.statusCode, 503);
-    assert.match(report.logs[2].data.error.message, /Gmail fetch failed with HTTP 503/);
+    assert.equal(report.failures.length, 8);
+    const mailFailures = report.failures.filter(
+      (row: any) => row.data.event === 'mail_check_failed',
+    );
+    assert.equal(mailFailures.length, 3);
+    assert.deepEqual(
+      mailFailures.map((row: any) => [row.data.error.code, row.data.error.status]).sort(),
+      [
+        ['decision_http', 503],
+        ['decision_json', 200],
+        ['decision_response', 200],
+      ],
+    );
+    assert.ok(mailFailures.every((row: any) => row.runId === child.runId && row.count === 1));
+    const requestFailure = report.failures.find((row: any) => row.data.event === 'request_failed');
+    const bridgeFailure = report.failures.find(
+      (row: any) =>
+        row.data.event === 'browser_bridge_failed' && row.data.context.reason === 'exit',
+    );
+    const pickerFailure = report.failures.find(
+      (row: any) => row.data.context?.signInGuard === 'control_covered',
+    );
+    const pickerFailures = report.failures.filter((row: any) => row.data.context?.signInGuard);
+    assert.deepEqual(
+      pickerFailures
+        .map((row: any) => [row.data.context.method, row.data.context.signInGuard, row.count])
+        .sort(),
+      [
+        ['selectSignInMethod', 'control_changed', 1],
+        ['signInMethods', 'control_changed', 1],
+        ['signInMethods', 'control_covered', 1],
+      ],
+    );
+    assert.equal(pickerFailure.data.error.code, 'unavailable');
+    assert.equal(pickerFailure.data.context.method, 'signInMethods');
+    assert.equal(pickerFailure.data.context.reason, 'error_response');
+    assert.equal(pickerFailure.count, 1);
+    assert.equal(pickerFailure.runId, child.runId);
+    assert.match(requestFailure.data.error.message, /Gmail fetch failed with HTTP 503/);
+    assert.equal(requestFailure.count, 1);
+    assert.equal(bridgeFailure.data.context.exitCode, 137);
+    assert.equal(bridgeFailure.count, 6);
+    assert.equal(bridgeFailure.runId, child.runId);
+    assert.equal(report.startupLog.length, 1);
+    assert.match(report.startupLog[0].line, /^update check result=offered version=9\.9\.9/);
+    assert.ok(report.startupLog[0].ageMs >= 5000);
+    assert.equal(report.system.osVersion, '15.1.0');
+    assert.equal(report.system.electron, null);
+    assert.ok(report.system.memoryMb > 0);
+    assert.deepEqual(report.client, { stream: 'closed', savedMessages: 4, renderedMessages: 3 });
+    assert.deepEqual(report.modelSettings, [
+      {
+        selection: {
+          connection: report.modelConnections[0].id,
+          model: 'qwen2.5-coder:7b',
+          effort: 'low',
+        },
+        schedule: null,
+        background: 'light',
+      },
+    ]);
+    assert.deepEqual(report.modelConnections[0].models, [
+      { id: 'qwen2.5-coder:7b', contextWindow: 8192, images: false, efforts: ['low'] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+      { id: null, contextWindow: 4096, images: false, efforts: [] },
+    ]);
+    assert.equal(report.modelUsageSummary[0].requests, 1);
+    assert.equal(report.settings[0].timeZone, 'Europe/Lisbon');
+    assert.equal(report.settings[0].notificationRuleSet, true);
+    assert.equal(report.settings[0].monthlyLimitUsd, 200);
+    assert.equal(report.channelSettings[0].linkMode, 'self-chat');
+    assert.equal(report.channelSettings[0].connectionState, 'logged_out');
     assert.equal(report.clientErrors.length, 1);
     assert.match(report.clientErrors[0].data.message, /Could not open account/);
     for (const input of [
@@ -11807,7 +13448,12 @@ test(
     assert.equal(report.modelUsage[0].durationMs, 4321);
     assert.equal(report.modelUsage[0].costUsd, 0.01234);
     assert.equal(report.modelUsage[0].estimateUsd, 0.04567);
-    assert.deepEqual(report.runtime, { provider: 'other', modelFamily: 'custom' });
+    assert.deepEqual(report.runtime, {
+      provider: 'other',
+      modelFamily: 'custom',
+      model: null,
+      trustModel: 'llm',
+    });
     assert.equal(report.environment.appVersion, '1.2.3');
     assert.equal(report.environment.appRelease, null);
     assert.equal(report.environment.platform, null);
@@ -11880,6 +13526,10 @@ test(
       assert.equal(fallback.coverage.redaction, 'unavailable');
       assert.equal(fallback.coverage.sections.clientErrors.status, 'unavailable');
       assert.equal(fallback.coverage.sections.logs.status, 'unavailable');
+      assert.equal(fallback.coverage.sections.failures.status, 'unavailable');
+      assert.equal(fallback.coverage.sections.startupLog.status, 'unavailable');
+      assert.deepEqual(fallback.failures, []);
+      assert.deepEqual(fallback.startupLog, []);
       assert.equal(readLogs, false);
       assert.deepEqual(fallback.clientErrors, []);
       assert.deepEqual(fallback.logs, []);
@@ -11910,6 +13560,47 @@ test(
     );
   },
 );
+
+test('feedback original spans remove private data before journal persistence and reload', async (t) => {
+  const { createFeedbackLog } = await import('../src/server/feedback-log.ts');
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const root = await mkdtemp(join(tmpdir(), 'feedback-original-spans-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const redactor = createFeedbackRedactor({
+    secrets: ['/', '@', 'Author'],
+    profile: { names: [] },
+  });
+  const options = { dataRoot: root, ownerId: 'synthetic-owner', sanitize: redactor.value };
+  const log = await createFeedbackLog(options);
+  t.after(() => log.close());
+  log.record('failure', {
+    status: 503,
+    reason: 'Engine request failed',
+    message: '/Users/Synthetic Owner/PrivateLedger.docx',
+    detail: 'PrivateMailbox%40synthetic.invalid',
+    headers: ['Authorization', 'PrivateOpaqueValue'],
+  });
+  const snapshot = await log.snapshot();
+  assert.equal(snapshot.entries.length, 1);
+  assert.equal((snapshot.entries[0].data as { status: number }).status, 503);
+  const parent = join(root, 'feedback-logs');
+  const [directory] = await readdir(parent);
+  const persisted = await readFile(join(parent, directory, 'journal-0.jsonl'), 'utf8');
+  for (const privatePart of [
+    'Synthetic Owner',
+    'PrivateLedger',
+    'PrivateMailbox',
+    'synthetic.invalid',
+    'PrivateOpaqueValue',
+  ]) {
+    assert.ok(!persisted.includes(privatePart), privatePart);
+    assert.ok(!JSON.stringify(snapshot).includes(privatePart), privatePart);
+  }
+  await log.close();
+  const reopened = await createFeedbackLog(options);
+  t.after(() => reopened.close());
+  assert.deepEqual((await reopened.snapshot()).entries, snapshot.entries);
+});
 
 test('feedback journal redacts before persistence, survives restart, rotates and expires within its owner', async (t) => {
   const { createFeedbackLog } = await import('../src/server/feedback-log.ts');
@@ -12301,6 +13992,136 @@ test(
   },
 );
 
+test('transaction runs afterRollback callbacks when aborted before commit', async () => {
+  const { afterCommit, afterRollback, transaction } = await import('../src/server/transaction.ts');
+  const controller = new AbortController();
+  const reason = new Error('cancelled');
+  const released: Array<boolean | undefined> = [];
+  const client = {
+    async query(_sql: string) {
+      return { rows: [] };
+    },
+    release(destroy?: boolean) {
+      released.push(destroy);
+    },
+  };
+  const database = {
+    async connect() {
+      return client;
+    },
+  } as unknown as pg.Pool;
+  let rolledBack = 0;
+  let committed = 0;
+  await assert.rejects(
+    transaction(
+      async (tx) => {
+        afterRollback(tx, () => {
+          rolledBack++;
+        });
+        afterCommit(tx, () => {
+          committed++;
+        });
+        controller.abort(reason);
+      },
+      database,
+      controller.signal,
+    ),
+    (error) => error === reason,
+  );
+  assert.equal(rolledBack, 1);
+  assert.equal(committed, 0);
+  assert.deepEqual(released, [true]);
+
+  const afterCommitController = new AbortController();
+  const releasedAfterCommit: Array<boolean | undefined> = [];
+  const commitClient = {
+    async query(_sql: string) {
+      return { rows: [] };
+    },
+    release(destroy?: boolean) {
+      releasedAfterCommit.push(destroy);
+    },
+  };
+  let postCommitRollbacks = 0;
+  await transaction(
+    async (tx) => {
+      afterRollback(tx, () => {
+        postCommitRollbacks++;
+      });
+      afterCommit(tx, () => {
+        afterCommitController.abort(reason);
+      });
+    },
+    {
+      async connect() {
+        return commitClient;
+      },
+    } as unknown as pg.Pool,
+    afterCommitController.signal,
+  );
+  assert.equal(postCommitRollbacks, 0);
+  assert.deepEqual(releasedAfterCommit, [undefined]);
+});
+
+test(
+  'a transaction stopped while its commit is pending does not run its rollback callbacks',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  async (t) => {
+    const { afterRollback, transaction } = await import('../src/server/transaction.ts');
+    const schema = `test_commit_stop_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    let pid = 0;
+    t.after(async () => {
+      await pool.end();
+      if (pid) await admin.query('SELECT pg_terminate_backend($1)', [pid]);
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    });
+    await pool.query(`
+      CREATE TABLE held(id int);
+      CREATE FUNCTION hold_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_sleep(20); RETURN NULL; END $$;
+      CREATE CONSTRAINT TRIGGER hold_commit AFTER INSERT ON held
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION hold_commit();
+    `);
+    const controller = new AbortController();
+    let rolledBack = 0;
+    const pending = transaction(
+      async (client) => {
+        pid = (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+        await client.query('INSERT INTO held VALUES (1)');
+        afterRollback(client, () => {
+          rolledBack++;
+        });
+      },
+      pool,
+      controller.signal,
+    );
+    const rejected = assert.rejects(pending);
+    let committing = false;
+    for (const deadline = Date.now() + 10_000; !committing && Date.now() < deadline;) {
+      committing = Boolean(
+        (
+          await admin.query(
+            "SELECT 1 FROM pg_stat_activity WHERE pid=$1 AND state='active' AND query='COMMIT'",
+            [pid],
+          )
+        ).rowCount,
+      );
+      if (!committing) await delay(10);
+    }
+    assert.ok(committing);
+    controller.abort(new Error('Synthetic Stop'));
+    await rejected;
+    assert.equal(rolledBack, 0);
+  },
+);
+
 test('a first task stays open after its chat turn ends and follows its own saved task', () => {
   const messages = [
     { id: 'old-request', role: 'user' as const, text: 'Draft the reply', turnId: 'old-turn' },
@@ -12331,6 +14152,35 @@ test('a first task stays open after its chat turn ends and follows its own saved
   assert.equal(status(), 'sent');
 });
 
+test('the onboarding brief masks each link and keeps the fields after it', async () => {
+  const { masked } = await import('../src/server/onboarding-suggestions.ts');
+  const event = {
+    htmlLink: 'https://calendar.example.test/event?eid=abc',
+    start: { dateTime: '2026-10-24T09:00:00Z' },
+    end: { dateTime: '2026-10-24T09:30:00Z' },
+    summary: 'Planning',
+  };
+  assert.deepEqual(JSON.parse(masked(JSON.stringify({ items: [event, event] }))), {
+    items: [event, event].map((item) => ({ ...item, htmlLink: '[link]' })),
+  });
+  const quoted = { note: 'Open https://files.example.test/a"b?token=zzz then reply', next: 'kept' };
+  const brief = masked(JSON.stringify(quoted));
+  assert.deepEqual(JSON.parse(brief), { note: 'Open [link] then reply', next: 'kept' });
+  assert.ok(!brief.includes('zzz'));
+});
+
+test('a web search label keeps a known secret out even when operators or quotes split it', async () => {
+  const { createTextRedactor } = await import('../src/server/redaction.ts');
+  const redact = createTextRedactor(['synthetic alpha beta']);
+  const label = webTarget(
+    'web_search',
+    { query: 'password:"synthetic alpha beta" forecast' },
+    redact,
+  );
+  assert.deepEqual(label, { detail: 'forecast' });
+  assert.doesNotMatch(JSON.stringify(label), /alpha|beta/);
+});
+
 test(
   'the live line uses an active tool label, drops old steps, and keeps work Nod started apart',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
@@ -12348,7 +14198,8 @@ test(
         CREATE TABLE tasks(id uuid PRIMARY KEY, owner_id text NOT NULL, session_id uuid, title text, now_text text,
           message_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE turn_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), turn_id uuid, type text, summary text DEFAULT '',
-          site text, call_id uuid, created_at timestamptz DEFAULT now());
+          site text, detail text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
+        CREATE INDEX turn_events_progress ON turn_events(turn_id,created_at,id) WHERE type IN ('step','steered');
         CREATE TABLE messages(id uuid PRIMARY KEY, owner_id text, turn_id uuid, role text, created_at timestamptz DEFAULT now())`);
       const { createActivity } = await import('../src/server/activity.ts');
       const owner = 'activity-fixture-owner';
@@ -12451,6 +14302,59 @@ test(
       item = await live();
       assert.equal(item.step, null);
       assert.ok(item.tool);
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,site) VALUES($1,'tool_complete','apps','Gmail'),($1,'tool_complete','files','Local files')",
+        [chat],
+      );
+      const recentActions = (await live()).recent;
+      assert.ok(
+        recentActions?.some(
+          (entry) => entry.summary === 'Used a connected app' && entry.site === 'Gmail',
+        ),
+      );
+      assert.ok(
+        recentActions?.some(
+          (entry) => entry.summary === 'Handled local files' && entry.site === 'Local files',
+        ),
+      );
+      const mainRun = randomUUID();
+      const helperRun = randomUUID();
+      const recentCall = randomUUID();
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id) VALUES($1,'step','Checking the synthetic report',$2)",
+        [chat, mainRun],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id) VALUES($1,'step','Checking a separate helper source',$2)",
+        [chat, helperRun],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id,call_id) VALUES($1,'tool_start','read',$2,$3)",
+        [chat, mainRun, recentCall],
+      );
+      const completed = await pool.query<{ id: string }>(
+        "INSERT INTO turn_events(turn_id,type,summary,run_id,call_id) VALUES($1,'tool_complete','read',$2,$3) RETURNING id",
+        [chat, mainRun, recentCall],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary) VALUES($1,'tool_failed','Synthetic failed operation'),($1,'tool_complete','set status')",
+        [chat],
+      );
+      item = await live();
+      assert.equal(item.recent?.length, 3);
+      assert.deepEqual(item.recent?.[0], {
+        id: completed.rows[0]!.id,
+        summary: 'Checking the synthetic report',
+        site: null,
+      });
+      assert.equal(
+        item.recent?.some((entry) => entry.summary.includes('failed')),
+        false,
+      );
+      assert.equal(
+        item.recent?.some((entry) => entry.summary === 'set status'),
+        false,
+      );
       const taskSession = randomUUID();
       const taskTurn = randomUUID();
       const observerTurn = randomUUID();
@@ -12468,6 +14372,214 @@ test(
       assert.equal(
         items.some((entry) => entry.turnId === observerTurn),
         false,
+      );
+      const foreignThread = randomUUID();
+      const foreignTurn = randomUUID();
+      await pool.query("INSERT INTO threads(id,owner_id) VALUES($1,'other-activity-owner')", [
+        foreignThread,
+      ]);
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status,started_at) VALUES($1,'other-activity-owner',$2,$2,'user','running',now())",
+        [foreignTurn, foreignThread],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary) VALUES($1,'tool_complete','Synthetic task operation'),($2,'tool_complete','Synthetic foreign operation')",
+        [taskTurn, foreignTurn],
+      );
+      const scoped = await activity.read();
+      assert.equal(
+        scoped.some((entry) => entry.turnId === foreignTurn),
+        false,
+      );
+      assert.equal(
+        scoped.find((entry) => entry.turnId === chat)?.recent?.[0]?.id,
+        completed.rows[0]!.id,
+      );
+      assert.equal(
+        scoped.find((entry) => entry.turnId === taskTurn)?.recent?.[0]?.summary,
+        'Synthetic task operation',
+      );
+      await pool.query('DELETE FROM turn_events WHERE turn_id=$1', [chat]);
+      const completedSteps: string[] = [];
+      let eventTime = Date.now() - 60_000;
+      const record = async (
+        type: string,
+        callId: string | null,
+        site: string | null,
+        runId = mainRun,
+      ) => {
+        const result = await pool.query<{ id: string }>(
+          `INSERT INTO turn_events(turn_id,type,summary,run_id,call_id,site,created_at)
+            VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+          [
+            chat,
+            type,
+            type === 'step' ? 'Checking synthetic notes' : 'read',
+            runId,
+            callId,
+            site,
+            new Date(eventTime++),
+          ],
+        );
+        return result.rows[0]!.id;
+      };
+      for (let step = 0; step < 5; step++) {
+        await record('step', null, null);
+        let latest = '';
+        for (let call = 0; call < (step === 4 ? 6 : 1); call++) {
+          const callId = randomUUID();
+          const site = call % 2 ? 'example.test' : null;
+          await record('tool_start', callId, site);
+          latest = await record('tool_complete', callId, site);
+        }
+        completedSteps.unshift(latest);
+      }
+      const eventCount = (
+        await pool.query('SELECT count(*) FROM turn_events WHERE turn_id=$1', [chat])
+      ).rows[0].count;
+      const grouped = (await live()).recent;
+      assert.deepEqual(
+        grouped?.map((entry) => entry.id),
+        completedSteps.slice(0, 4),
+        'Each completed step appears once, with earlier steps retained before the four-entry limit',
+      );
+      assert.equal(grouped?.[0]?.site, 'example.test');
+      assert.equal(
+        (await pool.query('SELECT count(*) FROM turn_events WHERE turn_id=$1', [chat])).rows[0]
+          .count,
+        eventCount,
+      );
+      await record('step', null, null, helperRun);
+      const runCompletions = new Map<string, string>();
+      for (let call = 0; call < 2; call++)
+        for (const runId of [mainRun, helperRun]) {
+          const callId = randomUUID();
+          await record('tool_start', callId, null, runId);
+          runCompletions.set(runId, await record('tool_complete', callId, null, runId));
+        }
+      assert.deepEqual(
+        (await live()).recent?.slice(0, 2).map((entry) => entry.id),
+        [runCompletions.get(helperRun), runCompletions.get(mainRun)],
+        'A helper progress update cannot group the parent run with its helper',
+      );
+      const ungrouped = async () => {
+        const completions: string[] = [];
+        for (let call = 0; call < 2; call++) {
+          const callId = randomUUID();
+          await record('tool_start', callId, null);
+          completions.unshift(await record('tool_complete', callId, null));
+        }
+        assert.deepEqual(
+          (await live()).recent?.slice(0, 2).map((entry) => entry.id),
+          completions,
+          'Operations without a current step keep their individual activity entries',
+        );
+      };
+      await record('steered', null, null);
+      await ungrouped();
+      for (const summary of ['   ', '\t\n', '\u00a0', '\u2007', '\u202f', '\ufeff']) {
+        await pool.query('UPDATE turn_events SET summary=$2 WHERE id=$1', [
+          await record('step', null, null),
+          summary,
+        ]);
+        await ungrouped();
+      }
+      const { recordIntent } = await import('../src/server/thread.ts');
+      const asked = randomUUID();
+      const askedThread = randomUUID();
+      await pool.query('INSERT INTO threads(id,owner_id) VALUES($1,$2)', [askedThread, owner]);
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status,started_at) VALUES($1,$2,$3,$3,'user','running',now())",
+        [asked, owner, askedThread],
+      );
+      const intent = async () => (await activity.read()).find((entry) => entry.turnId === asked)!;
+      const client = await pool.connect();
+      try {
+        await recordIntent(client, asked, 'Checking the synthetic weather');
+        await recordIntent(client, asked, 'A second synthetic line');
+      } finally {
+        client.release();
+      }
+      assert.equal((await intent()).step, 'Checking the synthetic weather');
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,call_id) VALUES($1,'tool_start','web search',$2)",
+        [asked, randomUUID()],
+      );
+      item = await intent();
+      assert.equal(item.step, 'Checking the synthetic weather');
+      assert.equal(item.tool, 'Searching the web');
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,created_at) VALUES($1,'thought','Comparing synthetic forecasts',now()+interval '1 second')",
+        [asked],
+      );
+      assert.equal((await intent()).step, 'Comparing synthetic forecasts');
+      const search = randomUUID();
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary,detail,call_id,created_at) VALUES($1,'tool_start','web search','synthetic forecast',$2,now()+interval '2 seconds')",
+        [asked, search],
+      );
+      assert.equal((await intent()).tool, 'Searching “synthetic forecast”');
+      await pool.query(
+        `INSERT INTO turn_events(turn_id,type,summary,detail,site,call_id,created_at) VALUES
+          ($1,'tool_complete','web search','synthetic forecast',NULL,$2,now()+interval '3 seconds'),
+          ($1,'tool_complete','tool search',NULL,NULL,$3,now()+interval '4 seconds'),
+          ($1,'tool_complete','fetch content',NULL,'forecast.example',$4,now()+interval '5 seconds')`,
+        [asked, search, randomUUID(), randomUUID()],
+      );
+      assert.deepEqual(
+        (await intent()).recent?.map(({ summary, site }) => [summary, site]),
+        [
+          ['Read forecast.example', null],
+          ['Searched “synthetic forecast”', null],
+        ],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,created_at) VALUES($1,'steered',now()+interval '6 seconds')",
+        [asked],
+      );
+      item = await intent();
+      assert.equal(item.step, null);
+      assert.equal(item.recent, undefined);
+      const steeredClient = await pool.connect();
+      try {
+        await recordIntent(steeredClient, asked, 'Checking the synthetic follow-up');
+        await pool.query(
+          "UPDATE turn_events SET created_at=now()+interval '7 seconds' WHERE turn_id=$1 AND type='intent' AND summary='Checking the synthetic follow-up'",
+          [asked],
+        );
+        assert.notEqual((await intent()).step, 'Checking the synthetic follow-up');
+        await recordIntent(steeredClient, asked, 'Checking the synthetic follow-up', 1);
+        await pool.query(
+          "UPDATE turn_events SET created_at=now()+interval '7 seconds' WHERE turn_id=$1 AND type='intent' AND summary='Checking the synthetic follow-up'",
+          [asked],
+        );
+      } finally {
+        steeredClient.release();
+      }
+      assert.equal((await intent()).step, 'Checking the synthetic follow-up');
+      const late = randomUUID();
+      await pool.query(
+        "INSERT INTO turns(id,owner_id,thread_id,session_id,source,status,started_at) VALUES($1,$2,$3,$3,'user','running',now())",
+        [late, owner, askedThread],
+      );
+      await pool.query(
+        "INSERT INTO turn_events(turn_id,type,summary) VALUES($1,'step','Reading synthetic notes')",
+        [late],
+      );
+      const lateClient = await pool.connect();
+      try {
+        await recordIntent(lateClient, late, 'Too late synthetic line');
+      } finally {
+        lateClient.release();
+      }
+      assert.equal(
+        (
+          await pool.query(
+            "SELECT count(*)::int AS n FROM turn_events WHERE turn_id=$1 AND type='intent'",
+            [late],
+          )
+        ).rows[0].n,
+        0,
       );
     } finally {
       await pool.end();
@@ -12507,7 +14619,7 @@ test(
         CREATE TABLE tasks(id uuid PRIMARY KEY, owner_id text NOT NULL, session_id uuid, title text, now_text text,
           message_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE turn_events(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), turn_id uuid, type text, summary text DEFAULT '',
-          site text, call_id uuid, created_at timestamptz DEFAULT now());
+          site text, detail text, call_id uuid, run_id uuid, created_at timestamptz DEFAULT now());
         CREATE TABLE messages(id uuid PRIMARY KEY, owner_id text, turn_id uuid, role text, created_at timestamptz DEFAULT now())`);
       const threadId = randomUUID();
       const scheduled = randomUUID();

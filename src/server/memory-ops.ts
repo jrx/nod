@@ -5,9 +5,10 @@ import {
   areaEntries,
   fits,
   factSchema,
-  fold,
+  foldQuote,
   freeSlug,
   line,
+  lines,
   locate,
   path,
   pathOf,
@@ -25,11 +26,11 @@ const reflectOp = z.discriminatedUnion('op', [
     op: z.literal('add'),
     area,
     slug,
-    text: line(),
+    text: lines(),
     abstract: line(120).optional().catch(undefined),
     expires: z.iso.date().optional().catch(undefined),
     m: ordinals,
-    quote: line(),
+    quote: lines(),
     sensitive: z.boolean(),
     fact: factSchema.optional().catch(undefined),
     replaces: z.array(path).max(8).optional(),
@@ -39,11 +40,13 @@ const reflectOp = z.discriminatedUnion('op', [
     path,
     reason: z.enum(['obsolete', 'contradicted']),
     m: ordinals,
-    quote: line(),
+    quote: lines(),
   }),
 ]);
 
 const union = (...lists: string[][]) => [...new Set(lists.flat())].slice(-5);
+
+export type Rejection = 'invalid' | 'quote' | 'secret' | 'missing' | 'full';
 
 export function applyOps(
   tree: Tree,
@@ -53,13 +56,21 @@ export function applyOps(
   origin: 'inferred' | 'stated' = 'inferred',
 ) {
   const applied: Array<{ operation: 'archive' | 'save'; path: string; text: string }> = [];
+  const rejected: Rejection[] = [];
   const ops = raw.flatMap((item) => {
     const parsed = reflectOp.safeParse(item);
-    return parsed.success ? [parsed.data] : [];
+    if (parsed.success) return [parsed.data];
+    rejected.push('invalid');
+    return [];
   });
   const replace = (op: Extract<z.infer<typeof reflectOp>, { op: 'add' }>, target: string) => {
     for (const previous of op.replaces ?? []) {
       const entry = locate(tree, previous);
+      if (
+        !entry &&
+        !applied.some(({ operation, path }) => operation === 'archive' && path === previous)
+      )
+        rejected.push('missing');
       if (!entry || previous === target || (origin === 'inferred' && entry.origin !== 'inferred'))
         continue;
       archive(tree, entry, 'superseded', now, target);
@@ -71,21 +82,32 @@ export function applyOps(
     ...ops.filter(({ op }) => op === 'add'),
   ]) {
     const cited = op.m.flatMap((n) => messages[n - 1] ?? []);
-    const quoted = cited.filter((m) => fold(m.text).includes(fold(op.quote)));
-    if (cited.length !== op.m.length || !quoted.length || unsafe(op.quote)) continue;
+    const quoted = cited.filter((m) => foldQuote(m.text).includes(foldQuote(op.quote)));
+    if (cited.length !== op.m.length || !quoted.length || !foldQuote(op.quote).trim()) {
+      rejected.push('quote');
+      continue;
+    }
+    if (unsafe(op.quote)) {
+      rejected.push('secret');
+      continue;
+    }
     const sources = union(quoted.map((m) => m.id));
     if (op.op === 'archive') {
       const entry = locate(tree, op.path);
-      if (!entry || (origin === 'inferred' && entry.origin !== 'inferred')) continue;
+      if (!entry) {
+        rejected.push('missing');
+        continue;
+      }
+      if (origin === 'inferred' && entry.origin !== 'inferred') continue;
       archive(tree, entry, op.reason, now);
       applied.push({ operation: 'archive', path: op.path, text: entry.text });
       continue;
     }
-    if (
-      unsafe(op.text, op.abstract, ...(op.fact?.entities ?? [])) ||
-      (origin === 'inferred' && op.sensitive && !tree.sensitive)
-    )
+    if (unsafe(op.text, op.abstract, ...(op.fact?.entities ?? []))) {
+      rejected.push('secret');
       continue;
+    }
+    if (origin === 'inferred' && op.sensitive && !tree.sensitive) continue;
     const match = areaEntries(tree, op.area).find((entry) => same(entry.text, op.text));
     const previous = { entries: tree.entries, archive: tree.archive, applied: applied.length };
     let entry: Entry;
@@ -119,9 +141,10 @@ export function applyOps(
       tree.entries = previous.entries;
       tree.archive = previous.archive;
       applied.length = previous.applied;
+      rejected.push('full');
       continue;
     }
     applied.push({ operation: 'save', path: pathOf(entry), text: entry.text });
   }
-  return applied;
+  return { applied, rejected };
 }

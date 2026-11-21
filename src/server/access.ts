@@ -5,7 +5,10 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 
 const token = /^[A-Za-z0-9_-]{43}$/;
 
-async function localKey(dataRoot: string, name: 'access-key' | 'credential-request-key') {
+async function localKey(
+  dataRoot: string,
+  name: 'access-key' | 'credential-request-key' | 'trace-key',
+) {
   const path = join(dataRoot, name);
   if (!token.test(await readFile(path, 'utf8').catch(() => ''))) {
     await mkdir(dataRoot, { recursive: true, mode: 0o700 });
@@ -27,6 +30,7 @@ async function localKey(dataRoot: string, name: 'access-key' | 'credential-reque
 export const accessKey = (dataRoot: string) => localKey(dataRoot, 'access-key');
 export const credentialRequestKey = (dataRoot: string) =>
   localKey(dataRoot, 'credential-request-key');
+export const traceKey = (dataRoot: string) => localKey(dataRoot, 'trace-key');
 
 export const accessCookie = (port: number) => `nod-access-${port}`;
 

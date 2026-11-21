@@ -1,10 +1,15 @@
-import { browserErrorMessage, type BrowserErrorCode } from '../shared/browser-errors.ts';
+import {
+  browserErrorMessage,
+  type BrowserErrorCode,
+  type BrowserSignInGuard,
+} from '../shared/browser-errors.ts';
 import type { BrowserHandoffInput } from '../shared/browser-handoff.ts';
 
 export class BrowserActionError extends Error {
   constructor(
     readonly code: BrowserErrorCode,
     readonly detail?: string,
+    readonly signInGuard?: BrowserSignInGuard,
   ) {
     super(
       detail
@@ -163,8 +168,11 @@ export interface Computer {
     state: 'live' | 'last_known' | 'unavailable';
     capturedAt?: string;
   };
-  injectCredentials(input: CredentialInput): Promise<CredentialSubmission | void>;
-  fillCard(input: CardEntry): Promise<void>;
+  injectCredentials(
+    input: CredentialInput,
+    signal?: AbortSignal,
+  ): Promise<CredentialSubmission | void>;
+  fillCard(input: CardEntry, signal?: AbortSignal): Promise<void>;
   cardDestinations(
     threadId: string,
     fields: CardFields,
@@ -201,6 +209,12 @@ export interface ConnectedCli {
   command: string;
   source: CliSource;
 }
+export interface ConnectedCliResult {
+  exitCode: number;
+  output: string;
+  stdout?: string;
+  stderr?: string;
+}
 export interface WorkspaceSession {
   path: string;
   instructions: string;
@@ -210,7 +224,7 @@ export interface WorkspaceSession {
     args: string[],
     environment: Record<string, string>,
     timeoutSeconds?: number,
-  ): Promise<{ exitCode: number; output: string }>;
+  ): Promise<ConnectedCliResult>;
 }
 export interface Workspace {
   connectedCliAvailable?: boolean;

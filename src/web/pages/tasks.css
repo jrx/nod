@@ -43,6 +43,13 @@
 .schedule-inactive[open] > summary > svg {
   transform: rotate(180deg);
 }
+.schedule-live-line {
+  color: var(--text-secondary);
+  font-size: var(--text-control);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .schedule-inactive > .saved-plan-list {
   margin-top: 12px;
 }
@@ -198,6 +205,16 @@
   outline: 2px solid var(--primary);
   outline-offset: -2px;
 }
+.task-preview-head-live {
+  padding-bottom: 4px;
+}
+.task-preview-live-line {
+  min-width: 0;
+  padding: 0 16px 16px;
+  color: var(--text-secondary);
+  font-size: var(--text-control);
+  line-height: 1.5;
+}
 .task-preview-heading {
   margin: 0;
   font: inherit;
@@ -323,6 +340,9 @@
 .tasks-page .task-preview-body {
   padding: 20px 24px 24px;
 }
+.tasks-page .task-preview-live-line {
+  padding: 0 24px 24px;
+}
 
 .task-preview-meta > svg,
 .task-preview-steps svg {
@@ -363,10 +383,16 @@
   .tasks-page .task-preview-body {
     padding: 16px;
   }
+  .tasks-page .task-preview-live-line {
+    padding: 0 16px 16px;
+  }
   .task-preview-actions .button,
   .tasks-page .saved-plan-footer .button {
     min-height: 40px;
   }
+}
+.tasks-page .task-preview-head-live {
+  padding-bottom: 4px;
 }
 @media (prefers-reduced-motion: reduce) {
   .task-preview-chevron,

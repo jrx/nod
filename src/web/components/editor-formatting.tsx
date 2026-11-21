@@ -152,7 +152,7 @@ function FormattingMenu({
   function applyLink() {
     const href = linkHref(url);
     if (!href) return setLinkError(true);
-    editor.chain().focus().extendMarkRange('link').setLink({ href }).run();
+    editor.chain().focus().extendMarkRange('link').unsetMark('rawPaste').setLink({ href }).run();
     closePanel();
   }
   function applyStyle(value: (typeof styles)[number][0]) {

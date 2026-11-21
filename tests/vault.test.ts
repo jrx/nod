@@ -5,11 +5,13 @@ import { act, createElement } from 'react';
 import { JSDOM } from 'jsdom';
 import { runProcess } from '../src/providers/process.ts';
 import { Vault } from '../src/web/pages/vault.tsx';
-import { Credentials } from '../src/web/pages/credentials.tsx';
+import { Credentials, Payment } from '../src/web/pages/credentials.tsx';
 import { SetupActions } from '../src/web/components/setup-link.tsx';
 import { messageSetupLinks } from '../src/web/lib/message-links.ts';
 import { paymentInvitation } from '../src/runtime/communication.ts';
 import { PrivateEntryWorkspace, usePrivateEntry } from '../src/web/components/private-entry.tsx';
+import { VaultItemForm } from '../src/web/components/vault-item-form.tsx';
+import { VaultDetails } from '../src/web/components/vault-details.tsx';
 import { pageDataCache } from '../src/web/lib/page-data-cache.ts';
 import { Composio } from '@composio/core';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -22,6 +24,7 @@ import {
   normalizedEmail,
   verificationCode,
   verificationSenderDomain,
+  type EmailCodeRequest,
 } from '../src/server/email-code.ts';
 import { createIntegrations } from '../src/server/integrations.ts';
 import type { TurnRef } from '../src/server/thread.ts';
@@ -44,6 +47,8 @@ import { PasswordManagerError, type PasswordManager } from '../src/ports/passwor
 import { createPayments } from '../src/server/payments.ts';
 import type { CardEntry } from '../src/ports/computer.ts';
 import { withFailureLog } from '../src/server/failure-log.ts';
+import { cancelTurnOperations } from '../src/server/turn-cancellation.ts';
+import { afterCommit } from '../src/server/transaction.ts';
 
 async function seedTurns(pool: pg.Pool) {
   await pool.query(
@@ -212,7 +217,7 @@ test('an idle 1Password helper closing late never fails a request on its replace
   }
 });
 
-async function vaultFixture() {
+async function vaultFixture(emailCode?: Parameters<typeof createVault>[1]['emailCode']) {
   const schema = `test_vault_${randomUUID().replaceAll('-', '')}`;
   const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
   await admin.query(`CREATE SCHEMA ${schema}`);
@@ -228,7 +233,36 @@ async function vaultFixture() {
     origin: 'https://example.com',
     url: 'https://example.com/login',
   });
-  const vault = await createVault(pool, {
+  let cancelAtCommit: string | undefined;
+  const database = new Proxy(pool, {
+    get(target, member) {
+      if (member === 'connect')
+        return async () => {
+          const client = await target.connect();
+          return new Proxy(client, {
+            get(connection, key) {
+              if (key === 'query')
+                return async (...args: Parameters<typeof client.query>) => {
+                  const value = await client.query(...args);
+                  if (args[0] === 'COMMIT' && cancelAtCommit) {
+                    const turnId = cancelAtCommit;
+                    cancelAtCommit = undefined;
+                    await pool.query("UPDATE turns SET status='cancelled' WHERE id=$1", [turnId]);
+                    cancelTurnOperations([turnId]);
+                  }
+                  return value;
+                };
+              const value = Reflect.get(connection, key);
+              return typeof value === 'function' ? value.bind(connection) : value;
+            },
+          });
+        };
+      const value = Reflect.get(target, member);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const vault = await createVault(database, {
+    emailCode,
     requestKey: Buffer.alloc(32, 42),
     keyStore: { id: 'fixture', configured: true, getKey: async () => randomBytes(32) },
     page: () => inspecting(),
@@ -269,6 +303,9 @@ async function vaultFixture() {
     app,
     vault,
     calls,
+    cancelBeforeEntry(turnId: string) {
+      cancelAtCommit = turnId;
+    },
     resumed: async () =>
       (
         await pool.query(
@@ -304,6 +341,83 @@ async function vaultFixture() {
     },
   };
 }
+
+test(
+  'automatic login and email-code entry preserve a known stop without a fallback form',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async () => {
+    const f = await vaultFixture(async () => ({ code: '381742', current: async () => true }));
+    try {
+      const first = await f.turn();
+      const invitation = await f.vault.request(first, 'local-development', {
+        origin: 'https://example.com',
+        label: 'Synthetic staged sign-in',
+        kind: 'identifier',
+        usernameSelector: '#username',
+      });
+      await f.wait(first);
+      const entered = await f.app.inject({
+        method: 'POST',
+        url: invitation.url.replace('/vault/', '/api/credential-requests/'),
+        payload: { username: 'synthetic@example.com', password: 'Synthetic held password' },
+      });
+      assert.equal(entered.statusCode, 200, entered.body);
+      const resumed = await f.resume(first);
+      const before = f.calls.injected;
+      f.cancelBeforeEntry(resumed.turnId);
+      await assert.rejects(
+        f.vault.fillSelected(resumed, 'local-development', {
+          origin: 'https://example.com',
+          label: 'Synthetic staged sign-in',
+          kind: 'password',
+          passwordSelector: '#password',
+        }),
+        (error: unknown) =>
+          error instanceof Error && 'notEntered' in error && error.notEntered === true,
+      );
+      assert.equal(f.calls.injected, before);
+      assert.equal(
+        (await f.pool.query('SELECT 1 FROM credential_requests WHERE turn_id=$1', [resumed.turnId]))
+          .rowCount,
+        0,
+      );
+      const email = await f.turn();
+      await f.pool.query(
+        "UPDATE turns SET started_at=clock_timestamp()-interval '1 second' WHERE id=$1",
+        [email.turnId],
+      );
+      f.cancelBeforeEntry(email.turnId);
+      await assert.rejects(
+        f.vault.fillEmailCode(email, 'local-development', {
+          origin: 'https://example.com',
+          label: 'Synthetic email code',
+          kind: 'otp',
+          emailCode: true,
+          emailRecipient: 'synthetic@example.com',
+          passwordSelector: '#code',
+        }),
+        (error: unknown) =>
+          error instanceof Error && 'notEntered' in error && error.notEntered === true,
+      );
+      assert.equal(f.calls.injected, before);
+      assert.equal(
+        (await f.pool.query('SELECT 1 FROM credential_requests WHERE turn_id=$1', [email.turnId]))
+          .rowCount,
+        0,
+      );
+      assert.deepEqual(
+        (
+          await f.pool.query(
+            "SELECT status FROM vault_uses WHERE kind IN ('password','otp') ORDER BY created_at",
+          )
+        ).rows,
+        [{ status: 'not_entered' }, { status: 'not_entered' }],
+      );
+    } finally {
+      await f.close();
+    }
+  },
+);
 
 test(
   'interrupted Vault claims and private entry retain uncertainty without replay or secret diagnostics',
@@ -472,6 +586,33 @@ test(
         (error: unknown) => error instanceof VaultUseError && error.statusCode === 409,
       );
       assert.equal(websiteSubmissions, 1);
+      const scripted = { ...use, id: randomUUID() };
+      await assert.rejects(
+        uses.run(scripted, {
+          perform: async () => {
+            throw new BrowserActionError('browser_card_reload', 'fixture-private-value');
+          },
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof VaultUseError);
+          assert.equal(error.statusCode, 502);
+          assert.match(error.message, /Reload the page/);
+          assert.equal(error.message.includes('fixture-private-value'), false);
+          return true;
+        },
+      );
+      assert.equal(
+        (await f.pool.query('SELECT status FROM vault_uses WHERE id=$1', [scripted.id])).rows[0]
+          .status,
+        'uncertain',
+      );
+      await assert.rejects(
+        uses.run(scripted, { perform: operation.perform }),
+        (error: unknown) => error instanceof VaultUseError && error.statusCode === 409,
+      );
+      const beforeRecovery = entries;
+      await uses.run({ ...use, id: randomUUID() }, operation);
+      assert.equal(entries, beforeRecovery + 1);
       for (const code of ['ECONNRESET', 'UND_ERR_SOCKET']) {
         const disconnected = { ...use, id: randomUUID() };
         await withFailureLog(record, async () => {
@@ -485,6 +626,45 @@ test(
           );
         });
       }
+      const stoppedPreparation = { ...use, id: randomUUID() };
+      const beforePreparation = entries;
+      await assert.rejects(
+        uses.run(stoppedPreparation, {
+          prepare: async () => {
+            cancelTurnOperations([stoppedPreparation.turnId]);
+            return false;
+          },
+          perform: operation.perform,
+        }),
+        (error: unknown) =>
+          error instanceof VaultUseError && error.statusCode === 409 && error.notEntered,
+      );
+      assert.equal(entries, beforePreparation);
+      assert.equal(
+        (await f.pool.query('SELECT 1 FROM vault_uses WHERE id=$1', [stoppedPreparation.id]))
+          .rowCount,
+        0,
+      );
+      const lifetime = new AbortController();
+      const closingUses = await createVaultUses(
+        f.pool,
+        'local-development',
+        undefined,
+        lifetime.signal,
+      );
+      const afterShutdown = { ...use, id: randomUUID() };
+      lifetime.abort();
+      const entriesBeforeShutdown = entries;
+      await assert.rejects(
+        closingUses.run(afterShutdown, operation),
+        (error: unknown) =>
+          error instanceof VaultUseError && error.statusCode === 409 && error.notEntered,
+      );
+      assert.equal(entries, entriesBeforeShutdown);
+      assert.equal(
+        (await f.pool.query('SELECT 1 FROM vault_uses WHERE id=$1', [afterShutdown.id])).rowCount,
+        0,
+      );
       const unfinished = { ...use, id: randomUUID() };
       await withFailureLog(record, async () => {
         await assert.rejects(
@@ -553,6 +733,103 @@ test(
         ).includes('fixture-private-value'),
         false,
       );
+      const stopped = await f.turn();
+      const privatePath = await f.link(stopped);
+      await f.wait(stopped);
+      const entriesBeforeStop = f.calls.injected;
+      f.cancelBeforeEntry(stopped.turnId);
+      const stoppedReply = await f.submit(privatePath);
+      assert.equal(stoppedReply.statusCode, 409, stoppedReply.body);
+      assert.match(stoppedReply.json().error, /stopped before entry/);
+      assert.equal(f.calls.injected, entriesBeforeStop);
+      const stoppedDescription = (await f.app.inject({ url: privatePath })).json();
+      assert.equal(stoppedDescription.status, 'expired');
+      assert.equal(stoppedDescription.notEntered, true);
+      const stoppedId = privatePath.split('/').at(-1)!;
+      const stoppedView = await vaultPage(
+        createElement(Credentials, { id: stoppedId }),
+        async (path) => {
+          const reply = await f.app.inject({ url: path });
+          return new Response(reply.body, {
+            status: reply.statusCode,
+            headers: { 'content-type': 'application/json' },
+          });
+        },
+        `http://localhost:4310/vault/${stoppedId}`,
+      );
+      try {
+        for (
+          let attempt = 0;
+          !stoppedView.document.body.textContent?.includes('Stopped before entry') && attempt < 100;
+          attempt++
+        )
+          await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          });
+        assert.match(stoppedView.document.body.textContent!, /No values were entered in this step/);
+        assert.doesNotMatch(
+          stoppedView.document.body.textContent!,
+          /result is unknown|may have reached/i,
+        );
+        assert.equal(stoppedView.document.querySelectorAll('input, button').length, 0);
+        await stoppedView.render(createElement(Credentials, { id: stoppedId, key: 'reload' }));
+        for (
+          let attempt = 0;
+          !stoppedView.document.body.textContent?.includes('Stopped before entry') && attempt < 100;
+          attempt++
+        )
+          await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          });
+        assert.match(stoppedView.document.body.textContent!, /No values were entered in this step/);
+      } finally {
+        await stoppedView.close();
+      }
+      const codeTurn = await f.turn();
+      const codeInvitation = await f.vault.request(codeTurn, 'local-development', {
+        origin: 'https://example.com',
+        label: 'Synthetic code',
+        kind: 'otp',
+        passwordSelector: '#code',
+      });
+      await f.wait(codeTurn);
+      const codeRequestId = (
+        await f.pool.query('SELECT id FROM credential_requests WHERE turn_id=$1', [codeTurn.turnId])
+      ).rows[0].id;
+      f.cancelBeforeEntry(codeTurn.turnId);
+      assert.deepEqual(
+        await f.vault.submitChatCode('local-development', codeTurn.turnId, '563829', codeRequestId),
+        { status: 'unavailable', notEntered: true },
+      );
+      assert.equal(
+        (
+          await f.app.inject({
+            url: codeInvitation.url.replace('/vault/', '/api/credential-requests/'),
+          })
+        ).json().notEntered,
+        true,
+      );
+      assert.equal(f.calls.injected, entriesBeforeStop);
+
+      assert.deepEqual((await f.app.inject({ url: `${privatePath}/status` })).json(), {
+        status: 'expired',
+        notEntered: true,
+      });
+      assert.equal((await f.submit(privatePath)).statusCode, 409);
+      assert.equal(
+        (await f.app.inject({ method: 'POST', url: `${privatePath}/retry`, payload: {} }))
+          .statusCode,
+        409,
+      );
+      assert.equal(f.calls.injected, entriesBeforeStop);
+      assert.deepEqual(
+        (
+          await f.pool.query('SELECT status FROM vault_uses WHERE root_turn_id=$1', [
+            stopped.turnId,
+          ])
+        ).rows,
+        [{ status: 'not_entered' }],
+      );
     } finally {
       await f.close();
     }
@@ -604,16 +881,22 @@ test(
     const stages = new Map<string, CredentialKind>();
     const injections: CredentialInjection[] = [];
     const resumed: string[] = [];
+    const emailCodeRequests: EmailCodeRequest[] = [];
     let app = Fastify();
+    let observedOrigin = 'https://example.com';
     const options = {
       requestKey: Buffer.alloc(32, 42),
       keyStore: { id: 'fixture', configured: true, getKey: async () => key },
-      page: async () => ({ origin: 'https://example.com', url: 'https://example.com/login' }),
+      page: async () => ({ origin: observedOrigin, url: `${observedOrigin}/login` }),
       inject: async (input: CredentialInjection) => {
         injections.push(input);
         stages.set(input.threadId, input.kind === 'identifier' ? 'password' : 'otp');
       },
       retry: async () => {},
+      emailCode: async (request: EmailCodeRequest) => {
+        emailCodeRequests.push(request);
+        return { code: '381742', current: async () => true };
+      },
       resume: async (turnId: string) => {
         const name = [...tasks].find(([, value]) => value.turnId === turnId)?.[0];
         assert.ok(name);
@@ -633,17 +916,17 @@ test(
       tasks.set(id, turn);
       stages.set(turn.threadId, kind);
     };
-    const input = (kind: CredentialKind = 'identifier') => ({
-      origin: 'https://example.com',
+    const input = (kind: CredentialKind = 'identifier', origin = 'https://example.com') => ({
+      origin,
       label: 'Model provided label',
       kind,
       ...(kind === 'identifier' ? { usernameSelector: '#login' } : { passwordSelector: '#login' }),
     });
-    const form = async (taskId: string) => {
+    const form = async (taskId: string, origin?: string) => {
       const request = await vault.request(
         task(taskId),
         'local-development',
-        input(stages.get(task(taskId).threadId)),
+        input(stages.get(task(taskId).threadId), origin),
       );
       await pool.query(
         "UPDATE turns SET status='waiting',waiting_reason='credentials' WHERE id=$1",
@@ -704,6 +987,281 @@ test(
           sealCredential(key, foreign, { username: 'foreign-user', password: 'foreign-secret' }),
         ],
       );
+
+      await t.test(
+        'root and www private entry keeps the real destination and saved binding',
+        async (t) => {
+          t.after(() => {
+            observedOrigin = 'https://example.com';
+          });
+          for (const [savedOrigin, destination] of [
+            ['https://example.net:8443', 'https://www.example.net:8443'],
+            ['https://www.example.org:9443', 'https://example.org:9443'],
+            ['https://tenant.github.io:8443', 'https://www.tenant.github.io:8443'],
+            ['https://xn--bcher-kva.de:7443', 'https://www.xn--bcher-kva.de:7443'],
+          ] as const) {
+            observedOrigin = destination;
+            const saved = await vault.saveLogin({
+              label: 'Synthetic root and www account',
+              origin: savedOrigin,
+              username: 'synthetic-account@example.test',
+              password: 'synthetic-www-password',
+              authenticatorKey: 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP',
+            });
+            const original = (
+              await pool.query('SELECT origin,ciphertext FROM vault_entries WHERE id=$1', [
+                saved.id,
+              ])
+            ).rows[0];
+            const name = `www-${saved.id}`;
+            await addTask(name);
+            const url = await form(name, destination);
+            const request = await describe(url);
+            assert.equal(request.origin, destination);
+            assert.deepEqual(
+              request.savedEntries?.map((entry) => entry.id),
+              [saved.id],
+            );
+            const before = injections.length;
+            const view = await vaultPage(
+              createElement(Credentials, { id: url.split('/').at(-1)!, embedded: true }),
+              async (path, init) => {
+                const response = await app.inject({
+                  method: (init.method ?? 'GET') as 'GET' | 'POST',
+                  url: path,
+                  headers: init.body ? { 'content-type': 'application/json' } : {},
+                  payload: init.body ? String(init.body) : undefined,
+                });
+                return new Response(response.body, {
+                  status: response.statusCode,
+                  headers: { 'content-type': 'application/json' },
+                });
+              },
+              'http://localhost:4310/',
+            );
+            try {
+              let button: HTMLButtonElement | undefined;
+              for (let attempt = 0; attempt < 100 && !button; attempt++) {
+                button = [...view.document.querySelectorAll('button')].find((item) =>
+                  item.textContent?.includes(saved.label),
+                );
+                if (!button)
+                  await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+              }
+              assert.ok(button);
+              assert.ok(view.document.body.textContent?.includes(new URL(destination).host));
+              await act(async () => button.click());
+              for (let attempt = 0; attempt < 100 && !resumed.includes(name); attempt++)
+                await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+              assert.ok(resumed.includes(name));
+            } finally {
+              await view.close();
+            }
+            assert.equal(injections.length, before + 1);
+            assert.equal(injections.at(-1)?.origin, destination);
+            assert.equal(injections.at(-1)?.username, 'synthetic-account@example.test');
+            assert.equal((await choose(url, saved.id)).statusCode, 409);
+            assert.equal(
+              await vault.fillSelected(
+                task(name),
+                'local-development',
+                input('password', destination),
+              ),
+              true,
+            );
+            assert.equal(injections.at(-1)?.origin, destination);
+            assert.equal(injections.at(-1)?.password, 'synthetic-www-password');
+            assert.equal(
+              await vault.fillSelected(
+                task(name),
+                'local-development',
+                input('password', destination),
+              ),
+              undefined,
+            );
+            const keyed = await vault.authenticatorLogin(
+              task(name),
+              'local-development',
+              destination,
+            );
+            assert.equal(keyed?.id, saved.id);
+            assert.equal(
+              await vault.fillAuthenticatorCode(
+                task(name),
+                'local-development',
+                saved.id,
+                input('otp', destination),
+              ),
+              true,
+            );
+            assert.match(injections.at(-1)?.code ?? '', /^\d{6}$/);
+            assert.equal(injections.at(-1)?.origin, destination);
+            assert.equal(
+              await vault.fillAuthenticatorCode(
+                task(name),
+                'local-development',
+                saved.id,
+                input('otp', destination),
+              ),
+              false,
+            );
+            const email = { ...input('otp', destination), emailCode: true };
+            assert.equal(await vault.fillEmailCode(task(name), 'local-development', email), true);
+            assert.equal(injections.at(-1)?.code, '381742');
+            assert.equal(injections.at(-1)?.origin, destination);
+            assert.equal(emailCodeRequests.at(-1)?.origin, destination);
+            assert.equal(emailCodeRequests.at(-1)?.recipient, 'synthetic-account@example.test');
+            assert.equal(await vault.fillEmailCode(task(name), 'local-development', email), false);
+            assert.deepEqual(
+              (
+                await pool.query('SELECT DISTINCT origin FROM vault_uses WHERE item_id=$1', [
+                  saved.id,
+                ])
+              ).rows,
+              [{ origin: destination }],
+            );
+            assert.deepEqual(
+              (
+                await pool.query('SELECT origin,ciphertext FROM vault_entries WHERE id=$1', [
+                  saved.id,
+                ])
+              ).rows[0],
+              original,
+            );
+            assert.deepEqual(
+              (
+                await pool.query(
+                  'SELECT origin FROM credential_account_selections WHERE entry_id=$1',
+                  [saved.id],
+                )
+              ).rows,
+              [{ origin: destination }],
+            );
+          }
+        },
+      );
+
+      await t.test('www matching refuses other sites and keeps exact excluded hosts', async (t) => {
+        t.after(() => {
+          observedOrigin = 'https://example.com';
+        });
+        for (const [savedOrigin, destination] of [
+          ['https://example.net:9444', 'https://www.example.net:9445'],
+          ['https://example.net:9446', 'https://login.example.net:9446'],
+          ['https://login.example.net:9447', 'https://www.login.example.net:9447'],
+          ['https://example.net:9448', 'https://www.www.example.net:9448'],
+          ['https://www.com', 'https://www.www.com'],
+          ['https://www.www.com', 'https://www.com'],
+          ['https://www.ck', 'https://www.www.ck'],
+          ['https://www.www.ck', 'https://www.ck'],
+          ['https://co.uk', 'https://www.co.uk'],
+          ['https://github.io', 'https://www.github.io'],
+          ['https://first.github.io', 'https://www.second.github.io'],
+          ['https://fixture.invalid', 'https://www.fixture.invalid'],
+          ['https://localhost', 'https://www.localhost'],
+        ] as const) {
+          const saved = await save(
+            'Synthetic excluded login',
+            savedOrigin,
+            'excluded',
+            'excluded-password',
+          );
+          observedOrigin = destination;
+          const name = `excluded-${saved.id}`;
+          await addTask(name, 'password');
+          const url = await form(name, destination);
+          assert.ok(!(await describe(url)).savedEntries?.some((entry) => entry.id === saved.id));
+          const before = injections.length;
+          assert.notEqual((await choose(url, saved.id)).json().ok, true);
+          assert.equal(injections.length, before);
+          observedOrigin = savedOrigin;
+          await addTask(`${name}-exact`, 'password');
+          assert.equal(
+            await vault.fillSaved(task(`${name}-exact`), 'local-development', saved.id, {
+              ...input('password', savedOrigin),
+              usernameSelector: '#account',
+            }),
+            true,
+          );
+          assert.equal(injections.at(-1)?.origin, savedOrigin);
+        }
+        for (const [origin, alternate] of [
+          ['https://127.0.0.1:9449', 'https://www.127.0.0.1:9449'],
+          ['https://[::1]:9449', 'https://www.[::1]:9449'],
+        ] as const) {
+          const saved = await save('Synthetic IP login', origin, 'ip-account', 'ip-password');
+          const name = `ip-${saved.id}`;
+          await addTask(name, 'password');
+          observedOrigin = alternate;
+          const before = injections.length;
+          await assert.rejects(
+            vault.request(task(name), 'local-development', input('password', alternate)),
+            /website address is not valid/,
+          );
+          await assert.rejects(
+            vault.fillSaved(
+              task(name),
+              'local-development',
+              saved.id,
+              input('password', alternate),
+            ),
+            /website address is not valid/,
+          );
+          assert.equal(injections.length, before);
+          observedOrigin = origin;
+          assert.equal(
+            await vault.fillSaved(task(name), 'local-development', saved.id, {
+              ...input('password', origin),
+              usernameSelector: '#account',
+            }),
+            true,
+          );
+          assert.equal(injections.at(-1)?.origin, origin);
+        }
+      });
+
+      await t.test('www matching keeps account choice, owner and actual-page fences', async (t) => {
+        t.after(() => {
+          observedOrigin = 'https://example.com';
+        });
+        observedOrigin = 'https://www.example.com';
+        await addTask('www-accounts');
+        const url = await form('www-accounts', observedOrigin);
+        assert.deepEqual(
+          new Set((await describe(url)).savedEntries?.map((entry) => entry.id)),
+          new Set([first.id, second.id]),
+        );
+        const before = injections.length;
+        assert.notEqual((await choose(url, foreign.id)).json().ok, true);
+        assert.equal(injections.length, before);
+        await addTask('www-chosen');
+        const chosenUrl = await form('www-chosen', observedOrigin);
+        assert.equal((await choose(chosenUrl, first.id)).json().ok, true);
+        assert.equal(
+          await vault.fillSaved(
+            task('www-chosen'),
+            'local-development',
+            second.id,
+            input('password', observedOrigin),
+          ),
+          false,
+        );
+        assert.equal(injections.length, before + 1);
+        assert.equal(
+          await vault.fillSelected(
+            task('www-chosen'),
+            'local-development',
+            input('password', observedOrigin),
+          ),
+          true,
+        );
+        assert.equal(injections.at(-1)?.password, 'first-password');
+        await addTask('www-changed');
+        const changedUrl = await form('www-changed', observedOrigin);
+        observedOrigin = 'https://example.com';
+        assert.notEqual((await choose(changedUrl, first.id)).json().ok, true);
+        assert.equal(injections.length, before + 2);
+      });
 
       await t.test(
         'one task can use two saved accounts after each sign-in completes without replay',
@@ -1813,7 +2371,8 @@ test(
         turn: { threadId: string; turnId: string };
         input: Record<string, unknown>;
       }> = [];
-      let duringFill = async () => {};
+      let duringFill = async (_signal?: AbortSignal) => {};
+      let stopBeforeEntry: string | undefined;
       const secureEntries: string[] = [];
       const make = () =>
         createPayments(pool, {
@@ -1847,10 +2406,19 @@ test(
             return new Uint8Array([255, 216, 255]);
           },
           cards: vault.paymentCards,
-          card: vault.paymentCard,
-          fill: async (input) => {
+          card: async (id, version, client) => {
+            const card = await vault.paymentCard(id, version, client);
+            if (stopBeforeEntry && client) {
+              const turnId = stopBeforeEntry;
+              stopBeforeEntry = undefined;
+              afterCommit(client, () => cancelTurnOperations([turnId]));
+            }
+            return card;
+          },
+          fill: async (input, signal) => {
             if (failFill) throw new Error('Synthetic stale field.');
-            await duringFill();
+            await duringFill(signal);
+            signal?.throwIfAborted();
             fills.push(input);
           },
           resume: async (_turnId, prompt) => {
@@ -2214,6 +2782,124 @@ test(
         200,
       );
       await pool.query('DELETE FROM turns WHERE id=$1', [laterTurn]);
+      const beforeNotEntered = { fills: fills.length, resumes: resumed.length };
+      const notEnteredPayment = await payments.request(turn, { ...order, card: card.id });
+      const notEnteredId = notEnteredPayment.url!.split('/').at(-1)!;
+      const notEnteredPath = `/api/payment-requests/${notEnteredId}`;
+      stopBeforeEntry = turn.turnId;
+      const notEnteredReply = await app.inject({
+        method: 'POST',
+        url: notEnteredPath,
+        headers,
+        payload: { code: '737' },
+      });
+      assert.equal(notEnteredReply.statusCode, 409, notEnteredReply.body);
+      assert.match(notEnteredReply.json().error, /stopped before entry/);
+      assert.deepEqual((await app.inject({ url: `${notEnteredPath}/status`, headers })).json(), {
+        status: 'expired',
+        notEntered: true,
+      });
+      assert.deepEqual({ fills: fills.length, resumes: resumed.length }, beforeNotEntered);
+      assert.deepEqual(
+        (await pool.query('SELECT status FROM vault_uses WHERE id=$1', [notEnteredId])).rows,
+        [{ status: 'not_entered' }],
+      );
+      const paymentView = await vaultPage(
+        createElement(Payment, { id: notEnteredId }),
+        async (path) => {
+          const result = await app.inject({ url: path, headers });
+          return new Response(result.body, {
+            status: result.statusCode,
+            headers: { 'content-type': 'application/json' },
+          });
+        },
+        `http://localhost:4310/payments/${notEnteredId}`,
+      );
+      try {
+        for (
+          let attempt = 0;
+          !paymentView.document.body.textContent?.includes('Stopped before entry') && attempt < 100;
+          attempt++
+        )
+          await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          });
+        assert.match(paymentView.document.body.textContent!, /No values were entered in this step/);
+        assert.doesNotMatch(
+          paymentView.document.body.textContent!,
+          /result is unknown|may have reached/i,
+        );
+        assert.equal(paymentView.document.querySelectorAll('input, button').length, 0);
+        await paymentView.render(createElement(Payment, { id: notEnteredId, key: 'reload' }));
+        for (
+          let attempt = 0;
+          !paymentView.document.body.textContent?.includes('Stopped before entry') && attempt < 100;
+          attempt++
+        )
+          await act(async () => {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          });
+        assert.match(paymentView.document.body.textContent!, /No values were entered in this step/);
+      } finally {
+        await paymentView.close();
+      }
+      await pool.query("UPDATE turns SET status='running' WHERE id=$1", [turn.turnId]);
+      const beforeInterrupted = { fills: fills.length, resumes: resumed.length };
+      const interrupted = await payments.request(turn, { ...order, card: card.id });
+      const interruptedId = interrupted.url!.split('/').at(-1)!;
+      let entrySignal: AbortSignal | undefined;
+      let entered!: () => void;
+      let release!: () => void;
+      const entryStarted = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const entryReady = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      duringFill = async (signal) => {
+        entrySignal = signal;
+        entered();
+        await entryReady;
+      };
+      const interruptedReply = app
+        .inject({
+          method: 'POST',
+          url: `/api/payment-requests/${interruptedId}`,
+          headers,
+          payload: { code: '737' },
+        })
+        .then((response) => response);
+      try {
+        await entryStarted;
+        assert.ok(entrySignal);
+        assert.equal(entrySignal.aborted, false);
+        await pool.query("UPDATE turns SET status='cancelled' WHERE id=$1", [turn.turnId]);
+        cancelTurnOperations([turn.turnId]);
+        assert.equal(entrySignal.aborted, true);
+        release();
+        assert.equal((await interruptedReply).statusCode, 409);
+        assert.equal(fills.length, beforeInterrupted.fills);
+        assert.deepEqual(
+          (await pool.query('SELECT status FROM vault_uses WHERE id=$1', [interruptedId])).rows,
+          [{ status: 'uncertain' }],
+        );
+        assert.equal(
+          (
+            await app.inject({
+              method: 'POST',
+              url: `/api/payment-requests/${interruptedId}`,
+              headers,
+              payload: { code: '737' },
+            })
+          ).statusCode,
+          409,
+        );
+      } finally {
+        release();
+        await interruptedReply;
+        duringFill = async () => {};
+      }
+      await pool.query("UPDATE turns SET status='running' WHERE id=$1", [turn.turnId]);
       const beforeCancelled = { fills: fills.length, resumes: resumed.length };
       await payments.request(turn, { ...order, card: card.id });
       const stoppedPayment = (await latest()).id;
@@ -3218,6 +3904,169 @@ test('Vault does not open or prefill a login from arbitrary query data', async (
 });
 
 test(
+  'Vault forms keep the service reason when a save is refused',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    for (const kind of ['login', 'card'] as const) {
+      for (const operation of ['create', 'update'] as const) {
+        await t.test(`${operation} ${kind}`, async (t) => {
+          const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+          const schema = `test_vault_form_${randomUUID().replaceAll('-', '')}`;
+          await admin.query(`CREATE SCHEMA ${schema}`);
+          const pool = new pg.Pool({
+            connectionString: process.env.TEST_DATABASE_URL,
+            options: `-c search_path=${schema}`,
+          });
+          const app = Fastify();
+          let closeView: (() => Promise<void>) | undefined;
+          t.after(async () => {
+            await closeView?.();
+            await app.close();
+            await pool.end();
+            await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+            await admin.end();
+          });
+          await seedTurns(pool);
+          const key = randomBytes(32);
+          let unavailable = operation === 'create';
+          const privateFailure = 'Synthetic private key-store detail';
+          const vault = await createVault(pool, {
+            requestKey: Buffer.alloc(32, 42),
+            keyStore: {
+              id: 'fixture',
+              configured: true,
+              getKey: async () => {
+                if (unavailable) throw new Error(privateFailure);
+                return key;
+              },
+            },
+            page: async () => assert.fail('Unexpected website inspection.'),
+            inject: async () => assert.fail('Unexpected private website entry.'),
+            resume: async () => assert.fail('Unexpected task resume.'),
+            retry: async () => assert.fail('Unexpected credential retry.'),
+          });
+          vault.registerRoutes(app);
+          const secret = kind === 'login' ? 'Synthetic saved password' : '4242424242424242';
+          const payload =
+            kind === 'login'
+              ? {
+                  kind,
+                  label: 'Synthetic login',
+                  origin: 'https://vault-form.example.test',
+                  username: 'synthetic-user',
+                  password: secret,
+                }
+              : {
+                  kind,
+                  label: 'Synthetic card',
+                  cardholder: 'Synthetic cardholder',
+                  cardNumber: secret,
+                  expiryMonth: 12,
+                  expiryYear: 2035,
+                };
+          let saved = 0;
+          const onSaved = () => {
+            saved++;
+          };
+          let entry: VaultLoginEntry | VaultCardEntry | undefined;
+          if (operation === 'update') {
+            const created = await app.inject({ method: 'POST', url: '/api/vault', payload });
+            assert.equal(created.statusCode, 200, created.body);
+            entry = created.json();
+          }
+          let failure: { status: number; reason: string } | undefined;
+          let writes = 0;
+          const view = await vaultPage(
+            entry
+              ? createElement(VaultDetails, {
+                  entry,
+                  backLabel: 'Vault',
+                  onClose() {},
+                  onSaved,
+                  onDeleted: () => assert.fail('Unexpected item deletion.'),
+                })
+              : createElement(VaultItemForm, { kind, onSaved, onCancel() {} }),
+            async (path, init) => {
+              const result = await app.inject({
+                method: (init.method ?? 'GET') as 'GET' | 'POST' | 'PATCH',
+                url: path,
+                headers: init.body ? { 'content-type': 'application/json' } : {},
+                payload: init.body ? String(init.body) : undefined,
+              });
+              if (path === '/api/vault' || init.method === 'PATCH') {
+                writes++;
+                if (result.statusCode >= 400)
+                  failure = { status: result.statusCode, reason: result.json().error };
+              }
+              return new Response(result.body, {
+                status: result.statusCode,
+                headers: { 'content-type': 'application/json' },
+              });
+            },
+            'http://localhost:4310/vault',
+          );
+          closeView = () => view.close();
+          const settle = async (ready: () => boolean) => {
+            for (let attempt = 0; attempt < 100 && !ready(); attempt++)
+              await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+            assert.ok(ready());
+          };
+          const field = (name: string) =>
+            view.document.querySelector<HTMLInputElement>(`input[name="${name}"]`)!;
+          if (operation === 'update') {
+            await settle(
+              () =>
+                view.document.querySelector<HTMLButtonElement>('[data-vault-edit]')?.disabled ===
+                false,
+            );
+            await act(async () =>
+              view.document.querySelector<HTMLButtonElement>('[data-vault-edit]')!.click(),
+            );
+            await pool.query(`DELETE FROM ${kind === 'login' ? 'vault_entries' : 'vault_cards'}`);
+          }
+          field('label').value = 'Synthetic changed item';
+          if (kind === 'login') {
+            if (operation === 'create') field('origin').value = payload.origin!;
+            field('username').value = 'synthetic-user';
+            field('password').value = secret;
+          } else {
+            field('cardholder').value = 'Synthetic cardholder';
+            field('cardNumber').value = secret;
+            field('expiry').value = '12 / 2035';
+          }
+          const submit = () =>
+            act(async () => {
+              const form = view.document.querySelector('form')!;
+              form.dispatchEvent(new Event('input', { bubbles: true }));
+              form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            });
+          await submit();
+          await settle(() => Boolean(failure));
+          assert.equal(failure!.status, operation === 'create' ? 503 : 404);
+          assert.ok(view.document.body.textContent?.includes(failure!.reason));
+          assert.equal(view.document.body.textContent?.includes(privateFailure), false);
+          assert.equal(field(kind === 'login' ? 'password' : 'cardNumber').value, '');
+          assert.equal(saved, 0);
+          assert.equal(writes, 1);
+          const table = kind === 'login' ? 'vault_entries' : 'vault_cards';
+          assert.equal((await pool.query(`SELECT 1 FROM ${table}`)).rowCount, 0);
+          if (operation === 'create') {
+            unavailable = false;
+            field(kind === 'login' ? 'password' : 'cardNumber').value = secret;
+            await submit();
+            await settle(() => saved === 1);
+            assert.equal(writes, 2);
+            const rows = (await pool.query(`SELECT * FROM ${table}`)).rows;
+            assert.equal(rows.length, 1);
+            assert.equal(JSON.stringify(rows).includes(secret), false);
+          }
+        });
+      }
+    }
+  },
+);
+
+test(
   'beside-chat private entry clears closed fields and follows owned server submission without replay',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
   async (t) => {
@@ -3596,7 +4445,7 @@ test('analytics routes collapse private paths to known pages', async () => {
   );
 });
 
-test('desktop onboarding turns on open at login once and resumes without repeating it', async () => {
+test('desktop onboarding saves native preferences once and follows model updates without stale reads', async () => {
   const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
     timeoutMs: 30_000,
     input: String.raw`
@@ -3629,6 +4478,9 @@ let completePreparation;
 let preparationCompleted=false;
 let completions=0;
 let statusListener;
+let modelConnected=true;
+let modelFailure;
+let modelReads=0;
 window.nodDesktop={
   ready:async()=>{rendererReady++},
   status:async()=>({phase:'ready',runtime:{phase:'preparing'}}),
@@ -3640,8 +4492,8 @@ window.nodDesktop={
 const calls=[];
 window.fetch=globalThis.fetch=async(url,options={})=>{
  const path=new URL(url,window.location.href).pathname;calls.push(path);
- if(path==='/api/account/prepare')return new Promise(resolve=>{completePreparation=()=>resolve(Response.json({ok:true}))});
- if(path==='/api/models')return Response.json({connections:[{id:'synthetic',provider:'anthropic',method:'api_key',label:'Synthetic model',managed:false,status:'connected',models:[{id:'synthetic-model',name:'Synthetic model',efforts:['medium'],images:false,contextWindow:1000}]}],selection:{connectionId:'synthetic',modelId:'synthetic-model',effort:'medium'}});
+ if(path==='/api/account/prepare')return new Promise((resolve,reject)=>{completePreparation=(response=Response.json({ok:true}))=>response instanceof Error?reject(response):resolve(response)});
+ if(path==='/api/models'){modelReads++;return Response.json({connections:modelConnected?[{id:'synthetic',provider:'anthropic',method:'api_key',label:'Synthetic model',managed:false,status:'connected',models:[{id:'synthetic-model',name:'Synthetic model',efforts:['medium'],images:false,contextWindow:1000}]}]:[],selection:modelConnected?{connectionId:'synthetic',modelId:'synthetic-model',effort:'medium'}:null,...(modelFailure?{selectionIssue:{reason:modelFailure}}:{})})}
  if(path==='/api/preferences')return Response.json({timeZone:'Europe/Lisbon',locale:'en-GB',hourCycle:'h23',quietHoursEnabled:false,quietStart:'22:00',quietEnd:'08:00',speechReply:'auto',speechVoice:null});
  if(path==='/api/speech')return Response.json({transcription:false,synthesis:false,voices:[],speechVoice:null,speechReply:'auto'});
  if(path==='/api/memory')return Response.json({saving:true,sensitive:false,notes:[],skills:[],archive:[]});
@@ -3656,11 +4508,25 @@ const {createRoot}=await import('react-dom/client');
 const {Onboarding}=await import('./src/web/pages/onboarding/index.tsx');
 globalThis.IS_REACT_ACT_ENVIRONMENT=true;
 const session={user:{id:'synthetic-native-owner',name:'',email:null,avatarUrl:null},settings:{usageData:false,onboardingCompleted:false}};
+const {sessionStore}=await import('./src/web/lib/session.ts');
+const {writeStep}=await import('./src/web/pages/onboarding/storage.ts');
+const {onboardingVersion}=await import('./src/shared/onboarding.ts');
+sessionStore.getSnapshot=()=>({session,epoch:0});
+let stream;
+globalThis.EventSource=class{
+ static CLOSED=2;
+ readyState=1;
+ closed=false;
+ constructor(){stream=this}
+ close(){this.closed=true;this.readyState=2}
+};
 let root=createRoot(document.getElementById('root'));
 const render=()=>act(async()=>root.render(createElement(Onboarding,{user:session.user,onComplete:async()=>{completions++;assert.equal(preparationCompleted,true,'No completion before server preparation finishes')}})));
 const settle=()=>act(async()=>{await new Promise(resolve=>setTimeout(resolve,20))});
 const waitFor=async condition=>{for(let at=0;at<100&&!(await condition());at++)await settle();assert.ok(await condition())};
 const button=text=>[...document.querySelectorAll('button')].find(value=>value.textContent.trim()===text);
+const changed=()=>act(async()=>stream.onmessage(new dom.window.MessageEvent('message',{data:JSON.stringify({type:'refresh'})})));
+const waitForModel=async condition=>{for(let at=0;at<200&&!condition();at++)await settle();assert.ok(condition())};
 await render();
 assert.equal(window.location.search,'');
 await waitFor(()=>button('Try again'));
@@ -3748,11 +4614,22 @@ const emailSkip=()=>document.querySelector('[data-step="email"] .ob-footer-end b
 assert.equal(emailSkip().disabled,false);
 await act(async()=>emailSkip().click());
 await waitFor(()=>document.querySelector('[data-step="about"]'));
-for(let at=0;at<10&&!document.querySelector('[data-step="privacy"]');at++){await act(async()=>{await new Promise(resolve=>setTimeout(resolve,1000))});if(button('Not now'))await act(async()=>button('Not now').click())}
-await waitFor(()=>document.querySelector('[data-step="privacy"]'));
-assert.ok(calls.includes('/api/onboarding/profile'));
+modelFailure='Synthetic provider failed while About you was open.';
+const beforeAboutRefresh=modelReads;
+await changed();
+await waitForModel(()=>modelReads>beforeAboutRefresh);
+assert.ok(document.querySelector('[data-step="about"]'));
+for(let at=0;at<10&&!document.querySelector('[data-step="brain"]');at++){await act(async()=>{await new Promise(resolve=>setTimeout(resolve,1000))});if(button('Not now'))await act(async()=>button('Not now').click())}
+await waitFor(()=>document.querySelector('[data-step="brain"]'));
+await waitForModel(()=>document.querySelector('.ob-brain-connected details')?.textContent.includes(modelFailure));
+modelFailure=undefined;
+await changed();
+await waitForModel(()=>!document.querySelector('.ob-brain-connected details'));
+assert.ok(document.querySelector('[data-step="brain"]'));
 await act(async()=>button('Continue').click());
 await waitFor(()=>document.querySelector('[data-step="join"]'));
+assert.ok(calls.includes('/api/onboarding/profile'));
+assert.equal(document.querySelector('.ob-dots').getAttribute('aria-label'),'Step 4 of 4');
 await act(async()=>button('Continue').click());
 await waitFor(()=>document.querySelector('.setup-progress [role="status"]'));
 assert.equal((await store.get()).onboardingPreferenceStep,'complete');
@@ -3761,10 +4638,65 @@ await act(async()=>statusListener({phase:'ready',runtime:{phase:'ready'}}));
 await settle();
 assert.equal(completions,0,'Desktop readiness must not complete onboarding before server preparation');
 assert.ok(document.querySelector('.setup-progress [role="status"]'));
+const preparationFailure='Synthetic workspace could not mount its volume.';
+await act(async()=>completePreparation(Response.json({error:preparationFailure},{status:503})));
+await waitFor(()=>document.querySelector('.setup-progress [role="alert"]'));
+assert.ok(document.querySelector('.setup-progress [role="alert"]').textContent.includes(preparationFailure));
+assert.ok(document.querySelector('.setup-progress details').textContent.includes('503'));
+assert.equal(document.querySelector('.setup-progress details').open,false);
+assert.equal(completions,0);
+await act(async()=>statusListener({phase:'ready',runtime:{phase:'ready'}}));
+assert.ok(document.querySelector('.setup-progress [role="alert"]').textContent.includes(preparationFailure));
+const preparationCalls=calls.filter(path=>path==='/api/account/prepare').length;
+await act(async()=>button('Try again').click());
+await waitFor(()=>calls.filter(path=>path==='/api/account/prepare').length===preparationCalls+1);
+assert.equal(document.querySelector('.setup-progress [role="alert"]'),null);
+assert.equal(completions,0);
+const transportFailure='Synthetic fetch TypeError during workspace setup.';
+await act(async()=>completePreparation(new TypeError(transportFailure)));
+await waitFor(()=>document.querySelector('.setup-progress [role="alert"]'));
+assert.equal(document.querySelector('.setup-progress [role="alert"]').textContent.includes(transportFailure),false);
+assert.ok(document.querySelector('.setup-progress details').textContent.includes(transportFailure));
+assert.equal(completions,0);
+await act(async()=>button('Try again').click());
+await waitFor(()=>calls.filter(path=>path==='/api/account/prepare').length===preparationCalls+2);
+assert.equal(document.querySelector('.setup-progress [role="alert"]'),null);
 await act(async()=>{preparationCompleted=true;completePreparation()});
 await waitFor(()=>completions===1);
 await settle();
 assert.equal(completions,1);
+await act(async()=>root.unmount());
+modelConnected=false;
+writeStep({owner:session.user.id,step:'brain',version:onboardingVersion});
+root=createRoot(document.getElementById('root'));
+await render();
+await waitFor(()=>button('Continue')?.disabled===true);
+assert.ok(stream);
+modelConnected=true;
+await changed();
+await waitForModel(()=>button('Continue')?.disabled===false);
+modelFailure='Synthetic provider rejected the selected model request.';
+await changed();
+await waitForModel(()=>document.querySelector('.ob-brain-connected details')?.textContent.includes(modelFailure));
+assert.ok(document.querySelector('.ob-brain-connected [role="alert"]'));
+assert.equal(button('Continue').disabled,false);
+await act(async()=>root.unmount());
+assert.equal(stream.closed,true);
+const beforeClosed=modelReads;
+await changed();
+await settle();
+assert.equal(modelReads,beforeClosed);
+modelFailure=undefined;
+writeStep({owner:session.user.id,step:'privacy',version:onboardingVersion});
+root=createRoot(document.getElementById('root'));
+const shared=usageShared=>act(async()=>root.render(createElement(Onboarding,{user:session.user,usageShared,onComplete:async()=>{}})));
+await shared(true);
+await waitFor(()=>document.querySelector('[data-step="privacy"]'));
+await shared(false);
+await waitFor(()=>document.querySelector('[data-step="join"]'));
+await shared(true);
+await settle();
+assert.ok(document.querySelector('[data-step="join"]'));
 await act(async()=>root.unmount());
 await rm(directory,{recursive:true,force:true});
 dom.window.close();
@@ -4452,13 +5384,13 @@ const captured=[];
 const client={init(_key,options){this.options=options},capture(event,properties={}){const value=this.options.before_send({event,properties});if(value)captured.push(value)},reset(){},set_config(){},stopSessionRecording(){},startSessionRecording(){}};
 setAnalyticsClient(client);configureAnalytics({enabled:true,distinctId:'local:connection-owner',environment:'development'},'web');
 const attempt='a'.repeat(43);
-let connected=false,checks=0,delay=false,release;
+let connected=false,checks=0,delay=false,release,failure;
 window.fetch=globalThis.fetch=async(path,options)=>{
  if(path==='/api/apps/gmail/connect')return Response.json({url:'https://example.test/sign-in',attempt});
  if(path==='/api/apps/setup-cancel')return Response.json({ok:true});
  assert.equal(path,'/api/apps/setup-status');checks++;
  const hash=JSON.parse(options.body).hashes[0];
- const response=()=>Response.json({completed:connected?[hash]:[],apps:[{hash,available:true}]});
+ const response=()=>Response.json({completed:connected?[hash]:[],apps:[{hash,available:!failure,...(failure?{error:failure}:{})}]});
  if(delay)return new Promise(resolve=>{release=()=>resolve(response())});
  return response();
 };
@@ -4475,10 +5407,16 @@ await settle(()=>checks===2);assert.equal(completions().length,0,'an unverified 
 await start();await settle(()=>checks===3);await act(async()=>signIn.cancel());assert.equal(completions().length,0);
 connected=true;await start();await settle(()=>completions().length===1);
 assert.deepEqual(completions()[0].properties.entry,'onboarding');
+connected=false;failure='Sign-in could not finish: invalid_request: Synthetic refusal';
+await start();await settle(()=>signIn.error===failure);
+failure=undefined;const polled=checks;await start();await settle(()=>checks>polled);
+failure='Sign-in could not finish: Synthetic exchange failure';
+await act(async()=>channels[0].onmessage({data:{connection:'failed',service:'gmail',attempt}}));
+await settle(()=>signIn.error===failure);failure=undefined;
 delay=true;release=undefined;await start();await settle(()=>release);
 setRequestAccount('other-owner');await act(async()=>release());assert.equal(completions().length,1);
 await act(async()=>root.unmount());configureAnalytics(undefined);dom.window.close();
-console.log(JSON.stringify({result:'pass',checks:['confirmed-success','original-entry','unverified-broadcast','cancelled-attempt','owner-fence'],events:captured},null,2));
+console.log(JSON.stringify({result:'pass',checks:['confirmed-success','original-entry','failure-reason','unverified-broadcast','cancelled-attempt','owner-fence'],events:captured},null,2));
 process.exit(0);
 `,
   });

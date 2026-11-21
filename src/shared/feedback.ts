@@ -74,6 +74,12 @@ export interface FeedbackContext {
   platform: string | null;
 }
 
+export interface StartupFeedbackContext extends FeedbackContext {
+  pending: FeedbackReceipt | null;
+  notSentSubmissionId?: string;
+  recovery?: { message: string; canPreserve: boolean };
+}
+
 export interface FeedbackReport {
   id: string;
   content: string;
@@ -105,5 +111,8 @@ export interface FeedbackReceipt {
   status: 'submitted' | 'partial' | 'unknown' | 'rejected';
   issueUrl?: string;
   message?: string;
+  messageOmitted?: boolean;
+  httpStatus?: number;
+  reason?: 'rate_limited';
   canRetryAttachments?: boolean;
 }

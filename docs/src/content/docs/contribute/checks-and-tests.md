@@ -31,6 +31,8 @@ pnpm exec tsx --test tests/approvals.test.ts
 
 ## Available application checks
 
+App connector changes must pass `pnpm check:apps`. The required CI workflow always runs this command. See [Test the app](/contribute/apps/test/) for fixtures and separate provider acceptance.
+
 Use these commands when needed to verify an application change. They are not a condition for opening every pull request.
 
 ```sh title="Terminal"

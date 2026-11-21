@@ -5,7 +5,7 @@ description: Use only when the user names n8n, or continues work on an n8n workf
 
 # n8n
 
-Work through the connected n8n MCP server. Its tools are named mcp__n8n__<tool>; load the ones you need with tool_search and follow the server's own guide in your context for how to build, validate and test.
+Work through the connected n8n MCP server. Its tools are named mcp__n8n__<tool>; load the ones you need with nod_tool_search and follow the server's own guide in your context for how to build, validate and test.
 
 - When the user names an existing workflow or Agent, find it and change it instead of building another.
 - Keep workflow code in a workspace file such as `n8n/<short-name>.workflow.ts` and pass it to the n8n tools from codemode, so the code never goes into chat.

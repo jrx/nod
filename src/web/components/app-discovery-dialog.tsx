@@ -21,10 +21,14 @@ import {
 
 type Discovery = {
   name: string;
+  catalogApp?: boolean;
+  credentialLabels?: Record<string, string>;
+  hints?: Record<string, string>;
   service?: string;
   needsAddress?: boolean;
   localAddress?: string;
   oauthStatus?: 'pending' | 'connected' | 'cancelled' | 'failed' | null;
+  oauthError?: string;
   authorizationUrl?: string;
   attempt?: string;
   callbackUrl?: string;
@@ -38,6 +42,8 @@ type Discovery = {
     env?: string[];
     source?: { npm?: string; pypi?: string; url?: string; sha256?: string };
     testPath?: string;
+    testMethod?: string;
+    testArgv?: string[];
     scope?: string;
     clientIdRequired?: boolean;
   }>;
@@ -152,7 +158,7 @@ export function AppDiscoveryDialog({
         const current = pending.current;
         if (value.oauthStatus) {
           if (value.oauthStatus === 'connected') report.current?.();
-          setError('');
+          setError(value.oauthError ?? '');
           const replaced =
             current?.url && value.authorizationUrl && current.url !== value.authorizationUrl;
           show({
@@ -466,13 +472,13 @@ export function AppDiscoveryDialog({
             <DialogDescription>
               {oauth
                 ? 'Sign in to connect your account.'
-                : paths.some((path) => path.kind === 'cli')
+                : paths.some((path) => path.kind === 'cli' && !path.testArgv)
                   ? 'Save credentials. The command is not checked during setup.'
                   : 'Nod will check access before connecting.'}
             </DialogDescription>
           </div>
         </div>
-        {paths[0]?.endpoint && (
+        {!discovery?.catalogApp && paths[0]?.endpoint && (
           <Tooltip content={paths[0].endpoint}>
             <p className="app-discovery-address">{paths[0].endpoint}</p>
           </Tooltip>
@@ -505,7 +511,14 @@ export function AppDiscoveryDialog({
                 )}
                 {path.scope && <span>Requested access: {path.scope}</span>}
                 {path.kind === 'http' && path.testPath && (
-                  <p>Read check: GET {readCheckUrl(path) ?? 'unavailable'}</p>
+                  <p>
+                    Read check: {path.testMethod ?? 'GET'} {readCheckUrl(path) ?? 'unavailable'}
+                  </p>
+                )}
+                {path.testArgv && (
+                  <p>
+                    Read check: {path.command} {path.testArgv.join(' ')}
+                  </p>
                 )}
                 {path.source?.sha256 && <p>SHA-256: {path.source.sha256}</p>}
               </div>
@@ -536,8 +549,11 @@ export function AppDiscoveryDialog({
               <Field
                 label={`Your ${discovery.name} address`}
                 hint={
-                  discovery.localAddress &&
-                  (desktopRuntimeAvailable() ? 'Found on this computer.' : 'Found on your server.')
+                  discovery.localAddress
+                    ? desktopRuntimeAvailable()
+                      ? 'Found on this computer.'
+                      : 'Found on your server.'
+                    : discovery.hints?.address
                 }
               >
                 <Input
@@ -546,7 +562,11 @@ export function AppDiscoveryDialog({
                   onChange={(event) => setInstanceUrl(event.target.value)}
                   required
                   maxLength={2048}
-                  placeholder="https://you.app.n8n.cloud"
+                  placeholder={
+                    discovery.service === 'n8n'
+                      ? 'https://you.app.n8n.cloud'
+                      : 'https://app.example.com'
+                  }
                   autoComplete="off"
                   spellCheck={false}
                   disabled={saving}
@@ -554,11 +574,11 @@ export function AppDiscoveryDialog({
               </Field>
               <details className="app-discovery-methods">
                 <summary>Use an access token instead</summary>
-                <Field label="MCP access token">
+                <Field label="MCP access token" hint={discovery.hints?.token}>
                   <Input
                     name="token"
                     type="password"
-                    minLength={8}
+                    minLength={1}
                     maxLength={8192}
                     autoComplete="off"
                     spellCheck={false}
@@ -573,7 +593,7 @@ export function AppDiscoveryDialog({
           ) : oauth ? (
             <form onSubmit={(event) => void authorize(event)} autoComplete="off">
               {paths[0]?.clientIdRequired && (
-                <Field label="Client ID">
+                <Field label="Client ID" hint={discovery.hints?.clientId}>
                   <Input
                     name="clientId"
                     value={clientId}
@@ -602,20 +622,30 @@ export function AppDiscoveryDialog({
                   disabled={saving}
                 />
               </Field>
-              {(settings ?? ['token']).map((name) => (
-                <Field key={name} label={name === 'token' ? 'API key or access token' : name}>
-                  <Input
-                    name={name === 'token' ? 'token' : `setting:${name}`}
-                    type="password"
-                    required
-                    minLength={8}
-                    maxLength={8192}
-                    autoComplete="off"
-                    spellCheck={false}
-                    disabled={saving}
-                  />
-                </Field>
-              ))}
+              {(settings ?? ['token']).map((name) => {
+                const field = name === 'token' ? (names?.[0] ?? name) : name;
+                return (
+                  <Field
+                    key={name}
+                    label={
+                      discovery.credentialLabels?.[field] ??
+                      (name === 'token' ? 'API key or access token' : name)
+                    }
+                    hint={discovery.hints?.[field]}
+                  >
+                    <Input
+                      name={name === 'token' ? 'token' : `setting:${name}`}
+                      type="password"
+                      required
+                      minLength={1}
+                      maxLength={8192}
+                      autoComplete="off"
+                      spellCheck={false}
+                      disabled={saving}
+                    />
+                  </Field>
+                );
+              })}
               <Button
                 type="submit"
                 disabled={
@@ -623,7 +653,7 @@ export function AppDiscoveryDialog({
                 }
               >
                 {saving
-                  ? paths.some((path) => path.kind === 'cli')
+                  ? paths.length > 0 && paths.every((path) => path.kind === 'cli' && !path.testArgv)
                     ? 'Saving…'
                     : 'Checking…'
                   : 'Connect account'}

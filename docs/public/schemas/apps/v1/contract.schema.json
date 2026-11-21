@@ -1,0 +1,427 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "anyOf": [
+    {
+      "type": "object",
+      "properties": {
+        "$schema": {
+          "type": "string",
+          "const": "https://nod.n8n.io/docs/schemas/apps/v1/contract.schema.json"
+        },
+        "source": {
+          "allOf": [
+            {
+              "type": "string",
+              "format": "uri"
+            },
+            {
+              "type": "string",
+              "maxLength": 2048,
+              "pattern": "^[hH][tT][tT][pP][sS]:\\/\\/"
+            }
+          ]
+        },
+        "output": {
+          "$ref": "#/$defs/__schema0"
+        },
+        "type": {
+          "default": "mcp",
+          "type": "string",
+          "const": "mcp"
+        },
+        "tool": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100,
+              "pattern": "^(?!replace_)"
+            },
+            "description": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000
+            },
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "object"
+                }
+              },
+              "required": ["type"],
+              "additionalProperties": {
+                "$ref": "#/$defs/__schema1"
+              }
+            },
+            "annotations": {
+              "type": "object",
+              "properties": {
+                "readOnlyHint": {
+                  "type": "boolean",
+                  "const": true
+                }
+              },
+              "required": ["readOnlyHint"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["name", "description", "inputSchema", "annotations"],
+          "additionalProperties": false
+        },
+        "input": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema2"
+          }
+        }
+      },
+      "required": ["$schema", "source", "output", "tool", "input"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "$schema": {
+          "type": "string",
+          "const": "https://nod.n8n.io/docs/schemas/apps/v1/contract.schema.json"
+        },
+        "source": {
+          "allOf": [
+            {
+              "type": "string",
+              "format": "uri"
+            },
+            {
+              "type": "string",
+              "maxLength": 2048,
+              "pattern": "^[hH][tT][tT][pP][sS]:\\/\\/"
+            }
+          ]
+        },
+        "output": {
+          "$ref": "#/$defs/__schema0"
+        },
+        "type": {
+          "type": "string",
+          "const": "http"
+        },
+        "request": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "GET"
+                },
+                "path": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2048,
+                  "pattern": "^(?!\\/\\/|[a-zA-Z][a-zA-Z0-9+.-]*:)[^\\\\#]+$"
+                }
+              },
+              "required": ["method", "path"],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "const": "POST"
+                },
+                "path": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 2048,
+                  "pattern": "^(?!\\/\\/|[a-zA-Z][a-zA-Z0-9+.-]*:)[^\\\\#]+$"
+                },
+                "body": {
+                  "$ref": "#/$defs/__schema3"
+                }
+              },
+              "required": ["method", "path", "body"],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "annotations": {
+          "type": "object",
+          "properties": {
+            "readOnlyHint": {
+              "type": "boolean",
+              "const": true
+            }
+          },
+          "required": ["readOnlyHint"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["$schema", "source", "output", "type", "request", "annotations"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "$schema": {
+          "type": "string",
+          "const": "https://nod.n8n.io/docs/schemas/apps/v1/contract.schema.json"
+        },
+        "source": {
+          "allOf": [
+            {
+              "type": "string",
+              "format": "uri"
+            },
+            {
+              "type": "string",
+              "maxLength": 2048,
+              "pattern": "^[hH][tT][tT][pP][sS]:\\/\\/"
+            }
+          ]
+        },
+        "output": {
+          "$ref": "#/$defs/__schema0"
+        },
+        "type": {
+          "type": "string",
+          "const": "cli"
+        },
+        "argv": {
+          "minItems": 1,
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048,
+            "pattern": "^[^\\u0000]+$"
+          }
+        },
+        "timeoutSeconds": {
+          "default": 30,
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120
+        },
+        "format": {
+          "default": "json",
+          "type": "string",
+          "const": "json"
+        },
+        "annotations": {
+          "type": "object",
+          "properties": {
+            "readOnlyHint": {
+              "type": "boolean",
+              "const": true
+            }
+          },
+          "required": ["readOnlyHint"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["$schema", "source", "output", "type", "argv", "annotations"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "$schema": {
+          "type": "string",
+          "const": "https://nod.n8n.io/docs/schemas/apps/v1/contract.schema.json"
+        },
+        "source": {
+          "allOf": [
+            {
+              "type": "string",
+              "format": "uri"
+            },
+            {
+              "type": "string",
+              "maxLength": 2048,
+              "pattern": "^[hH][tT][tT][pP][sS]:\\/\\/"
+            }
+          ]
+        },
+        "output": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "const": "cli"
+        },
+        "argv": {
+          "minItems": 1,
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048,
+            "pattern": "^[^\\u0000]+$"
+          }
+        },
+        "timeoutSeconds": {
+          "default": 30,
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 120
+        },
+        "format": {
+          "type": "string",
+          "const": "text"
+        },
+        "annotations": {
+          "type": "object",
+          "properties": {
+            "readOnlyHint": {
+              "type": "boolean",
+              "const": true
+            }
+          },
+          "required": ["readOnlyHint"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["$schema", "source", "output", "type", "argv", "format", "annotations"],
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "__schema0": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema0"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema0"
+          }
+        }
+      ]
+    },
+    "__schema1": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema1"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema1"
+          }
+        }
+      ]
+    },
+    "__schema2": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema2"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema2"
+          }
+        }
+      ]
+    },
+    "__schema3": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/__schema3"
+          }
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/__schema3"
+          }
+        }
+      ]
+    }
+  },
+  "$id": "https://nod.n8n.io/docs/schemas/apps/v1/contract.schema.json",
+  "title": "Nod app contract fixture v1"
+}

@@ -166,6 +166,47 @@
   font-variant-numeric: tabular-nums;
 }
 
+.artifact-drawer-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  padding-block: 2px;
+  border-radius: var(--control-radius);
+  vertical-align: top;
+}
+
+.artifact-drawer-picker > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.artifact-drawer-picker > svg {
+  flex: none;
+  color: var(--muted-foreground);
+}
+
+.artifact-drawer-picker:hover {
+  background: var(--control-hover);
+}
+
+.artifact-drawer-picker:focus-within {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+
+.artifact-drawer-picker select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
 .artifact-drawer-actions {
   display: flex;
   flex: none;

@@ -11,12 +11,13 @@ import {
   area,
   areaEntries,
   find,
-  fold,
+  foldQuote,
   freeSlug,
   id,
   indexLayout,
   isEmpty,
   line,
+  lines,
   locate,
   maxBytes,
   open,
@@ -39,14 +40,14 @@ const nilId = '00000000-0000-0000-0000-000000000000';
 const flat = (value: string) => value.replace(/\s+/g, ' ').trim();
 const findInput = z.object({ query: z.string().trim().min(1), area: area.optional() }).strict();
 const readInput = z.object({ path: z.union([area, path]) }).strict();
-const noteInput = z.object({ area, text: line(), expires: z.iso.date().optional() }).strict();
+const noteInput = z.object({ area, text: lines(), expires: z.iso.date().optional() }).strict();
 const importInput = z
   .object({ notes: z.array(z.object({ area, text: z.string() }).strict()) })
   .strict();
-const restateInput = z.array(z.object({ area, slug, text: line() }).strict()).min(1);
+const restateInput = z.array(z.object({ area, slug, text: lines() }).strict()).min(1);
 const changeInput = z
   .object({
-    text: line().optional(),
+    text: lines().optional(),
     expires: z.iso.date().nullable().optional(),
     confirm: z.literal(true).optional(),
   })
@@ -114,7 +115,7 @@ export function createMemoryService(options: {
       ...(tree.enabled ? [] : ['savingEnabled: false']),
       ...(tree.sensitive ? ['sensitiveTopics: allowed'] : []),
       ...Object.entries(indexLayout(tree, { tentative: true })).flatMap(([area, rows]) =>
-        rows.map((row) => `${area}/${row}`),
+        rows.map((row) => `${area}/${row}`.replaceAll('\n', '\n  ')),
       ),
     ].join('\n');
   }
@@ -230,7 +231,7 @@ export function createMemoryService(options: {
 
   async function adopt(notes: Array<{ area: Area; text: string }>) {
     const valid = notes.flatMap((note) => {
-      const text = line().safeParse(note.text);
+      const text = lines().safeParse(note.text);
       return text.success && !unsafe(text.data)
         ? [{ area: area.parse(note.area), text: text.data }]
         : [];
@@ -496,7 +497,10 @@ export function createMemoryService(options: {
           const source = found.get(id) ?? { id, text: null, at: null, channel: null };
           return {
             ...source,
-            text: quote && source.text && fold(source.text).includes(fold(quote)) ? quote : null,
+            text:
+              quote && source.text && foldQuote(source.text).includes(foldQuote(quote))
+                ? quote
+                : null,
           };
         }),
       };

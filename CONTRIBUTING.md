@@ -6,14 +6,33 @@ Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## Ways to help
 
+- **Create an app connector.** Follow [Creating your own connectors](docs/src/content/docs/contribute/apps/index.md) for MCP, HTTP API, and CLI formats, the AI builder skill, required tests, and approval process. Browse [custom connections](https://nod.n8n.io/docs/connect/community-apps/) for examples.
+- **Improve the documentation.** Follow [Write docs](docs/src/content/docs/contribute/write-docs.mdx). You can preview and build the docs site without running Nod.
 - **Report a bug** with the [bug report form](https://github.com/n8n-io/nod/issues/new/choose).
 - **Ask a question or share an idea** in [Discussions](https://github.com/n8n-io/nod/discussions).
 - **Report a vulnerability** privately, as described in the [security policy](SECURITY.md). Never in a public issue.
-- **Send a pull request.** For anything larger than a small fix, open an issue or discussion first.
+- **Send a pull request.** App-only contributions that use the supported profile follow the app guide. For other work larger than a small fix, open an issue or discussion first.
+
+## Documentation-only changes
+
+For a docs-only change, you do not need to install or run Nod, start Docker, or connect a model. You need Node.js 24.21.0 or newer and pnpm 10.34.5 installed. From the repository root, install the docs dependencies and start the site:
+
+```sh
+pnpm --dir docs install --frozen-lockfile
+pnpm --dir docs dev
+```
+
+Open `http://localhost:4321/docs/` to preview your changes. Before opening a pull request, build the site and check its internal links:
+
+```sh
+pnpm --dir docs build
+```
+
+See [Write docs](docs/src/content/docs/contribute/write-docs.mdx) for the house style and page guidance.
 
 ## Set up and check
 
-Follow [Install from source](docs/src/content/docs/get-started/install-from-source.mdx), then run Nod with automatic reload:
+For application changes, follow [Install from source](docs/src/content/docs/get-started/install-from-source.mdx), then run Nod with automatic reload:
 
 ```sh
 pnpm run dev

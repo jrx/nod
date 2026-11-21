@@ -1,5 +1,5 @@
 import type { ReactNode, Ref } from 'react';
-import { MessageSquare } from '../../components/icons';
+import { Bug } from '../../components/icons';
 import { onboardingSteps, type OnboardingStep } from '../../../shared/onboarding';
 import { NodGlyph } from '../../components/motion';
 import { Button } from '../../components/ui';
@@ -59,10 +59,10 @@ export function OnboardingFrame({
                 size="sm"
                 className="ob-feedback"
                 onClick={onFeedback}
-                aria-label="Feedback"
+                aria-label="Report bug"
               >
-                <MessageSquare size={16} aria-hidden="true" />
-                <span className="ob-header-label">Feedback</span>
+                <Bug size={16} aria-hidden="true" />
+                <span className="ob-header-label">Report bug</span>
               </Button>
             )}
           </div>

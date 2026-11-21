@@ -233,7 +233,7 @@ function ConnectButton({
   return (
     <Button type="submit" variant="outline" disabled={checking || disabled}>
       {checking && <LoaderCircle size={16} className="spin" aria-hidden="true" />}
-      {checking ? (saved ? 'Saving' : 'Checking') : saved ? 'Save key' : 'Connect'}
+      {checking ? (saved ? 'Saving' : 'Connecting') : saved ? 'Save key' : 'Connect'}
     </Button>
   );
 }
@@ -492,6 +492,7 @@ function Setup({ c, provider }: { c: Connect; provider: ModelProvider }) {
 
 function Connected({ c, onReconnect }: { c: Connect; onReconnect: () => void }) {
   const source = c.shown!;
+  const issue = c.data?.selection?.connectionId === source.id ? c.data.selectionIssue : undefined;
   const saved = modelProviderInfo[source.provider]?.catalog === 'bundled';
   const choosing =
     source.status === 'connected' &&
@@ -518,9 +519,11 @@ function Connected({ c, onReconnect }: { c: Connect; onReconnect: () => void }) 
                 ? 'Choose the model I should use.'
                 : missing
                   ? 'No supported models are available for this account.'
-                  : saved
-                    ? 'Access checked on first use. You can change the model any time.'
-                    : 'I’ll use this model for every reply. You can change it any time.'}
+                  : issue
+                    ? 'Choose another model or continue with this one.'
+                    : saved
+                      ? 'I’ll check the connection in the background. You can continue.'
+                      : 'I’ll use this model for every reply. You can change it any time.'}
           </p>
         </div>
       </div>
@@ -551,7 +554,15 @@ function Connected({ c, onReconnect }: { c: Connect; onReconnect: () => void }) 
               : 'Use another account'}
         </Button>
       )}
-      <Problem>{c.models.error}</Problem>
+      <Problem>
+        {c.models.error || (issue && 'This model could not complete its last request.')}
+      </Problem>
+      {issue && !c.models.error && (
+        <details className="setup-progress-details" data-analytics-private>
+          <summary>Details</summary>
+          <pre>{issue.reason}</pre>
+        </details>
+      )}
       <button type="button" className="ob-link ob-brain-another" onClick={c.addAnother}>
         Use a different provider
       </button>

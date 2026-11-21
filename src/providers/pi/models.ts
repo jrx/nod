@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import {
   getSupportedThinkingLevels,
   getSystemMessageText,
@@ -17,7 +18,13 @@ import { ModelRuntime, type ProviderModelConfig } from '@earendil-works/pi-codin
 import { Agent, Dispatcher1Wrapper } from 'undici';
 import { z } from 'zod';
 import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
-import { ModelAuthError, ModelWorkspaceSelectionError } from '../../ports/models.ts';
+import { logFailure } from '../../ports/failure-log.ts';
+import {
+  ModelAuthError,
+  ModelCatalogError,
+  ModelWorkspaceSelectionError,
+} from '../../ports/models.ts';
+import { appPages } from '../../shared/app-links.ts';
 import { ElevenLabsConnectionError, readElevenLabsVoices } from '../elevenlabs/speech.ts';
 import { openAIBaseUrl, openAIRequestError } from '../openai/api.ts';
 import type {
@@ -25,10 +32,12 @@ import type {
   ModelBackend,
   ModelCredential,
   ModelDefinition,
+  ModelCatalogFailure,
 } from '../../ports/models.ts';
 import {
   bedrockRegionPattern,
   boundedPrice,
+  modelPricingSignature,
   modelProviders,
   modelProviderNames,
   type ModelProvider,
@@ -46,11 +55,14 @@ import { modelServiceError } from '../model-error.ts';
 import {
   antLingModel,
   nativeAudioModel,
+  openAIModels,
   assistantModelId,
   assistantModels,
   cloudflareCredential,
   nativeCatalog,
 } from './model-catalog.ts';
+
+const reconnectChatGpt = `Reconnect your ChatGPT account in ${appPages['/settings/models']}.`;
 
 export const localModelSilenceMs = 30 * 60_000;
 export const modelFirstEventMs = 90_000;
@@ -68,7 +80,6 @@ function supportedModel(model: Model<Api>): Model<Api> {
 const resource = 'https://api.openai.com/v1';
 const issuer = 'https://auth.openai.com';
 
-const callbackUrl = 'http://127.0.0.1:1455/auth/callback';
 const registration = 'dynamic_agent_client';
 const planScope = 'chatgpt.tokens.use.direct';
 const random = () => randomBytes(32).toString('base64url');
@@ -104,8 +115,7 @@ class AnthropicBadRequest extends ModelAuthError {}
 
 function chatgptCredential(value: unknown) {
   const parsed = chatgptCredentialSchema.safeParse(value);
-  if (!parsed.success)
-    throw new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true);
+  if (!parsed.success) throw new ModelAuthError(reconnectChatGpt, true);
   return parsed.data;
 }
 
@@ -262,6 +272,12 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
     const headers: Record<string, string> = credential.key
       ? { Authorization: `Bearer ${credential.key}` }
       : {};
+    const secrets = [credential.url, credential.key ?? ''].flatMap((value) => [
+      value,
+      encodeURIComponent(value),
+      JSON.stringify(value).slice(1, -1),
+    ]);
+    const failures: ModelCatalogFailure[] = [];
     let found: { url: string; data: unknown[] } | undefined;
     for (const url of credential.url.endsWith('/v1')
       ? [credential.url]
@@ -271,15 +287,26 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         redirect: 'error',
         signal: AbortSignal.timeout(15000),
       });
+      const path = url === credential.url ? '/models' : '/v1/models';
+      if (!response.ok) {
+        const error = await modelServiceError(response, 'Model discovery', secrets);
+        failures.push({ path, status: error.status, detail: error.details ?? '' });
+        continue;
+      }
       const list = z
         .object({ data: z.array(z.unknown()) })
-        .safeParse(response.ok ? await response.json().catch(() => undefined) : undefined);
+        .safeParse(await response.json().catch(() => undefined));
       if (list.success) {
         found = { url, data: list.data.data };
         break;
       }
+      failures.push({
+        path,
+        status: response.status,
+        detail: 'The server returned an invalid model list.',
+      });
     }
-    if (!found) throw new Error('The server’s model list could not be loaded.');
+    if (!found) throw new ModelCatalogError(failures);
     const size = z.number().int().positive().optional().catch(undefined);
     const listed = entries(
       found.data,
@@ -305,6 +332,15 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       serverJson('/api/v1/models'),
     ]);
     const ollama = z.object({ version: z.string() }).safeParse(version).success;
+    const running = ollama ? await serverJson('/api/ps') : undefined;
+    const loadedModels = entries(
+      z.object({ models: z.array(z.unknown()) }).safeParse(running).data?.models ?? [],
+      z.object({
+        name: z.string().min(1).max(200).optional(),
+        model: z.string().min(1).max(200).optional(),
+        context_length: z.number().int().positive(),
+      }),
+    );
     const studioModels = entries(
       z.object({ models: z.array(z.unknown()) }).safeParse(studio).data?.models ?? [],
       lmStudioModelSchema,
@@ -330,12 +366,20 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
               ? ollamaModel(shown.data)
               : undefined;
           if (known?.usable === false) return [];
-          const contextWindow =
+          const reportedContext =
             known?.contextWindow ??
             entry.context_length ??
             entry.context_window ??
             entry.max_model_len ??
             128_000;
+          const contextWindow = Math.min(
+            reportedContext,
+            ...(studioModel
+              ? []
+              : loadedModels
+                  .filter((model) => model.name === entry.id || model.model === entry.id)
+                  .map((model) => model.context_length)),
+          );
           return [
             definition({
               id: entry.id,
@@ -423,11 +467,13 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         signal: AbortSignal.timeout(15000),
       },
     );
-    await response.body?.cancel();
-    if ([400, 401, 403].includes(response.status))
+    if ([400, 401, 403].includes(response.status)) {
+      await response.body?.cancel();
       throw new ModelAuthError('Google Vertex AI didn’t accept this API key.');
+    }
     if (!response.ok && response.status !== 404)
-      throw new Error('The model service is temporarily unavailable. Try again.');
+      throw await modelServiceError(response, 'Google Vertex AI model discovery', [credential.key]);
+    await response.body?.cancel();
     return local.map(definition);
   }
   async function azureCatalog(local: readonly Model<Api>[], credential: ModelCredential) {
@@ -447,28 +493,14 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
     async signIn({ signal: requestedSignal, hostId, previous }) {
       const controller = new AbortController();
       const signal = AbortSignal.any([requestedSignal, controller.signal]);
-      const canceled = () => new ModelAuthError('ChatGPT sign-in was canceled.');
+      const refused = (message: string, reason: string) =>
+        new ModelAuthError(message, false, { cause: { reason } });
+      const canceled = (reason = 'aborted') => refused('ChatGPT sign-in was canceled.', reason);
       if (signal.aborted) throw canceled();
       const saved = chatgptCredentialSchema.safeParse(previous).data;
       const state = random();
       const nonce = random();
       const verifier = random();
-      const url = new URL(`${issuer}/api/accounts/authorize`);
-      url.search = new URLSearchParams({
-        client_id: saved?.clientId ?? registration,
-        ...(saved
-          ? { id_token_hint: saved.idToken, ...(saved.email ? { login_hint: saved.email } : {}) }
-          : { agent_name_hint: 'Nod' }),
-        ext_agent_host_id: `urn:uuid:${hostId}`,
-        response_type: 'code',
-        redirect_uri: callbackUrl,
-        scope: `openid profile email offline_access resource.invoke ${planScope}`,
-        resource,
-        state,
-        nonce,
-        code_challenge: createHash('sha256').update(verifier).digest('base64url'),
-        code_challenge_method: 'S256',
-      }).toString();
       let settled = false;
       let claimed = false;
       let grant!: (value: { code: string; clientId: string }) => void;
@@ -480,10 +512,10 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       granted.catch(() => {});
       const abort = () => refuse(canceled());
       signal.addEventListener('abort', abort, { once: true });
-      const expected = new URL(callbackUrl);
+      const expected = new URL('http://127.0.0.1:1455/auth/callback');
       const complete = (callback: URL) => {
         if (settled || claimed || signal.aborted)
-          throw new ModelAuthError('This sign-in request has expired. Start a new connection.');
+          throw refused('This sign-in request has expired. Start a new connection.', 'expired');
         if (
           callback.origin !== expected.origin ||
           callback.pathname !== expected.pathname ||
@@ -493,15 +525,15 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           callback.searchParams.getAll('state').length !== 1 ||
           callback.searchParams.get('state') !== state
         )
-          throw new ModelAuthError('This sign-in callback is invalid or was declined.');
+          throw refused('This sign-in callback is invalid or was declined.', 'callback_mismatch');
         if (callback.searchParams.has('error')) {
           if (
             callback.searchParams.getAll('error').length !== 1 ||
             !callback.searchParams.get('error') ||
             callback.searchParams.has('code')
           )
-            throw new ModelAuthError('This sign-in callback is invalid.');
-          const declined = canceled();
+            throw refused('This sign-in callback is invalid.', 'invalid_callback');
+          const declined = canceled('declined');
           claimed = true;
           refuse(declined);
           throw declined;
@@ -516,7 +548,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
             ? issued[0]
             : undefined;
         if (codes.length !== 1 || !codes[0] || !clientId)
-          throw new ModelAuthError('This sign-in callback is invalid.');
+          throw refused('This sign-in callback is invalid.', 'invalid_callback');
         claimed = true;
         grant({ code: codes[0], clientId });
       };
@@ -528,7 +560,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           response.end(page.html);
         };
         try {
-          const callback = new URL(request.url ?? '/', callbackUrl);
+          const callback = new URL(request.url ?? '/', expected);
           if (request.method !== 'GET' || callback.pathname !== expected.pathname) {
             send(404);
             return;
@@ -538,7 +570,13 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
             () => send(200),
             () => send(400),
           );
-        } catch {
+        } catch (error) {
+          if (!claimed)
+            logFailure('model_sign_in_failed', Object(error).cause, {
+              provider: 'openai',
+              reason: Object(Object(error).cause).reason,
+              phase: 'callback',
+            });
           send(400);
         }
       });
@@ -553,26 +591,43 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
           });
           server.closeIdleConnections();
         }));
-      try {
-        await new Promise<void>((resolve, reject) => {
+      const listen = (port: number) =>
+        new Promise<void>((resolve, reject) => {
           server.once('error', reject);
-          server.listen(Number(expected.port), expected.hostname, () => {
+          server.listen(port, expected.hostname, () => {
             server.off('error', reject);
             resolve();
           });
         });
+      try {
+        await listen(Number(expected.port)).catch(() => listen(0));
         server.on('error', () => controller.abort());
         if (signal.aborted) throw canceled();
       } catch (error) {
         signal.removeEventListener('abort', abort);
         await close();
         if (error instanceof ModelAuthError) throw error;
-        throw new ModelAuthError(
-          error instanceof Error && 'code' in error && error.code === 'EADDRINUSE'
-            ? 'Port 1455 is already in use. Close the other Nod app or another sign-in, then try again.'
-            : 'ChatGPT sign-in couldn’t start. Try again.',
-        );
+        throw new ModelAuthError('ChatGPT sign-in couldn’t start. Try again.', false, {
+          cause: { reason: 'callback_server_failed', code: Object(error).code },
+        });
       }
+      expected.port = String((server.address() as AddressInfo).port);
+      const url = new URL(`${issuer}/api/accounts/authorize`);
+      url.search = new URLSearchParams({
+        client_id: saved?.clientId ?? registration,
+        ...(saved
+          ? { id_token_hint: saved.idToken, ...(saved.email ? { login_hint: saved.email } : {}) }
+          : { agent_name_hint: 'Nod' }),
+        ext_agent_host_id: `urn:uuid:${hostId}`,
+        response_type: 'code',
+        redirect_uri: expected.href,
+        scope: `openid profile email offline_access resource.invoke ${planScope}`,
+        resource,
+        state,
+        nonce,
+        code_challenge: createHash('sha256').update(verifier).digest('base64url'),
+        code_challenge_method: 'S256',
+      }).toString();
       exchange = (async (): Promise<ModelCredential> => {
         try {
           const { code, clientId } = await granted;
@@ -582,7 +637,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
               client_id: clientId,
               code,
               code_verifier: verifier,
-              redirect_uri: callbackUrl,
+              redirect_uri: expected.href,
             },
             signal,
           );
@@ -764,7 +819,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         if (response.status !== 401) return response;
         await response.body?.cancel();
         throw method === 'subscription'
-          ? new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true)
+          ? new ModelAuthError(reconnectChatGpt, true)
           : new ModelAuthError(
               `${modelProviderNames[provider]} didn’t accept this API key. Check it and try again.`,
             );
@@ -819,6 +874,12 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         const ids = new Set(
           list.filter((m) => !m.visibility || m.visibility === 'list').map((m) => m.slug ?? m.id),
         );
+        if (provider === 'openai')
+          local.push(
+            ...openAIModels(credential.type === 'api_key' ? credential.region : undefined).filter(
+              (model) => !local.some(({ id }) => id === model.id),
+            ),
+          );
         return local.filter((m) => ids.has(m.id)).map(definition);
       }
       const list = entries(
@@ -966,9 +1027,7 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         const terminal =
           error instanceof TokenRejected && [400, 401, 403].includes(error.statusCode);
         throw new ModelAuthError(
-          terminal
-            ? 'Reconnect your ChatGPT account in Settings > Models.'
-            : 'ChatGPT is temporarily unavailable. Try again.',
+          terminal ? reconnectChatGpt : 'ChatGPT is temporarily unavailable. Try again.',
           terminal,
           { cause: error },
         );
@@ -1012,6 +1071,24 @@ function portableToolCallIds(messages: Context['messages'], model: string): Cont
   });
 }
 
+function textContentParts(event: unknown) {
+  const choices = (event as { choices?: unknown } | null)?.choices;
+  if (!Array.isArray(choices)) return;
+  for (const choice of choices as Array<{ delta?: { content?: unknown } } | null>) {
+    const delta = choice?.delta;
+    if (delta && Array.isArray(delta.content))
+      delta.content = delta.content
+        .map((part: { type?: unknown; text?: unknown } | string | null) =>
+          typeof part === 'string'
+            ? part
+            : part?.type === 'text' && typeof part.text === 'string'
+              ? part.text
+              : '',
+        )
+        .join('');
+  }
+}
+
 export async function createPiModelRuntime(
   access: ModelAccess,
   {
@@ -1030,7 +1107,7 @@ export async function createPiModelRuntime(
   const provider = access.provider;
   const reconnect = async (credential?: ModelCredential) => {
     await access.needsReconnect?.(credential);
-    return new ModelAuthError('Reconnect your ChatGPT account in Settings > Models.', true);
+    return new ModelAuthError(reconnectChatGpt, true);
   };
   if (
     subscription &&
@@ -1153,7 +1230,7 @@ export async function createPiModelRuntime(
     let phase: ModelRequestFacts['requestPhase'] = 'prepare';
     let status: number | undefined;
     let transportCause: string | undefined;
-    let completeRequest: ((error?: string) => Promise<void>) | undefined;
+    let completeRequest: ((error?: string, status?: number) => Promise<void>) | undefined;
     let settleBudget: ((spentUsd: number | null) => Promise<void>) | undefined;
     const silence = new AbortController();
     let silenceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1184,6 +1261,7 @@ export async function createPiModelRuntime(
       onProviderStreamEvent: async (event, model) => {
         heard();
         phase = 'stream';
+        if (model.api === 'openai-completions') textContentParts(event);
         await options?.onProviderStreamEvent?.(event, model);
       },
       ...(target.provider === 'openrouter' && target.id === 'openrouter/free'
@@ -1234,6 +1312,8 @@ export async function createPiModelRuntime(
                 }
                 throw error;
               });
+              phase = 'response';
+              status = response.status;
               return usage ? usage.response(response) : response;
             },
           }
@@ -1378,6 +1458,7 @@ export async function createPiModelRuntime(
           )
             await completeRequest?.(
               message.stopReason === 'error' ? message.errorMessage : undefined,
+              status,
             );
         }
         if (event.type === 'done' || event.type === 'error') {
@@ -1385,6 +1466,7 @@ export async function createPiModelRuntime(
           await settleBudget?.(piUsageMetrics(message.usage).costUsd ?? null);
           requestFacts.set(message, {
             requestPhase: phase,
+            requestKind: cacheWarm ? 'cache_warm' : 'regular',
           });
         }
         events.push(event);
@@ -1415,6 +1497,7 @@ export async function createPiModelRuntime(
           costUsd: null,
           pricing: 'unavailable',
           ...piUsageMetrics(message?.usage),
+          pricingSignature: modelPricingSignature(target.cost, target.api),
         });
       };
       const cancel = () => report();

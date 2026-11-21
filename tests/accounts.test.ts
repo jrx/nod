@@ -1,3 +1,12 @@
+import {
+  startupErrorFacts,
+  startupStatusFacts,
+  startupEventFacts,
+  startupLogFacts,
+  startupFailureMessage,
+  startupReceiptFacts,
+  StartupFeedbackError,
+} from '../src/shared/startup-feedback-facts.mjs';
 import assert from 'node:assert/strict';
 import test, { describe } from 'node:test';
 import Fastify from 'fastify';
@@ -22,6 +31,8 @@ import {
   type DecisionConnection,
 } from '../src/providers/decisions.ts';
 import { createMailCheck } from '../src/server/mail-check.ts';
+import { privateEmailResult } from '../src/server/integration-result.ts';
+import { withFailureLog } from '../src/ports/failure-log.ts';
 import type { DecisionQuestion } from '../src/ports/decisions.ts';
 import { createModelTraces } from '../src/server/traces.ts';
 import type { ModelTrace } from '../src/ports/traces.ts';
@@ -34,9 +45,349 @@ import { createTrustReview } from '../src/server/trust-review.ts';
 import { trustFacts } from '../src/server/trust-facts.ts';
 import {
   createErrorRedactor,
+  environmentSecrets,
   createRedactor,
   createTextRedactor,
+  redactSecretText,
 } from '../src/server/redaction.ts';
+
+test('decision failures retain bounded HTTP and response details', async (t) => {
+  const question: DecisionQuestion = {
+    name: 'access',
+    choices: [
+      { value: false, description: 'Ordinary mail.' },
+      { value: true, description: 'Access secret.' },
+    ],
+  };
+  const canary = 'synthetic-private-value@example.test/private-response';
+  for (const provider of ['openrouter', 'typesafe'] as const)
+    for (const status of [401, 403, 429, 503])
+      await t.test(`${provider} HTTP ${status}`, async () => {
+        const usage: ProviderUsageEvent[] = [];
+        let calls = 0;
+        let cancelled = false;
+        const model = createDecisionModel({
+          resolve: async () => ({ provider, key: canary }),
+          fetch: async () => {
+            calls++;
+            return new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.enqueue(new TextEncoder().encode(canary));
+                },
+                cancel() {
+                  cancelled = true;
+                  return new Promise(() => {});
+                },
+              }),
+              { status, statusText: canary },
+            );
+          },
+        });
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await assert.rejects(
+            Promise.race([
+              model.check(
+                { instructions: 'Check synthetic mail.', input: {}, question },
+                undefined,
+                (event) => usage.push(event),
+              ),
+              new Promise((_resolve, reject) => {
+                timer = setTimeout(
+                  () => reject(new Error('The HTTP failure waited for its body.')),
+                  500,
+                );
+              }),
+            ]),
+            (error: Error & { code?: string; status?: number }) => {
+              assert.equal(error.code, 'decision_http');
+              assert.equal(error.status, status);
+              assert.equal(error.cause, undefined);
+              assert.ok(!error.message.includes(canary));
+              return true;
+            },
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+        assert.equal(calls, 1);
+        assert.equal(cancelled, true);
+        assert.equal(usage.length, 1);
+        assert.equal(usage[0].status, 'failed');
+      });
+  const cases = [
+    [
+      'transport',
+      'decision_transport',
+      () => {
+        throw Object.assign(new Error(canary), { cause: canary, code: canary });
+      },
+    ],
+    [
+      'response body',
+      'decision_response',
+      () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error(canary));
+            },
+          }),
+          { status: 200 },
+        ),
+    ],
+    ['JSON', 'decision_json', () => new Response(`{"private":"${canary}"`, { status: 200 })],
+    [
+      'missing answer',
+      'decision_validation',
+      () => Response.json({ answers: {}, usage: { input_tokens: 1 } }),
+    ],
+    [
+      'unknown choice',
+      'decision_validation',
+      () =>
+        Response.json({
+          answers: { access: { type: 'choice', choice: canary } },
+          usage: { input_tokens: 1 },
+        }),
+    ],
+    [
+      'invalid probabilities',
+      'decision_validation',
+      () =>
+        Response.json({
+          answers: {
+            access: { type: 'choice', choice: 'false', probabilities: { false: -1, true: 2 } },
+          },
+          usage: { input_tokens: 1 },
+        }),
+    ],
+    [
+      'invalid usage',
+      'decision_validation',
+      () =>
+        Response.json({
+          answers: { access: { type: 'choice', choice: false } },
+          usage: { input_tokens: -1 },
+        }),
+    ],
+  ] as const;
+  for (const [name, code, response] of cases)
+    await t.test(name, async () => {
+      const model = createDecisionModel({
+        resolve: async () => ({ provider: 'openrouter', key: canary }),
+        fetch: async () => response(),
+      });
+      await assert.rejects(
+        model.check({
+          instructions: 'Check synthetic mail.',
+          input: {},
+          question: { ...question, minProbability: 0.99 },
+        }),
+        (error: Error & { code?: string; status?: number; issues?: unknown }) => {
+          assert.equal(error.code, code);
+          assert.equal(error.status, code === 'decision_transport' ? undefined : 200);
+          assert.equal(error.cause, undefined);
+          assert.equal(error.issues, undefined);
+          assert.ok(
+            !JSON.stringify(
+              Object.getOwnPropertyNames(error).map(
+                (key) => (error as unknown as Record<string, unknown>)[key],
+              ),
+            ).includes(canary),
+          );
+          return true;
+        },
+      );
+    });
+  const valid = createDecisionModel({
+    resolve: async () => ({ provider: 'openrouter', key: canary }),
+    fetch: async () =>
+      Response.json({
+        answers: {
+          access: { type: 'choice', choice: 'false', probabilities: { false: 0.999, true: 0.001 } },
+        },
+        usage: { input_tokens: 1 },
+      }),
+  });
+  const accepted = await valid.check({
+    instructions: 'Check synthetic mail.',
+    input: {},
+    question: { ...question, minProbability: 0.99 },
+  });
+  assert.equal(Object(accepted).access, false);
+});
+
+test('mail withholding and failure logs expose only known phases and valid HTTP statuses', async () => {
+  const canary = 'synthetic-private-body-and-provider-value';
+  const failures: Array<Record<string, unknown>> = [];
+  const checks = [
+    ['decision_http', 503, 'request failed (HTTP 503)'],
+    ['decision_response', 200, 'response could not be read (HTTP 200)'],
+    ['decision_json', 200, 'returned invalid JSON (HTTP 200)'],
+    ['decision_validation', 200, 'returned an invalid response (HTTP 200)'],
+    ['decision_transport', undefined, 'connection failed'],
+    [canary, 429, 'request failed (HTTP 429)'],
+    ...[NaN, Infinity, 99, 600, 200.5, '503'].map((status) => [canary, status, 'request failed']),
+  ];
+  for (const [code, status, expected] of checks) {
+    let requests = 0;
+    const check = createMailCheck({
+      curator: {
+        id: 'unused',
+        configured: false,
+        async curate() {
+          assert.fail('No fallback is allowed.');
+        },
+      },
+      decisions: {
+        async check() {
+          requests++;
+          throw Object.assign(new Error(canary), { code, status, cause: canary, issues: [canary] });
+        },
+      },
+    });
+    const result = await withFailureLog(
+      (event, error) => {
+        const value = error as Error & { code?: unknown; status?: unknown; issues?: unknown };
+        assert.equal(value.cause, undefined);
+        assert.equal(value.issues, undefined);
+        failures.push({
+          event,
+          name: value.name,
+          message: value.message,
+          code: value.code,
+          status: value.status,
+        });
+      },
+      () =>
+        privateEmailResult(
+          {
+            messages: [
+              { id: 'synthetic-mail', from: 'sender@example.test', subject: canary, body: canary },
+            ],
+          },
+          check,
+        ),
+    );
+    const encoded = JSON.stringify(result);
+    assert.ok(encoded.includes(String(expected)), encoded);
+    assert.ok(!encoded.includes(canary));
+    assert.equal(requests, 1);
+  }
+  assert.equal(failures.length, checks.length);
+  assert.ok(!JSON.stringify(failures).includes(canary));
+  assert.deepEqual(
+    failures.map((failure) => failure.status),
+    [503, 200, 200, 200, undefined, 429, ...Array(6).fill(undefined)],
+  );
+  assert.ok(failures.every((failure) => failure.event === 'mail_check_failed'));
+});
+
+test('mail checks retain the native curator HTTP status without provider content', async (t) => {
+  const { createServer } = await import('node:http');
+  const { createPiMemoryCurator } = await import('../src/providers/pi/memory-curator.ts');
+  const canary = 'synthetic-private-provider-body';
+  let calls = 0;
+  const server = createServer(async (request, response) => {
+    let text = '';
+    for await (const chunk of request) text += chunk;
+    const body = JSON.parse(text);
+    assert.equal(request.url, '/v1/chat/completions');
+    assert.equal(body.model, 'fixture-mail-check');
+    assert.equal(body.response_format, undefined);
+    calls++;
+    response.writeHead(403, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ error: { message: canary } }));
+  });
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+  const curator = createPiMemoryCurator({
+    provider: 'compatible',
+    configured: () => true,
+    resolve: async () => ({
+      provider: 'compatible',
+      method: 'api_key',
+      effort: 'off',
+      definition: {
+        choice: {
+          id: 'fixture-mail-check',
+          name: 'Synthetic mail',
+          images: false,
+          efforts: ['off'],
+          contextWindow: 128000,
+        },
+        spec: {
+          id: 'fixture-mail-check',
+          name: 'Synthetic mail',
+          provider: 'compatible',
+          api: 'openai-completions',
+          baseUrl,
+          reasoning: false,
+          input: ['text'],
+          contextWindow: 128000,
+          maxTokens: 8192,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        },
+      },
+      read: async () => ({ type: 'endpoint', url: baseUrl, key: 'fixture-native-mail-key' }),
+    }),
+  });
+  const failures: unknown[] = [];
+  const result = await withFailureLog(
+    (event, error) => failures.push({ event, ...Object(error) }),
+    () =>
+      privateEmailResult(
+        { from: 'sender@example.test', subject: canary, body: canary },
+        createMailCheck({ curator }),
+      ),
+  );
+  assert.equal(calls, 1);
+  assert.match(JSON.stringify(result), /HTTP 403/);
+  assert.ok(!JSON.stringify(result).includes(canary));
+  assert.deepEqual(failures, [
+    { event: 'mail_check_failed', code: 'mail_check_request', status: 403 },
+  ]);
+});
+
+test('invalid decision settings fail before reserving a budget or sending a request', async () => {
+  let reservations = 0;
+  let requests = 0;
+  const usage: ProviderUsageEvent[] = [];
+  const model = createDecisionModel({
+    resolve: async () => ({ provider: 'openai', key: 'fixture-key', region: 'invalid' as never }),
+    reserve: async () => {
+      reservations++;
+      return async () => {};
+    },
+    fetch: async () => {
+      requests++;
+      assert.fail('An invalid connection must not send a request.');
+    },
+  });
+  await assert.rejects(
+    model.check(
+      {
+        instructions: 'Check synthetic mail.',
+        input: {},
+        question: { name: 'access', choices: [{ value: false, description: 'Ordinary mail.' }] },
+      },
+      undefined,
+      (event) => usage.push(event),
+    ),
+    /Choose an OpenAI API region/,
+  );
+  assert.equal(reservations, 0);
+  assert.equal(requests, 0);
+  assert.equal(usage.length, 0);
+});
 
 test('decision reservations release only requests that did not reach dispatch', async () => {
   for (const phase of ['before dispatch', 'provider error', 'transport error']) {
@@ -172,7 +523,9 @@ test('OpenAI decision failures keep the region and provider reason without expos
       input: {},
       question: { name: 'answer', choices: [{ value: false, description: 'Ask.' }] },
     }),
-    (error: Error) => {
+    (error: Error & { status?: number; code?: string }) => {
+      assert.equal(error.status, 401);
+      assert.equal(error.code, 'decision_http');
       assert.match(error.message, /401/);
       assert.match(error.message, /project geography EU/);
       assert.ok(!error.message.includes(key));
@@ -958,6 +1311,46 @@ test('trust decisions select only owner evidence and keep reply evidence separat
     ['Look at the budget folder', undefined],
   ] as const)
     assert.equal(trustBasis({ run: true, because }, scheduled)?.kind, kind);
+  const informal = withOwnerIds(
+    { userMessages: [{ at: '2026-11-03T09:00:00Z', text: 'clica no icone de lapis e salva' }] },
+    ['owner-message'],
+  );
+  for (const [because, kind] of [
+    ['…clica no icone de lapis', 'message'],
+    ['clica no ícone de lápis', 'message'],
+    ['clica no ícone … salva', undefined],
+    ['apaga o ícone', undefined],
+  ] as const)
+    assert.equal(trustBasis({ run: true, because }, informal)?.kind, kind, because);
+  const conditional = withOwnerIds(
+    { userMessages: [{ at: '2026-11-03T09:00:00Z', text: 'send it if x ≠ 1' }] },
+    ['owner-message'],
+  );
+  for (const [because, kind] of [
+    ['send it if x ≠ 1', 'message'],
+    ['send it if x = 1', undefined],
+  ] as const)
+    assert.equal(trustBasis({ run: true, because }, conditional)?.kind, kind, because);
+  const recipient = withOwnerIds(
+    {
+      userMessages: [
+        {
+          at: '2026-11-03T09:00:00Z',
+          text: 'manda o relatorio para lena@example.test e publica em docs.example.test/relatorio',
+        },
+        { at: '2026-11-03T09:01:00Z', text: 'avisa cafe.example.test, ação:sim' },
+      ],
+    },
+    ['owner-message', 'owner-reply'],
+  );
+  for (const [because, kind] of [
+    ['manda o relatório para lena@example.test', 'message'],
+    ['manda o relatorio para lena@exämple.test', undefined],
+    ['publica em docs.exämple.test/relatorio', undefined],
+    ['avisa café.example.test', undefined],
+    ['acao:sim', 'message'],
+  ] as const)
+    assert.equal(trustBasis({ run: true, because }, recipient)?.kind, kind, because);
   assert.equal(
     trustDecision(scheduled).question.choices.some(({ value }) =>
       String(value).startsWith('message:'),
@@ -1071,6 +1464,88 @@ test('retired confirmation replies require high confidence to start a new reques
     output = answer;
     assert.equal(await trust.classifyRetiredReply(reply, expiredConfirmation), expected);
   }
+});
+
+test('repeated actions require an action-specific decision with high confidence', async () => {
+  let output: unknown;
+  const input = {
+    action: 'CONNECTED_MCP_CALL',
+    args: { tool: 'execute_workflow', input: { workflowId: 'synthetic-workflow' } },
+    reply: 'Set the threshold to 7 and run the synthetic workflow again.',
+    question: 'Which threshold should I use?',
+  };
+  const controller = new AbortController();
+  let receivedSignal: AbortSignal | undefined;
+  const trust = createTrust({
+    pool: {} as never,
+    ownerId: 'synthetic-owner',
+    review: async (instructions, received, signal, question) => {
+      assert.deepEqual(received, input);
+      assert.match(instructions, /never permits execution/);
+      assert.equal(question?.name, 'repeatedAction');
+      assert.deepEqual(
+        question?.choices.map(({ value }) => value),
+        ['new', 'same'],
+      );
+      receivedSignal = signal;
+      return output;
+    },
+  });
+  for (const [answer, expected] of [
+    [{ repeatedAction: 'new', probability: 0.98 }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: '0.995' }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: Number.NaN }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: Number.POSITIVE_INFINITY }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: 1.1 }, 'uncertain'],
+    [{ repeatedAction: 'new' }, 'uncertain'],
+    [{ repeatedAction: 'wrong', probability: 1 }, 'uncertain'],
+    [{ repeatedAction: 'new', probability: 0.995 }, 'new'],
+    [{ repeatedAction: 'same', probability: 0.995 }, 'same'],
+  ] as const) {
+    output = answer;
+    assert.equal(await trust.classifyRepeatedAction(input, controller.signal), expected);
+  }
+  assert.ok(receivedSignal);
+  assert.notEqual(receivedSignal, controller.signal);
+  assert.equal(receivedSignal.aborted, false);
+  controller.abort();
+  assert.equal(receivedSignal.aborted, true);
+});
+
+test('repeated action decisions keep their confidence threshold and refuse a late stopped answer', async () => {
+  const input = {
+    action: 'CONNECTED_MCP_CALL',
+    args: { tool: 'execute_workflow' },
+    reply: 'Run it again.',
+    question: 'Another run?',
+  };
+  const controller = new AbortController();
+  const stopped = createTrust({
+    pool: {} as never,
+    ownerId: 'synthetic-owner',
+    review: async () => {
+      controller.abort(new Error('Synthetic Stop.'));
+      return { repeatedAction: 'new', probability: 1 };
+    },
+  });
+  await assert.rejects(stopped.classifyRepeatedAction(input, controller.signal), /Synthetic Stop/);
+  const decisions = createTrust({
+    pool: {} as never,
+    ownerId: 'synthetic-owner',
+    review: async () => {
+      assert.fail('A selected decision provider must not fall back.');
+    },
+    decisions: {
+      check: async ({ input: received, question }, signal) => {
+        assert.deepEqual(received, input);
+        assert.equal(question.name, 'repeatedAction');
+        assert.equal(question.minProbability, 0.99);
+        assert.ok(signal);
+        return { repeatedAction: 'new', probability: 0.995 };
+      },
+    },
+  });
+  assert.equal(await decisions.classifyRepeatedAction(input), 'new');
 });
 
 test('native decision probabilities validate the wire type and retain refusal and cache costs', async (t) => {
@@ -1485,6 +1960,10 @@ describe('account routes', () => {
         await activity.wait?.();
         return owner === 'local-owner' ? Math.min(activity.days, limit) : 0;
       },
+      async seenSurveys() {
+        return [];
+      },
+      async markSurveySeen() {},
       async update(_owner, input) {
         calls.writes++;
         const saved = record;
@@ -1509,7 +1988,6 @@ describe('account routes', () => {
     createAccountSession({
       analytics,
       accounts,
-      origin,
       localUser: { id: 'local-owner', name: 'You', email: null, avatarUrl: null },
       developerIds: new Set(['local-owner']),
       async start() {
@@ -1817,12 +2295,111 @@ describe('account routes', () => {
     );
   });
 
+  test('conversation trace IDs survive idle gaps and runtime restarts without an analytics ID', async (t) => {
+    const { traceKey } = await import('../src/server/access.ts');
+    const root = await mkdtemp(join(tmpdir(), 'nod-stable-traces-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const delivered: ModelTrace[] = [];
+    const open = async () => {
+      const traces = createModelTraces(async (trace) => {
+        delivered.push(trace);
+      });
+      traces.configure({
+        enabled: true,
+        conversationKey: Buffer.from(await traceKey(root), 'base64url'),
+      });
+      return traces;
+    };
+    const sessionId = randomUUID();
+    const turnId = randomUUID();
+    const trace = (day: number): ModelTrace => ({
+      id: randomUUID(),
+      name: 'fixture-model',
+      provider: 'fixture',
+      startedAt: `2026-11-${day}T10:00:00.000Z`,
+      endedAt: `2026-11-${day}T10:00:01.000Z`,
+      messages: [{ role: 'user', content: 'Synthetic request from lena@example.test.' }],
+      tools: [],
+      output: { role: 'assistant', content: 'Synthetic answer.' },
+      usage: {
+        inputTokens: 10,
+        outputTokens: 2,
+        totalTokens: 12,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUsd: null,
+      },
+      metadata: {
+        source: 'agent',
+        session_id: sessionId,
+        turn_id: turnId,
+        user_id: 'private-forged-id',
+      },
+    });
+    const settle = async (count: number) => {
+      for (let attempt = 0; attempt < 100 && delivered.length < count; attempt++)
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(delivered.length, count);
+    };
+    const first = await open();
+    assert.equal(first.active(), true);
+    const ids = first.withTurn({ sessionId, turnId }, (ids) => {
+      first.record(trace(19));
+      return ids;
+    });
+    await settle(1);
+    first.record(trace(21));
+    await settle(2);
+    const restarted = await open();
+    const next = restarted.withTurn({ sessionId, turnId: randomUUID() }, (ids) => {
+      restarted.record(trace(23));
+      return ids;
+    });
+    await settle(3);
+    assert.equal(next.thread_id, ids.thread_id);
+    for (const item of delivered) {
+      assert.equal(item.metadata.thread_id, ids.thread_id);
+      assert.equal(item.metadata.user_id, undefined);
+    }
+    const userId = `local:${randomUUID()}`;
+    restarted.configure({ userId });
+    restarted.record(trace(24));
+    await settle(4);
+    assert.equal(delivered[3].metadata.user_id, userId);
+    assert.equal(delivered[3].metadata.thread_id, ids.thread_id);
+    restarted.configure({ userId: undefined });
+    restarted.record(trace(25));
+    await settle(5);
+    assert.equal(delivered[4].metadata.user_id, undefined);
+    assert.equal(delivered[4].metadata.thread_id, ids.thread_id);
+    restarted.configure({ userId: 'invalid' });
+    restarted.record(trace(26));
+    await settle(6);
+    assert.equal(delivered[5].metadata.user_id, undefined);
+    restarted.withTurn({ sessionId: randomUUID(), turnId: randomUUID() }, () =>
+      restarted.record(trace(26)),
+    );
+    await settle(7);
+    assert.notEqual(delivered[6].metadata.thread_id, ids.thread_id);
+    const key = await readFile(join(root, 'trace-key'), 'utf8');
+    if (process.platform !== 'win32')
+      assert.equal((await lstat(join(root, 'trace-key'))).mode & 0o077, 0);
+    for (const privateValue of [sessionId, turnId, key, 'private-forged-id', 'lena@example.test'])
+      assert.ok(
+        !JSON.stringify(delivered).includes(privateValue),
+        privateValue === key ? 'trace key' : privateValue,
+      );
+    restarted.configure({ enabled: false });
+    assert.equal(restarted.active(), false);
+  });
+
   test('conversation traces stay off until the owner opts in, stop at once and leave without personal data', async (t) => {
     const delivered: ModelTrace[] = [];
     const traces = createModelTraces(async (trace) => {
       delivered.push(trace);
     }, '0.3.0');
     traces.configure({
+      userId: `local:${randomUUID()}`,
       secrets: ['fixture-model-key-8c41f2'],
       profile: async () => ({ names: ['Marta Vidal'], region: 'ES' }),
     });
@@ -1892,10 +2469,9 @@ describe('account routes', () => {
     await settle(1);
     assert.equal(delivered.length, 1);
     const sent = JSON.stringify(delivered[0]);
-    const privateContent = [delivered[0].metadata.thread_id, delivered[0].metadata.turn_id].reduce(
-      (text, id) => text.replaceAll(id, '[id]'),
-      sent,
-    );
+    const privateContent = [delivered[0].metadata.thread_id, delivered[0].metadata.turn_id]
+      .map(String)
+      .reduce((text, id) => text.replaceAll(id, '[id]'), sent);
     for (const value of [
       'Marta',
       'Vidal',
@@ -1918,10 +2494,15 @@ describe('account routes', () => {
       assert.ok(!privateContent.includes(value), value);
     assert.match(sent, /order 123456 on 2026-10-19/);
     assert.match(sent, /192\.168\.1\.1\.example/);
-    assert.deepEqual(Object.keys(delivered[0].metadata), ['turn_id', 'thread_id', 'app_version']);
+    assert.deepEqual(Object.keys(delivered[0].metadata), [
+      'turn_id',
+      'thread_id',
+      'user_id',
+      'app_version',
+    ]);
     assert.equal(delivered[0].metadata.app_version, '0.3.0');
-    assert.match(delivered[0].metadata.thread_id, /^[0-9a-f]{32}$/);
-    assert.match(delivered[0].metadata.turn_id, /^[0-9a-f]{32}$/);
+    assert.match(String(delivered[0].metadata.thread_id), /^[0-9a-f]{32}$/);
+    assert.match(String(delivered[0].metadata.turn_id), /^[0-9a-f]{32}$/);
     assert.ok(!sent.includes('fixture-session') && !sent.toLowerCase().includes(turnId));
     assert.ok(sent.includes(`task ${delivered[0].metadata.turn_id}`));
     assert.ok(!sent.includes(homedir()) && sent.includes('~/Library/nod.json'));
@@ -1930,7 +2511,7 @@ describe('account routes', () => {
     traces.record(trace('A request after a long pause', 57));
     await settle(3);
     assert.equal(delivered[1].metadata.thread_id, delivered[0].metadata.thread_id);
-    assert.notEqual(delivered[2].metadata.thread_id, delivered[1].metadata.thread_id);
+    assert.equal(delivered[2].metadata.thread_id, delivered[1].metadata.thread_id);
     await request({ traces: false });
     traces.record(trace('After opting out'));
     await settle(4);
@@ -1938,11 +2519,23 @@ describe('account routes', () => {
   });
 
   test('account changes require the same origin and owner and never accept provider or owner input', async (t) => {
-    const f = await fixture();
+    const key = 'k'.repeat(43);
+    const f = await fixture(undefined, undefined, key);
     t.after(() => f.app.close());
-    const headers = { origin };
+    const access = { host: 'localhost:4399', cookie: `nod-access-4399=${key}` };
+    const headers = { ...access, origin };
+    for (const loopback of ['127.0.0.1:4399', '[::1]:4399']) {
+      const response = await f.app.inject({
+        method: 'POST',
+        url: '/api/account/prepare',
+        headers: { ...access, host: loopback, origin: `http://${loopback}` },
+        payload: {},
+      });
+      assert.equal(response.statusCode, 200);
+    }
     for (const input of [
-      { headers: { origin: 'https://foreign.example.test' }, payload: {}, status: 403 },
+      { headers: { ...access, origin: 'https://foreign.example.test' }, payload: {}, status: 403 },
+      { headers: { host: access.host, origin }, payload: {}, status: 401 },
       { headers: { ...headers, 'sec-fetch-site': 'cross-site' }, payload: {}, status: 403 },
       { headers: { ...headers, 'x-nod-account': 'sam' }, payload: {}, status: 401 },
       { headers, payload: { ownerId: 'sam' }, status: 400 },
@@ -2569,6 +3162,37 @@ test('server model credentials reject invalid destinations and cloud accounts be
   );
 });
 
+test('adding a model key keeps the service reason and removes the key', async () => {
+  const { createModelService } = await import('../src/server/models.ts');
+  const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+  const key = 'fixture-add-key-reason';
+  const secret = randomBytes(32);
+  for (const [provider, status] of [
+    ['openrouter', 429],
+    ['mistral', 503],
+  ] as const) {
+    const service = createModelService({
+      database: {} as pg.Pool,
+      ownerId: 'fixture-add-key-owner',
+      keyStore: { id: 'fixture', configured: true, getKey: async () => secret },
+      backend: createPiModelBackend({
+        fetch: async () =>
+          Response.json(
+            { message: `Synthetic ${key}` },
+            { status, headers: { 'content-type': 'application/json' } },
+          ),
+      }),
+      origin: 'http://127.0.0.1:4310',
+    });
+    await assert.rejects(service.addKey(provider, key), (error: Error) => {
+      assert.ok(!error.message.includes(key));
+      assert.ok(error.message.includes(`HTTP ${status}`));
+      assert.match(error.message, /Synthetic \[redacted\]/);
+      return true;
+    });
+  }
+});
+
 test('secret redaction finishes for long malformed Basic credentials', async () => {
   const { execFile } = await import('node:child_process');
   const { promisify } = await import('node:util');
@@ -2589,6 +3213,15 @@ test('secret redaction finishes for long malformed Basic credentials', async () 
   );
 });
 
+test('secret redaction hides every bearer token character', () => {
+  assert.equal(
+    redactSecretText('Rejected Bearer synthetic~private+token/1== for this client'),
+    'Rejected [redacted] for this client',
+  );
+  const basic = Buffer.from('synthetic-user:synthetic-password').toString('base64');
+  assert.equal(redactSecretText(`Rejected Basic ${basic}~tail`), 'Rejected [redacted]~tail');
+});
+
 test('secret redaction keeps valid tokens when another token is missing', () => {
   const secrets = [' fixture-access-token ', undefined, null, 42] as unknown as string[];
   const text = createTextRedactor(secrets);
@@ -2607,6 +3240,359 @@ test('secret redaction keeps valid tokens when another token is missing', () => 
     JSON.stringify(redact({ detail: 'fixture-refresh-token' })),
     '{"detail":"[redacted]"}',
   );
+});
+
+test('compatible model discovery retains HTTP failures and private values through the connection route', async (t) => {
+  const { createServer } = await import('node:http');
+  const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+  const { createModelService } = await import('../src/server/models.ts');
+  const key = String.raw`synthetic-discovery-key/with+private\value`;
+  let expectedKey = key;
+  const privateField = 'synthetic-private-unselected-response';
+  const paths: string[] = [];
+  let respond: (path: string) => { status: number; body: string; type?: string };
+  const server = createServer((request, response) => {
+    assert.equal(request.headers.authorization, `Bearer ${expectedKey}`);
+    paths.push(request.url!);
+    const result = respond(request.url!);
+    response.writeHead(result.status, { 'content-type': result.type ?? 'application/json' });
+    response.end(result.body);
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(server.address() as import('node:net').AddressInfo).port}`;
+  const address = `${origin}/synthetic-private-server/v1`;
+  const echoes = [key, encodeURIComponent(key), address, encodeURIComponent(address)];
+  let transportFailure = false;
+  let transportMessage = `Synthetic transport unavailable. ${echoes.join(' ')}`;
+  const backend = createPiModelBackend({
+    fetch: async (input, init) => {
+      assert.equal(new URL(String(input)).origin, origin);
+      if (transportFailure) throw new Error(transportMessage);
+      return fetch(input, init);
+    },
+  });
+  const database = new pg.Pool();
+  const queries = t.mock.method(database, 'query', () => assert.fail('Unexpected database query.'));
+  const connects = t.mock.method(database, 'connect', () =>
+    assert.fail('Unexpected database connection.'),
+  );
+  const owner = createModelService({
+    database,
+    ownerId: 'synthetic-discovery-owner',
+    keyStore: {
+      id: 'synthetic-discovery-key-store',
+      configured: true,
+      getKey: async () => Buffer.alloc(32),
+    },
+    backend,
+    origin,
+  });
+  const app = Fastify();
+  owner.register(app);
+  t.after(async () => {
+    await app.close();
+    await owner.close();
+    await database.end();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+    assert.equal(server.listening, false);
+    assert.equal(queries.mock.callCount(), 0);
+    assert.equal(connects.mock.callCount(), 0);
+    assert.equal(database.totalCount, 0);
+  });
+  const cases = [
+    {
+      name: 'HTTP 401 object',
+      status: 401,
+      body: JSON.stringify({
+        error: {
+          message: `The credential was rejected. ${echoes.join(' ')}`,
+          type: 'authentication_error',
+          code: 'invalid_api_key',
+          param: 'authorization',
+          private: privateField,
+        },
+      }),
+      expected: [/HTTP 401/, /authentication_error/, /invalid_api_key/, /authorization/],
+    },
+    {
+      name: 'HTTP 503 string',
+      status: 503,
+      body: JSON.stringify({ error: `Synthetic catalog unavailable. ${echoes.join(' ')}` }),
+      expected: [/HTTP 503/, /Synthetic catalog unavailable/],
+    },
+    {
+      name: 'HTTP 429',
+      status: 429,
+      body: JSON.stringify({
+        error: { message: 'Synthetic rate limit.', code: 'rate_limit_exceeded' },
+      }),
+      expected: [/HTTP 429/, /rate_limit_exceeded/],
+    },
+    {
+      name: 'non-JSON HTTP failure',
+      status: 503,
+      body: `<html>${privateField} ${echoes.join(' ')}</html>`,
+      type: 'text/html',
+      expected: [/HTTP 503/, /Service Unavailable/],
+    },
+    {
+      name: 'oversized HTTP JSON',
+      status: 503,
+      body: JSON.stringify({ error: { message: 'x'.repeat(17000) + privateField } }),
+      expected: [/HTTP 503/],
+    },
+    {
+      name: 'malformed HTTP 200 JSON',
+      status: 200,
+      body: `{"private":"${privateField}"`,
+      expected: [/HTTP 200/, /invalid model list/i],
+    },
+    {
+      name: 'wrong HTTP 200 shape',
+      status: 200,
+      body: JSON.stringify({ data: { private: privateField } }),
+      expected: [/HTTP 200/, /invalid model list/i],
+    },
+  ];
+  for (const item of cases)
+    await t.test(item.name, async () => {
+      paths.length = 0;
+      respond = () => item;
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: address, key },
+      });
+      assert.equal(result.statusCode, 400);
+      const error = result.json().error;
+      for (const expected of item.expected) assert.match(error, expected);
+      for (const value of [...echoes, privateField]) assert.ok(!error.includes(value));
+      assert.doesNotMatch(error, /billing/i);
+      assert.ok(error.length <= 2000);
+      assert.deepEqual(paths, ['/synthetic-private-server/v1/models']);
+      assert.equal(owner.view().connections.length, 0);
+    });
+  await t.test(
+    'an endpoint key matching the HTTP status does not erase that trusted status',
+    async () => {
+      paths.length = 0;
+      expectedKey = '401';
+      respond = () => ({
+        status: 401,
+        body: JSON.stringify({
+          error: { message: 'Synthetic credential rejected. marked-key: 401.' },
+        }),
+      });
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: address, key: expectedKey },
+      });
+      expectedKey = key;
+      assert.equal(result.statusCode, 400);
+      assert.match(result.json().error, /HTTP 401/);
+      assert.match(result.json().error, /Synthetic credential rejected/);
+      assert.doesNotMatch(result.json().error, /marked-key: 401/);
+      assert.deepEqual(paths, ['/synthetic-private-server/v1/models']);
+    },
+  );
+  await t.test('HTTP failures redact nested JSON key text before error bounds', async () => {
+    paths.length = 0;
+    respond = (path) => ({
+      status: path.endsWith('/v1/models') ? 404 : 401,
+      body: JSON.stringify({ error: { message: 'x'.repeat(870) + JSON.stringify({ echo: key }) } }),
+    });
+    const result = await app.inject({
+      method: 'POST',
+      url: '/api/models/endpoints',
+      payload: { url: address.replace(/\/v1$/, ''), key },
+    });
+    assert.equal(result.statusCode, 400);
+    assert.match(result.json().error, /HTTP 401/);
+    assert.match(result.json().error, /HTTP 404/);
+    assert.ok(!result.json().error.includes(key.slice(0, 16)));
+    assert.ok(result.json().error.length <= 2000);
+    assert.deepEqual(paths, [
+      '/synthetic-private-server/models',
+      '/synthetic-private-server/v1/models',
+    ]);
+  });
+  for (const statuses of [
+    [401, 404],
+    [404, 503],
+  ])
+    await t.test(`two routes ${statuses.join('/')}`, async () => {
+      paths.length = 0;
+      respond = (path) => ({
+        status: path.endsWith('/v1/models') ? statuses[1]! : statuses[0]!,
+        body: JSON.stringify({ error: { message: 'Synthetic route failure.' } }),
+      });
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: address.replace(/\/v1$/, ''), key },
+      });
+      assert.equal(result.statusCode, 400);
+      for (const status of statuses)
+        assert.match(result.json().error, new RegExp(`HTTP ${status}`));
+      assert.deepEqual(paths, [
+        '/synthetic-private-server/models',
+        '/synthetic-private-server/v1/models',
+      ]);
+      assert.equal(owner.view().connections.length, 0);
+    });
+  await t.test(
+    'transport failures retain their reason without submitted private values',
+    async () => {
+      paths.length = 0;
+      transportFailure = true;
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: address, key },
+      });
+      transportFailure = false;
+      assert.equal(result.statusCode, 400);
+      assert.match(result.json().error, /Synthetic transport unavailable/);
+      for (const value of echoes) assert.ok(!result.json().error.includes(value));
+      assert.deepEqual(paths, []);
+    },
+  );
+  for (const [index, currentKey] of [key, 'q/+', 'q"\\'].entries())
+    await t.test(`transport masks every form of current endpoint key ${index + 1}`, async () => {
+      paths.length = 0;
+      const variants = [
+        currentKey,
+        JSON.stringify(currentKey).slice(1, -1),
+        encodeURIComponent(currentKey),
+      ];
+      transportMessage = `Synthetic transport unavailable. ${variants.join(' ')}`;
+      transportFailure = true;
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: address, key: currentKey },
+      });
+      transportFailure = false;
+      assert.equal(result.statusCode, 400);
+      assert.match(result.json().error, /Synthetic transport unavailable/);
+      for (const value of variants) assert.ok(!result.json().error.includes(value));
+      assert.deepEqual(paths, []);
+    });
+  await t.test(
+    'a short key overlapping the endpoint URL cannot reveal its private path',
+    async () => {
+      paths.length = 0;
+      const marker = 'synthetic-overlap-private-marker';
+      const url = `${origin}/${marker}/v1`;
+      transportMessage = `Synthetic transport unavailable. ${url} ${encodeURIComponent(url)}`;
+      transportFailure = true;
+      const result = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url, key: 'http' },
+      });
+      transportFailure = false;
+      assert.equal(result.statusCode, 400);
+      assert.match(result.json().error, /Synthetic transport unavailable/);
+      assert.ok(!result.json().error.includes(marker));
+      assert.deepEqual(paths, []);
+    },
+  );
+  await t.test('remembered text cannot split the current JSON key redaction', async () => {
+    paths.length = 0;
+    const prior = 'synthetic-prior-private-value';
+    transportMessage = 'Synthetic transport unavailable.';
+    transportFailure = true;
+    const setup = await app.inject({
+      method: 'POST',
+      url: '/api/models/endpoints',
+      payload: { url: address, key: prior },
+    });
+    const marker = 'synthetic-current-private-marker';
+    const currentKey = `${marker}"${prior}\\tail`;
+    transportMessage = `Synthetic transport unavailable. ${JSON.stringify(currentKey)}`;
+    const result = await app.inject({
+      method: 'POST',
+      url: '/api/models/endpoints',
+      payload: { url: address, key: currentKey },
+    });
+    transportFailure = false;
+    assert.equal(setup.statusCode, 400);
+    assert.equal(result.statusCode, 400);
+    assert.match(result.json().error, /Synthetic transport unavailable/);
+    assert.ok(!result.json().error.includes(marker));
+    assert.deepEqual(paths, []);
+  });
+  await t.test('HTTP-looking transport prose does not acquire a trusted status', async () => {
+    paths.length = 0;
+    transportMessage = 'Synthetic transport unavailable. HTTP 401; marked-key: 401.';
+    transportFailure = true;
+    const result = await app.inject({
+      method: 'POST',
+      url: '/api/models/endpoints',
+      payload: { url: address, key: '401' },
+    });
+    transportFailure = false;
+    assert.equal(result.statusCode, 400);
+    assert.match(result.json().error, /Synthetic transport unavailable/);
+    assert.doesNotMatch(result.json().error, /HTTP 401|marked-key: 401/);
+    assert.deepEqual(paths, []);
+  });
+  await t.test('concurrent catalogs keep each response status with its request', async () => {
+    paths.length = 0;
+    respond = (path) => ({
+      status: path.includes('/first/') ? 401 : 503,
+      body: JSON.stringify({ error: { message: 'Synthetic concurrent failure.' } }),
+    });
+    const results = await Promise.all(
+      ['first', 'second'].map((name) =>
+        app.inject({
+          method: 'POST',
+          url: '/api/models/endpoints',
+          payload: { url: `${origin}/${name}/v1`, key },
+        }),
+      ),
+    );
+    assert.match(results[0]!.json().error, /HTTP 401/);
+    assert.doesNotMatch(results[0]!.json().error, /HTTP 503/);
+    assert.match(results[1]!.json().error, /HTTP 503/);
+    assert.doesNotMatch(results[1]!.json().error, /HTTP 401/);
+    assert.deepEqual(paths.sort(), ['/first/v1/models', '/second/v1/models']);
+  });
+  for (const firstStatus of [200, 404, 503])
+    await t.test(`alternate catalog after HTTP ${firstStatus}`, async () => {
+      paths.length = 0;
+      respond = (path) =>
+        path === '/synthetic-private-server/v1/models'
+          ? {
+              status: 200,
+              body: JSON.stringify({
+                data: [{ id: 'synthetic-local-model', context_length: 32768 }],
+              }),
+            }
+          : { status: path === '/synthetic-private-server/models' ? firstStatus : 404, body: '{}' };
+      const definitions = await backend.catalog('compatible', 'api_key', {
+        type: 'endpoint',
+        url: address.replace(/\/v1$/, ''),
+        key,
+      });
+      assert.equal(definitions.length, 1);
+      assert.equal(definitions[0]!.choice.id, 'synthetic-local-model');
+      assert.equal(definitions[0]!.choice.contextWindow, 32768);
+      assert.equal(definitions[0]!.spec.baseUrl, address);
+      assert.deepEqual(paths.slice(0, 2), [
+        '/synthetic-private-server/models',
+        '/synthetic-private-server/v1/models',
+      ]);
+      assert.deepEqual(paths.slice(2).sort(), [
+        '/synthetic-private-server/api/v1/models',
+        '/synthetic-private-server/api/version',
+      ]);
+    });
 });
 
 describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
@@ -2667,6 +3653,119 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
       idToken: 'fixture-id-token',
     };
   }
+
+  test(
+    'model setup returns while checks run and shows only the current result',
+    { timeout: 10_000 },
+    async (t) => {
+      const f = await fixture(t);
+      const definitions = await f.backend.catalog('openai', 'api_key');
+      const key = 'fixture-background-model-key';
+      const state = 'fixture-background-sign-in-state-12345';
+      const owner = await f.create('fixture-background-model-owner', {
+        ...f.backend,
+        catalog: async () => definitions,
+        connectKey: async (_provider, credential) => ({ credential, models: definitions }),
+        authorize: () => ({ url: 'https://model.example/sign-in', state, secret: {} }),
+        exchange: async () => ({ type: 'api_key', key: 'fixture-background-oauth-key' }),
+      });
+      const checks: { resolve(): void; reject(error: Error): void }[] = [];
+      await owner.setSelectionCheck(() => {
+        return new Promise<void>((resolve, reject) => checks.push({ resolve, reject }));
+      });
+      const app = Fastify();
+      owner.register(app);
+      t.after(async () => {
+        for (const check of checks) check.resolve();
+        await app.close();
+      });
+      const saved = await app.inject({
+        method: 'POST',
+        url: '/api/models/keys',
+        payload: { provider: 'openai', key },
+      });
+      assert.equal(saved.statusCode, 200, saved.body);
+      assert.equal(owner.current.checking, true);
+      assert.equal(checks.length, 1);
+
+      const endpoint = await app.inject({
+        method: 'POST',
+        url: '/api/models/endpoints',
+        payload: { url: 'http://localhost:11434/v1' },
+      });
+      assert.equal(endpoint.statusCode, 200, endpoint.body);
+      const selection = owner.view().selection!;
+      const selected = await app.inject({
+        method: 'PUT',
+        url: '/api/models/selection',
+        payload: selection,
+      });
+      assert.equal(selected.statusCode, 200, selected.body);
+      assert.equal(checks.length, 2);
+      checks[0]!.reject(new Error('Synthetic old model failure.'));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(owner.current.checking, true);
+      assert.equal(owner.current.issue, undefined);
+
+      checks[1]!.reject(new Error(`HTTP 503: Synthetic service unavailable. ${key}`));
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(owner.current.checking, false);
+      assert.match(owner.current.issue!.reason, /HTTP 503: Synthetic service unavailable/);
+      assert.doesNotMatch(owner.current.issue!.reason, /fixture-background-model-key/);
+      assert.deepEqual(owner.view().selectionIssue, owner.current.issue);
+      const access = await owner.resolve();
+      const complete = await access.prepareRequest!(selection.modelId, false);
+      await complete();
+      assert.equal(owner.current.issue, undefined);
+
+      await owner.select(selection);
+      const signIn = await app.inject({
+        method: 'POST',
+        url: '/api/models/oauth',
+        payload: { provider: 'openrouter' },
+      });
+      assert.equal(signIn.statusCode, 200, signIn.body);
+      const signedIn = await app.inject({
+        method: 'POST',
+        url: '/api/models/oauth/complete',
+        payload: {
+          url: `http://127.0.0.1:4310/api/models/oauth/callback?state=${state}&code=fixture-code`,
+        },
+      });
+      assert.equal(signedIn.statusCode, 200, signedIn.body);
+      assert.equal(owner.current.checking, true);
+      checks.at(-1)!.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(owner.current.checking, false);
+      assert.equal(owner.current.issue, undefined);
+
+      const connectionId = owner
+        .view()
+        .connections.find((row) => row.provider === 'compatible')!.id;
+      await owner.select({ ...selection, connectionId });
+      const previous = await owner.resolve();
+      const completePrevious = await previous.prepareRequest!(selection.modelId, false);
+      assert.equal(
+        await owner.addEndpoint('http://localhost:11434/v1', 'fixture-replacement-endpoint-key'),
+        connectionId,
+      );
+      checks.at(-1)!.reject(new Error('Synthetic new credential failure.'));
+      await new Promise((resolve) => setImmediate(resolve));
+      const issue = owner.view().selectionIssue;
+      assert.match(issue!.reason, /Synthetic new credential failure/);
+      await completePrevious('HTTP 401; Synthetic expired key.', 401);
+      assert.equal(
+        owner.view().connections.find((row) => row.id === connectionId)!.status,
+        'connected',
+      );
+      await completePrevious();
+      assert.deepEqual(owner.current.issue, issue);
+      const current = await owner.resolve();
+      const completeCurrent = await current.prepareRequest!(selection.modelId, false);
+      await completeCurrent();
+      assert.equal(owner.current.issue, undefined);
+    },
+  );
 
   test('OpenAI connections keep their regions through selection, refresh and restart', async (t) => {
     const f = await fixture(t);
@@ -2911,6 +4010,35 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     assert.ok(Math.abs(small.input - 0.00001) < 1e-12);
     assert.ok(Math.abs(small.output - 0.00002) < 1e-12);
     assert.ok(models.every((model) => !('spec' in model)));
+    const tier = { inputTokensAbove: 100_000, input: 3, output: 6, cacheRead: 1, cacheWrite: 3 };
+    await f.database.query(
+      `UPDATE model_connections SET models=jsonb_set(
+        jsonb_set(models,'{0,spec,cost,tiers}',$3),'{1,spec,cost,tiers}',$4
+      ) WHERE id=$1 AND owner_id=$2`,
+      [
+        id,
+        ownerId,
+        JSON.stringify([tier]),
+        JSON.stringify([
+          tier,
+          {
+            ...tier,
+            inputTokensAbove: 120_000,
+            cacheWrite: -1,
+          },
+        ]),
+      ],
+    );
+    const tiered = await f.create(ownerId, backend);
+    const [paidTier, variableTier] = tiered.view().connections[0].models;
+    assert.deepEqual(paidTier.pricing, {
+      input: 1.25,
+      output: 5,
+      cacheRead: 0,
+      cacheWrite: 0,
+      tiers: [tier],
+    });
+    assert.equal(variableTier.pricing, 'variable');
     await f.database.query(
       `UPDATE model_connections SET models=jsonb_set(models,'{0,spec,cost,input}','"invalid"') WHERE id=$1 AND owner_id=$2`,
       [id, ownerId],
@@ -3114,7 +4242,7 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     await assert.rejects(owner.resolve());
   });
 
-  test('a model request failure that Pi does not retry pauses automatic requests to that model, tries again after a growing wait, and clears on success', async (t) => {
+  test('a model request failure that Pi does not retry pauses automatic requests to that model, tries again after a growing wait, clears on success, and a rejected key needs reconnecting', async (t) => {
     const f = await fixture(t);
     const { createPiMemoryCurator } = await import('../src/providers/pi/memory-curator.ts');
     const { createPiModelRuntime } = await import('../src/providers/pi/models.ts');
@@ -3196,6 +4324,8 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
       /HTTP 402; This request requires more credits\./,
     );
     assert.match(service.current.issue!.reason, /requires more credits/);
+    assert.deepEqual(service.view().selectionIssue, service.current.issue);
+    assert.equal(service.view().connections[0]!.status, 'connected');
     assert.equal(await allowed(), false);
     assert.equal(await allowed(second), true);
     assert.equal(service.paused({ kind: 'schedule', schedule: first }), true);
@@ -3247,6 +4377,8 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     await service.select(second);
     assert.equal(checks, 3);
     assert.equal(service.current.issue, undefined);
+    assert.equal(service.view().selectionIssue, undefined);
+    assert.match(service.view().connections[0]!.issue!.reason, /requires more credits/);
     reply = healthy;
     assert.equal((await ask()).stopReason, 'stop');
     assert.equal(calls, 6);
@@ -3269,6 +4401,15 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     assert.equal(calls, 9);
     assert.equal(service.view().connections[0]!.issue, undefined);
     assert.equal(service.current.issue, undefined);
+
+    reply = () => Response.json({ error: { message: 'API key expired.' } }, { status: 401 });
+    assert.equal((await ask()).stopReason, 'error');
+    assert.equal(calls, 10);
+    assert.equal(service.view().connections[0]!.status, 'reconnect');
+    assert.match(service.current.issue!.reason, /API key expired/);
+    assert.equal(service.configured, false);
+    await assert.rejects(ask(), /add it again/);
+    assert.equal(calls, 10);
   });
 
   test('model setup chooses capable defaults, preserves explicit choices and requires valid cloud accounts', async (t) => {
@@ -3345,15 +4486,48 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     await fallback.addKey('deepseek', 'fixture-fallback-key');
     assert.equal(fallback.view().selection?.modelId, 'fixture-small');
     assert.equal(fallback.view().selection?.effort, 'off');
-    const subscription = await f.create('fixture-subscription-default', {
-      ...backend,
+    const { createPiModelBackend } = await import('../src/providers/pi/models.ts');
+    let offered = ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol'];
+    const openaiBackend = {
+      ...createPiModelBackend({
+        fetch: async () =>
+          Response.json({
+            data: offered.map((id) => ({ id })),
+            models: offered.map((slug) => ({ slug, visibility: 'list' })),
+          }),
+      }),
       signIn: stubSignIn(async () => subscriptionCredential()),
-    });
-    const signIn = await subscription.start('openai');
-    await subscription.complete(
-      new URL(`http://127.0.0.1:1455/auth/callback?state=${signIn.attempt}&code=fixture`),
-    );
-    assert.equal(subscription.view().selection?.modelId, 'gpt-6-sol');
+    };
+    for (const method of ['api_key', 'subscription'] as const) {
+      const connect = async (owner: Awaited<ReturnType<typeof f.create>>) => {
+        if (method === 'api_key') await owner.addKey('openai', 'fixture-openai-default-key');
+        else {
+          const signIn = await owner.start('openai');
+          await owner.complete(
+            new URL(`http://127.0.0.1:1455/auth/callback?state=${signIn.attempt}&code=fixture`),
+          );
+        }
+      };
+      offered = ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-6.2-sol'];
+      const ownerId = `fixture-openai-default-${method}`;
+      const openai = await f.create(ownerId, openaiBackend);
+      await connect(openai);
+      assert.equal(openai.view().selection?.modelId, 'gpt-6.2-sol');
+      assert.equal(openai.view().selection?.effort, 'high');
+      const selected = { ...openai.view().selection!, modelId: 'gpt-6.1-sol' };
+      await openai.select(selected);
+      await openai.refreshCatalog(selected.connectionId);
+      assert.deepEqual(openai.view().selection, selected);
+      const restarted = await f.create(ownerId, openaiBackend);
+      assert.deepEqual(restarted.view().selection, selected);
+      offered = ['gpt-6-sol', 'gpt-6.1-sol'];
+      const legacy = await f.create(`${ownerId}-legacy`, openaiBackend);
+      await connect(legacy);
+      assert.equal(
+        legacy.view().selection?.modelId,
+        method === 'subscription' ? 'gpt-6-sol' : 'gpt-6.1-sol',
+      );
+    }
     const count = google.view().connections.length;
     for (const settings of [
       {},
@@ -4190,6 +5364,7 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     Object.assign(f.keyStore, createEnvironmentKeyStore(invalidKey));
     const calls = { signIn: 0, authorize: 0, catalog: 0 };
     let rejectSignIn = false;
+    let rejectStart = false;
     const signIn = stubSignIn(async () => {
       if (rejectSignIn) throw new Error('Synthetic sign-in failure');
       return subscriptionCredential();
@@ -4198,10 +5373,12 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
       ...f.backend,
       signIn(input) {
         calls.signIn++;
+        if (rejectStart) throw new Error('Synthetic sign-in start failure');
         return signIn(input);
       },
       authorize(input) {
         calls.authorize++;
+        if (rejectStart) throw new Error('Synthetic sign-in start failure');
         return f.backend.authorize(input);
       },
       catalog(provider, method) {
@@ -4274,6 +5451,69 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     );
     assert.deepEqual(captured.slice(failures.length + 1), [failures[0]]);
     assert.deepEqual(calls, { signIn: 2, authorize: 0, catalog: 1 });
+    rejectStart = true;
+    for (const provider of ['openai', 'openrouter'] as const)
+      await assert.rejects(owner.start(provider), /Synthetic sign-in start failure/);
+    assert.deepEqual(captured.slice(failures.length + 2), [failures[0], failures[1]]);
+    assert.deepEqual(calls, { signIn: 3, authorize: 1, catalog: 1 });
+  });
+
+  test('sign-in start failures keep the consent period that started the request', async (t) => {
+    for (const boundary of ['provider', 'storage'])
+      for (const changeConsent of [false, true]) {
+        const f = await fixture(t);
+        let entered!: () => void;
+        let reject!: (error: Error) => void;
+        const starting = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const result = new Promise<never>((_resolve, fail) => {
+          reject = fail;
+        });
+        const ownerId = `fixture-sign-in-${boundary}-${changeConsent}`;
+        const owner = await f.create(ownerId, {
+          ...f.backend,
+          signIn: async () => {
+            entered();
+            return result;
+          },
+        });
+        if (boundary === 'storage')
+          f.keyStore.getKey = async () => {
+            entered();
+            return result;
+          };
+        const captured: Parameters<ProductAnalytics['capture']>[0][] = [];
+        const analytics = await createAnalytics({
+          provider: { capture: (event) => captured.push(event), shutdown: async () => {} },
+          environment: 'development',
+          dataRoot: '.',
+          installationId: randomUUID(),
+        });
+        t.after(() => analytics.shutdown());
+        analytics.setUsageData(ownerId, true);
+        const app = Fastify();
+        owner.register(app, analytics.forOwner(ownerId));
+        t.after(() => app.close());
+        const failed = assert.rejects(owner.start('openai'));
+        await starting;
+        if (changeConsent) {
+          analytics.setUsageData(ownerId, false);
+          analytics.setUsageData(ownerId, true);
+        }
+        reject(new Error('Synthetic sign-in start failure'));
+        await failed;
+        assert.deepEqual(
+          captured.map(({ event, properties }) => [
+            event,
+            properties.provider,
+            properties.method,
+            properties.status,
+          ]),
+          changeConsent ? [] : [['model_connection_changed', 'openai', 'subscription', 'failed']],
+          `${boundary}: consent changed=${changeConsent}`,
+        );
+      }
   });
 
   test('removing a selected model records only committed clearing within its consent period', async (t) => {
@@ -4427,6 +5667,10 @@ describe('model connections', { skip: !process.env.TEST_DATABASE_URL }, () => {
     );
     const access = await owner.resolve();
     assert.equal(access.definition.spec.baseUrl, `${address}/v1`);
+    const endpointPrice = owner.priceOf(owner.view().selection);
+    assert.ok(endpointPrice);
+    assert.equal(endpointPrice.modelId, 'fixture-local');
+    assert.equal(endpointPrice.pricing, undefined);
     assert.equal(owner.hasApiKey('openai'), false);
     assert.equal(await owner.apiKey('openai'), undefined);
     assert.deepEqual(await access.read(), {
@@ -6372,7 +7616,6 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
     createAccountSession({
       accounts,
       analytics: f.analytics,
-      origin: 'http://localhost:4399',
       localUser: { id: f.owner, name: 'Synthetic Owner', email: null, avatarUrl: null },
     }).register(app);
     const session = async () => {
@@ -6404,6 +7647,36 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
     await message(f.owner, 'user', currentThread, '2026-11-03T12:00:00Z');
     assert.equal(await createAccountStore(f.database).activeDays(f.owner, 3), 3);
     assert.equal(await accounts.activeDays('owner-without-messages', 3), 0);
+
+    await accounts.update(f.owner, { onboardingCompleted: true });
+    assert.deepEqual((await session()).analytics.seenSurveys, []);
+    const survey = randomUUID();
+    const seen = (key: string) =>
+      app.inject({
+        method: 'POST',
+        url: '/api/account/survey-seen',
+        headers: { origin: 'http://localhost:4399' },
+        payload: { survey: key },
+      });
+    assert.notEqual((await seen('not-a-survey')).statusCode, 200);
+    assert.notEqual((await seen(`${survey}_${'9'.repeat(10)}`)).statusCode, 200);
+    assert.equal((await seen(survey)).statusCode, 200);
+    assert.equal((await seen(survey)).statusCode, 200);
+    assert.equal((await seen(`${survey}_2`)).statusCode, 200);
+    const restarted = Fastify();
+    t.after(() => restarted.close());
+    createAccountSession({
+      accounts: createAccountStore(f.database),
+      analytics: f.analytics,
+      localUser: { id: f.owner, name: 'Synthetic Owner', email: null, avatarUrl: null },
+    }).register(restarted);
+    const after = await restarted.inject({ method: 'GET', url: '/api/session' });
+    assert.deepEqual(after.json().analytics.seenSurveys, [survey, `${survey}_2`]);
+    await accounts.update('other-survey-owner', { onboardingCompleted: true });
+    assert.deepEqual(await accounts.seenSurveys('other-survey-owner'), []);
+    const keys = Array.from({ length: 101 }, () => randomUUID());
+    for (const key of keys) await accounts.markSurveySeen('other-survey-owner', key);
+    assert.deepEqual(await accounts.seenSurveys('other-survey-owner'), keys.slice(1));
   });
 
   test('preferences and spending expose committed bounded states across actors, owners and consent periods', async (t) => {
@@ -6763,7 +8036,6 @@ describe('persisted setting analytics privacy', { skip: !process.env.TEST_DATABA
         },
       },
       analytics: f.analytics,
-      origin,
       traces: true,
       localUser: { id: f.owner, name: 'Synthetic Owner', email: null, avatarUrl: null },
     }).register(app);
@@ -6867,3 +8139,1267 @@ function withOwnerIds<
     userMessages: words.userMessages?.map((message, index) => ({ ...message, id: ids[index] })),
   };
 }
+
+test('startup reports require review and keep exact redacted content through send and restart', async (t) => {
+  const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+  const { mkdir, writeFile } = await import('node:fs/promises');
+  const root = await mkdtemp(join(tmpdir(), 'nod-startup-feedback-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(join(root, 'logs'));
+  const secret = 'synthetic-startup-private-key';
+  const privateName = 'Synthetic Person';
+  await writeFile(
+    join(root, 'logs', 'startup.log'),
+    `2026-11-19T00:00:00.000Z Startup failed ${secret} ${privateName} private@example.test /Users/private-person/record.txt https://private.example.test/account\n`,
+  );
+  const context = {
+    appVersion: '0.9.0',
+    appRelease: 'a'.repeat(40),
+    appModified: false,
+    platform: 'win32-x64',
+    development: false,
+    source: 'desktop' as const,
+  };
+  const submitted: import('../src/ports/feedback.ts').FeedbackEnvelope[] = [];
+  const statusCalls: string[][] = [];
+  let dispatchReady!: () => void;
+  const dispatched = new Promise<void>((resolve) => {
+    dispatchReady = resolve;
+  });
+  let release!: (value: import('../src/shared/feedback.ts').FeedbackReceipt) => void;
+  let nextStatus: import('../src/shared/feedback.ts').FeedbackReceipt['status'] = 'unknown';
+  const options = {
+    dataRoot: root,
+    context,
+    secrets: [secret],
+    names: [privateName],
+    startupLog: {
+      entries: [
+        {
+          ageMs: 1000,
+          line: `Startup failed ${secret} ${privateName} private@example.test /Users/private-person/record.txt https://private.example.test/account`,
+        },
+      ],
+      truncated: false,
+    },
+    status: {
+      phase: 'error',
+      error: `Synthetic failure for ${privateName} ${secret}`,
+      details: 'HTTP 503',
+      failure: { class: 'Error', httpStatus: 503 },
+    },
+    delivery: {
+      configured: true,
+      recipient: 'n8n',
+      async submit(envelope: import('../src/ports/feedback.ts').FeedbackEnvelope) {
+        submitted.push(envelope);
+        dispatchReady();
+        return new Promise<import('../src/shared/feedback.ts').FeedbackReceipt>((resolve) => {
+          release = resolve;
+        });
+      },
+      async status(id: string, payloadHash: string) {
+        statusCalls.push([id, payloadHash]);
+        return { submissionId: id, status: nextStatus };
+      },
+    },
+  };
+  const service = createStartupFeedback(options);
+  assert.equal((await service.context()).recipient, 'n8n');
+  assert.equal(submitted.length, 0);
+  await assert.rejects(service.send(randomUUID()), /Review the report again/);
+  const first = await service.review({
+    feedback: '  Synthetic startup does not finish.\n\n',
+    includeReport: true,
+  });
+  assert.equal(submitted.length, 0);
+  const content = first.content!;
+  for (const value of [
+    secret,
+    privateName,
+    'private@example.test',
+    '/Users/private-person',
+    'private.example.test',
+  ])
+    assert.ok(!content.includes(value), value);
+  assert.match(content, /503/);
+  assert.ok(!content.includes('2026-11-19T'));
+  assert.equal(typeof JSON.parse(content).startupLog.entries[0].ageMs, 'number');
+  options.startupLog.entries = [
+    { ageMs: 500, line: `${'Synthetic detail '.repeat(234)}${secret} end` },
+  ];
+  const boundary = await service.review({
+    feedback: 'Synthetic boundary check.',
+    includeReport: true,
+  });
+  assert.ok(
+    !boundary.content!.includes(secret.slice(0, 12)),
+    'Startup prose must be omitted before text bounds.',
+  );
+  const changedSecret = 'synthetic-rotated-startup-key';
+  options.secrets.push(changedSecret);
+  options.startupLog.entries.push({ ageMs: 0, line: `Synthetic rotated key ${changedSecret}` });
+  const current = await service.review({ feedback: first.feedback, includeReport: true });
+  assert.ok(!current.content!.includes(changedSecret));
+  assert.equal(JSON.parse(content).schema, 'nod-desktop-startup-report-v2');
+  options.startupLog.entries = [{ ageMs: 0, line: 'Synthetic later event not reviewed' }];
+  const sending = service.send(current.reviewId);
+  await Promise.race([dispatched, sending]);
+  assert.equal(submitted.length, 1);
+  assert.equal(Buffer.from(submitted[0].report!.data, 'base64').toString(), current.content);
+  assert.equal(first.feedback, '  Synthetic startup does not finish.\n\n');
+  assert.equal(submitted[0].feedback, first.feedback);
+  const duplicate = service.send(current.reviewId);
+  await assert.rejects(
+    service.review({ feedback: 'Changed', includeReport: false }),
+    /Check the previous report/,
+  );
+  release({ submissionId: current.reviewId, status: 'unknown' });
+  assert.equal((await sending).status, 'unknown');
+  assert.equal((await duplicate).status, 'unknown');
+  assert.equal(submitted.length, 1);
+  const saved = await readFile(join(root, 'startup-feedback.json'), 'utf8');
+  assert.deepEqual(Object.keys(JSON.parse(saved)).sort(), ['payloadHash', 'submissionId']);
+  assert.ok(!saved.includes('Synthetic'));
+  const restarted = createStartupFeedback(options);
+  assert.equal((await restarted.context()).pending?.status, 'unknown');
+  assert.equal((await restarted.send(current.reviewId)).status, 'unknown');
+  assert.equal(submitted.length, 1);
+  assert.equal(statusCalls.at(-1)?.[0], current.reviewId);
+  assert.equal(statusCalls.at(-1)?.[1], submitted[0].payloadHash);
+  await assert.rejects(
+    restarted.review({ feedback: 'Changed', includeReport: false }),
+    /Check the previous report/,
+  );
+  nextStatus = 'submitted';
+  assert.equal((await restarted.status())?.status, 'submitted');
+  const second = await restarted.review({
+    feedback: 'A different startup report.',
+    includeReport: false,
+  });
+  assert.equal(second.content, null);
+  await assert.rejects(restarted.send(current.reviewId + 'x'));
+  const third = await restarted.review({
+    feedback: 'Latest exact description.',
+    includeReport: false,
+  });
+  await assert.rejects(restarted.send(second.reviewId), /Review the report again/);
+  assert.notEqual(third.reviewId, second.reviewId);
+});
+
+test('startup status keeps its original submission while a newer send runs or finishes', async (t) => {
+  const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+  for (const finishNewSend of [false, true]) {
+    await t.test(finishNewSend ? 'new send finished' : 'new send in flight', async (t) => {
+      const root = await mkdtemp(join(tmpdir(), 'nod-startup-status-race-'));
+      t.after(() => rm(root, { recursive: true, force: true }));
+      let releaseStatus!: (value: import('../src/shared/feedback.ts').FeedbackReceipt) => void;
+      let statusStarted!: () => void;
+      const checking = new Promise<void>((resolve) => {
+        statusStarted = resolve;
+      });
+      let releaseSend!: (value: import('../src/shared/feedback.ts').FeedbackReceipt) => void;
+      let sendStarted!: () => void;
+      const sending = new Promise<void>((resolve) => {
+        sendStarted = resolve;
+      });
+      let submits = 0;
+      const service = createStartupFeedback({
+        dataRoot: root,
+        context: {
+          appVersion: null,
+          appRelease: null,
+          appModified: null,
+          platform: null,
+          development: false,
+          source: 'desktop',
+        },
+        status: { phase: 'error' },
+        delivery: {
+          configured: true,
+          recipient: 'n8n',
+          async submit(envelope) {
+            if (++submits === 1)
+              return { submissionId: envelope.submissionId, status: 'submitted' };
+            sendStarted();
+            return new Promise((resolve) => {
+              releaseSend = resolve;
+            });
+          },
+          async status() {
+            statusStarted();
+            return new Promise((resolve) => {
+              releaseStatus = resolve;
+            });
+          },
+        },
+      });
+      const first = await service.review({
+        feedback: 'Synthetic first report.',
+        includeReport: false,
+      });
+      await service.send(first.reviewId);
+      const oldStatus = service.status();
+      await checking;
+      const next = await service.review({
+        feedback: 'Synthetic next report.',
+        includeReport: true,
+      });
+      const newSend = service.send(next.reviewId);
+      await sending;
+      if (finishNewSend) {
+        releaseSend({ submissionId: next.reviewId, status: 'partial' });
+        await newSend;
+      }
+      releaseStatus({ submissionId: first.reviewId, status: 'rejected' });
+      assert.deepEqual(await oldStatus, { submissionId: first.reviewId, status: 'rejected' });
+      if (!finishNewSend) {
+        releaseSend({ submissionId: next.reviewId, status: 'partial' });
+        await newSend;
+      }
+      assert.deepEqual((await service.context()).pending, {
+        submissionId: next.reviewId,
+        status: 'partial',
+        canRetryAttachments: true,
+      });
+      assert.equal(submits, 2);
+    });
+  }
+});
+
+test('startup reports omit unavailable event snapshots and refuse invalid input or failed durable saves', async (t) => {
+  const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+  const { mkdir, writeFile, unlink } = await import('node:fs/promises');
+  const root = await mkdtemp(join(tmpdir(), 'nod-startup-feedback-unsafe-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dataRoot = join(root, 'profile');
+  await mkdir(join(dataRoot, 'logs'), { recursive: true });
+  const target = join(root, 'private.log');
+  await writeFile(target, 'Synthetic private target\n');
+  await writeFile(join(dataRoot, 'logs', 'startup.log'), 'Synthetic disk history is excluded\n');
+  let sends = 0;
+  const options = {
+    dataRoot,
+    context: {
+      appVersion: 'private version',
+      appRelease: 'private release',
+      appModified: null,
+      platform: 'private device',
+      development: true,
+      source: 'desktop' as const,
+    },
+    secrets: [],
+    names: [],
+    status: { phase: 'error' },
+    delivery: {
+      configured: true,
+      recipient: 'n8n',
+      async submit(envelope: import('../src/ports/feedback.ts').FeedbackEnvelope) {
+        sends++;
+        return { submissionId: envelope.submissionId, status: 'submitted' as const };
+      },
+      async status(id: string) {
+        return { submissionId: id, status: 'unknown' as const };
+      },
+    },
+  };
+  const service = createStartupFeedback(options);
+  const reviewed = await service.review({ feedback: 'Synthetic failure.', includeReport: true });
+  const report = JSON.parse(reviewed.content!);
+  assert.equal(report.startupLog.status, 'unavailable');
+  assert.deepEqual(report.startupLog.entries, []);
+  assert.ok(!reviewed.content!.includes('private'));
+  assert.equal(report.context.appVersion, null);
+  assert.equal(report.context.platform, null);
+  await assert.rejects(service.review({ feedback: 'x', includeReport: true, extra: true }));
+  await assert.rejects(service.review({ feedback: '', includeReport: true }));
+  await assert.rejects(service.review({ feedback: ' \n\t', includeReport: true }));
+  const disabled = createStartupFeedback({
+    ...options,
+    delivery: { ...options.delivery, configured: false },
+  });
+  await assert.rejects(
+    disabled.review({ feedback: 'Synthetic failure.', includeReport: false }),
+    /turned off/,
+  );
+  await rm(dataRoot, { recursive: true });
+  await writeFile(dataRoot, 'Synthetic blocking file');
+  await assert.rejects(service.send(reviewed.reviewId));
+  assert.equal(sends, 0);
+  assert.equal((await service.context()).notSentSubmissionId, reviewed.reviewId);
+  await unlink(dataRoot);
+  await mkdir(dataRoot);
+  await assert.rejects(service.send(reviewed.reviewId), /Review the report again/);
+  const recoveredReview = await service.review({
+    feedback: 'Synthetic recovery review.',
+    includeReport: true,
+  });
+  assert.notEqual(recoveredReview.reviewId, reviewed.reviewId);
+  assert.equal((await service.context()).notSentSubmissionId, undefined);
+  assert.equal((await service.send(recoveredReview.reviewId)).status, 'submitted');
+  assert.equal(sends, 1, 'A known failure before dispatch must allow a fresh review and send.');
+  await writeFile(join(dataRoot, 'startup-feedback.json'), '{"submissionId":"bad"}');
+  const corrupt = createStartupFeedback(options);
+  assert.equal((await corrupt.context()).recovery?.canPreserve, true);
+  await assert.rejects(
+    corrupt.review({ feedback: 'Synthetic blocked report.', includeReport: false }),
+    /saved report status/,
+  );
+  assert.equal(sends, 1);
+});
+
+test('the startup feedback factory ignores unrelated engine configuration and dotenv keys', async (t) => {
+  const { writeFile } = await import('node:fs/promises');
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const root = await mkdtemp(join(tmpdir(), 'nod-startup-factory-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(
+    join(root, '.env'),
+    'PORT=invalid-synthetic-port\nOPENAI_API_KEY=synthetic-model-key-canary\nDATABASE_POOL_MAX=invalid-synthetic-pool\n',
+  );
+  const source = new URL('../src/server/feedback-delivery.ts', import.meta.url).href;
+  const script = join(root, 'check.mjs');
+  await writeFile(
+    script,
+    `const { createFeedbackDelivery } = await import(${JSON.stringify(source)}); const delivery = createFeedbackDelivery({NOD_FEEDBACK_ENABLED:'false'}); process.stdout.write(JSON.stringify({modelKeyLoaded:Object.hasOwn(process.env,'OPENAI_API_KEY'),dotenvPortLoaded:Object.hasOwn(process.env,'PORT'),configured:delivery.configured}));`,
+  );
+  const result = await promisify(execFile)(process.execPath, [script], {
+    cwd: root,
+    env: Object.fromEntries(
+      ['PATH', 'SystemRoot', 'SYSTEMROOT'].flatMap((key) =>
+        process.env[key] ? [[key, process.env[key]]] : [],
+      ),
+    ),
+  });
+  assert.deepEqual(JSON.parse(result.stdout), {
+    modelKeyLoaded: false,
+    dotenvPortLoaded: false,
+    configured: false,
+  });
+});
+
+test(
+  'startup report save failures restore disk state before a recovered restart',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+    const { open } = await import('node:fs/promises');
+    for (const previous of [false, true]) {
+      await t.test(previous ? 'prior resolved receipt' : 'no previous report', async (t) => {
+        const root = await mkdtemp(join(tmpdir(), 'nod-startup-save-restart-'));
+        t.after(() => rm(root, { recursive: true, force: true }));
+        let sends = 0;
+        const options = {
+          dataRoot: root,
+          secrets: [],
+          names: [],
+          status: { phase: 'error' },
+          context: {
+            appVersion: '0.9.0',
+            appRelease: 'a'.repeat(40),
+            appModified: false,
+            platform: 'darwin-arm64',
+            development: false,
+            source: 'desktop' as const,
+          },
+          delivery: {
+            configured: true,
+            recipient: 'n8n',
+            async submit(envelope: import('../src/ports/feedback.ts').FeedbackEnvelope) {
+              sends++;
+              return { submissionId: envelope.submissionId, status: 'submitted' as const };
+            },
+            async status(id: string) {
+              return { submissionId: id, status: 'submitted' as const };
+            },
+          },
+        };
+        const service = createStartupFeedback(options);
+        let oldId: string | undefined;
+        if (previous) {
+          const old = await service.review({
+            feedback: 'Synthetic earlier report.',
+            includeReport: false,
+          });
+          oldId = old.reviewId;
+          await service.send(oldId);
+        }
+        const candidate = await service.review({
+          feedback: 'Synthetic new report.',
+          includeReport: false,
+        });
+        const directory = await open(root, 'r');
+        const prototype = Object.getPrototypeOf(directory);
+        const sync = prototype.sync;
+        await directory.close();
+        try {
+          prototype.sync = async function (this: Awaited<ReturnType<typeof open>>) {
+            if ((await this.stat()).isDirectory())
+              throw Object.assign(new Error('Synthetic directory sync failure.'), { code: 'EIO' });
+            return sync.call(this);
+          };
+          await assert.rejects(service.send(candidate.reviewId));
+        } finally {
+          prototype.sync = sync;
+        }
+        assert.equal(sends, previous ? 1 : 0);
+        const disk = await readFile(join(root, 'startup-feedback.json'), 'utf8').catch((error) => {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        });
+        assert.equal(disk ? JSON.parse(disk).submissionId : undefined, oldId);
+        const restarted = createStartupFeedback(options);
+        assert.equal((await restarted.context()).pending?.submissionId, oldId);
+        const recovered = await restarted.review({
+          feedback: 'Synthetic report after disk recovery.',
+          includeReport: false,
+        });
+        assert.equal((await restarted.send(recovered.reviewId)).status, 'submitted');
+        assert.equal(sends, previous ? 2 : 1);
+      });
+    }
+  },
+);
+
+test('startup reports never open log paths and use only current desktop events', async (t) => {
+  const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+  const filesystem = (await import('node:fs/promises')).default;
+  const directFilesystem = (await import('node:fs')).default;
+  const { syncBuiltinESMExports } = await import('node:module');
+  const { mkdir, writeFile } = filesystem;
+  const root = await mkdtemp(join(tmpdir(), 'nod-startup-no-log-read-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dataRoot = join(root, 'profile');
+  const outside = join(root, 'outside');
+  await mkdir(dataRoot);
+  await mkdir(outside);
+  await writeFile(join(outside, 'startup.log'), 'Synthetic unrelated private file\n');
+  if (process.platform === 'win32') {
+    await mkdir(join(dataRoot, 'logs'));
+    await writeFile(join(dataRoot, 'logs', 'startup.log'), 'Synthetic unrelated private file\n');
+  } else await symlink(outside, join(dataRoot, 'logs'));
+  const accessed: string[] = [];
+  const restorations: Array<() => void> = [];
+  function trackReads(surface: object, names: string[]) {
+    for (const name of names) {
+      const original = Reflect.get(surface, name);
+      Reflect.set(surface, name, (...args: unknown[]) => {
+        accessed.push(String(args[0]));
+        return Reflect.apply(original, surface, args);
+      });
+      restorations.push(() => {
+        Reflect.set(surface, name, original);
+      });
+    }
+  }
+  const options = {
+    dataRoot,
+    secrets: [],
+    names: [],
+    status: { phase: 'error' },
+    context: {
+      appVersion: '0.9.0',
+      appRelease: 'a'.repeat(40),
+      appModified: false,
+      platform: 'darwin-arm64',
+      development: false,
+      source: 'desktop' as const,
+    },
+    startupLog: {
+      entries: [{ ageMs: 5, line: 'Synthetic event from this desktop process' }],
+      truncated: true,
+    },
+    delivery: {
+      configured: true,
+      recipient: 'n8n',
+      async submit(envelope: import('../src/ports/feedback.ts').FeedbackEnvelope) {
+        return { submissionId: envelope.submissionId, status: 'submitted' as const };
+      },
+      async status(id: string) {
+        return { submissionId: id, status: 'unknown' as const };
+      },
+    },
+  };
+  try {
+    const methods = [
+      'open',
+      'readFile',
+      'readdir',
+      'opendir',
+      'readlink',
+      'realpath',
+      'stat',
+      'lstat',
+      'access',
+    ];
+    trackReads(filesystem, methods);
+    trackReads(directFilesystem, [
+      ...methods,
+      ...methods.map((name) => `${name}Sync`),
+      'createReadStream',
+    ]);
+    syncBuiltinESMExports();
+    const service = createStartupFeedback(options);
+    const snapshot = await service.review({ feedback: 'Synthetic failure.', includeReport: true });
+    const report = JSON.parse(snapshot.content!);
+    assert.equal(report.startupLog.status, 'collected');
+    assert.equal(report.startupLog.scope, 'current-desktop-process');
+    assert.equal(report.startupLog.truncated, true);
+    assert.deepEqual(report.startupLog.entries, [
+      { ageMs: 5, event: 'diagnostic_text_omitted', textOmitted: true },
+    ]);
+    assert.ok(!snapshot.content!.includes('Synthetic unrelated private file'));
+    const malformed = createStartupFeedback({
+      ...options,
+      startupLog: { entries: [{ ageMs: -1, line: 'Synthetic invalid event' }], truncated: false },
+    });
+    const empty = JSON.parse(
+      (await malformed.review({ feedback: 'Synthetic failure.', includeReport: true })).content!,
+    );
+    assert.equal(empty.startupLog.status, 'unavailable');
+    assert.deepEqual(empty.startupLog.entries, []);
+    assert.ok(
+      !accessed.some((path) =>
+        [join(dataRoot, 'logs'), outside].some(
+          (root) => path === root || path.startsWith(root + '/') || path.startsWith(root + '\\'),
+        ),
+      ),
+      'Preparing a startup report must not access a log path or its outside target.',
+    );
+  } finally {
+    for (const restore of restorations.reverse()) restore();
+    syncBuiltinESMExports();
+  }
+});
+
+test('environment secret collection covers every model key and token segment before redaction', async () => {
+  const { modelProviderInfo } = await import('../src/shared/models.ts');
+  const modelEnvironment = Object.fromEntries(
+    Object.values(modelProviderInfo).map(({ env }, index) => [env, `synthetic-model-key-${index}`]),
+  );
+  const legacyEnvironment = Object.fromEntries(
+    [
+      'API_KEY',
+      'SECRET',
+      'PASSWORD',
+      'VAULT_KEY',
+      'BOT_TOKEN',
+      'ACCESS_TOKEN',
+      'AUTH_TOKEN',
+      'FEEDBACK_TOKEN',
+      'TRACES_TOKEN',
+      'UPDATES_TOKEN',
+      'AWS_SECRET_ACCESS_KEY',
+      'PRIVATE_KEY',
+      'ENCRYPTION_KEY',
+      'PASSPHRASE',
+      'ACCESS_KEY_ID',
+    ].map((key, index) => [`SYNTHETIC_${key}`, `synthetic-legacy-key-${index}`]),
+  );
+  const environment = {
+    ...modelEnvironment,
+    ...legacyEnvironment,
+    NOD_FEEDBACK_TOKEN: 'synthetic-feedback-key',
+    NOD_TRACES_TOKEN: 'synthetic-traces-key',
+    SYNTHETIC_TOKEN_SUFFIX: 'synthetic-token-with-suffix',
+    SYNTHETIC_SECRET: 'synthetic-secret-value',
+    SYNTHETIC_PASSWORD: 'synthetic-password-value',
+    NOD_VAULT_KEY: 'synthetic-vault-key',
+    DATABASE_URL: 'postgresql://synthetic:synthetic%2Bdatabase%2Fpassword@127.0.0.1/nod_synthetic',
+    PORT: '1234',
+  };
+  const secrets = environmentSecrets(environment);
+  for (const [key, value] of Object.entries(environment))
+    assert.equal(secrets.includes(value), key !== 'PORT', key);
+  assert.ok(secrets.includes('synthetic+database/password'));
+  const malformed = 'synthetic%2Gprivate-password';
+  assert.ok(
+    environmentSecrets({
+      DATABASE_URL: `postgresql://synthetic:${malformed}@127.0.0.1/nod_synthetic`,
+    }).includes(malformed),
+  );
+  assert.deepEqual(
+    environmentSecrets({
+      EMPTY_TOKEN: '',
+      MISSING_TOKEN: undefined,
+      DATABASE_URL: 'synthetic-invalid-url',
+    }),
+    ['synthetic-invalid-url'],
+  );
+});
+
+test('startup status recovery preserves corrupt bytes before a fresh reviewed submission', async (t) => {
+  const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+  const { writeFile, readFile, readdir, stat } = await import('node:fs/promises');
+  const { randomUUID } = await import('node:crypto');
+  const root = await mkdtemp(join(tmpdir(), 'nod-status-recovery-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 'startup-feedback.json');
+  const untrustedId = randomUUID();
+  const bytes = Buffer.from(
+    `{"submissionId":"${untrustedId}","private":"synthetic-private-state"\n`,
+  );
+  await writeFile(path, bytes);
+  const sent: import('../src/ports/feedback.ts').FeedbackEnvelope[] = [];
+  let lookups = 0;
+  const options = {
+    dataRoot: root,
+    secrets: [],
+    names: [],
+    status: { phase: 'error' },
+    context: {
+      appVersion: '0.9.0',
+      appRelease: 'a'.repeat(40),
+      appModified: false,
+      development: false,
+      source: 'desktop' as const,
+      platform: 'darwin-arm64',
+    },
+    delivery: {
+      configured: true,
+      recipient: 'n8n',
+      async submit(value: import('../src/ports/feedback.ts').FeedbackEnvelope) {
+        sent.push(value);
+        return { submissionId: value.submissionId, status: 'submitted' as const };
+      },
+      async status(id: string) {
+        lookups++;
+        return { submissionId: id, status: 'unknown' as const };
+      },
+    },
+  };
+  const service = createStartupFeedback(options);
+  const blocked = await service.context();
+  assert.equal(blocked.recovery?.canPreserve, true);
+  assert.match(blocked.recovery!.message, /invalid JSON/);
+  assert.ok(!JSON.stringify(blocked).includes('synthetic-private-state'));
+  await assert.rejects(
+    service.review({ feedback: 'Synthetic failure.', includeReport: true }),
+    /invalid JSON/,
+  );
+  await assert.rejects(service.send(untrustedId), /invalid JSON/);
+  assert.equal(lookups, 0);
+  assert.throws(() => service.recover({ confirm: false }));
+  assert.deepEqual(await readFile(path), bytes);
+  await service.recover({ confirm: true });
+  const names = await readdir(root);
+  const backups = names.filter((name) => /^startup-feedback-recovered-.*\.bin$/.test(name));
+  assert.equal(backups.length, 1);
+  assert.deepEqual(await readFile(join(root, backups[0])), bytes);
+  if (process.platform !== 'win32')
+    assert.equal((await stat(join(root, backups[0]))).mode & 0o777, 0o600);
+  await assert.rejects(readFile(path), { code: 'ENOENT' });
+  assert.equal((await service.context()).pending, null);
+  assert.equal(sent.length, 0);
+  const fresh = await service.review({ feedback: 'Synthetic fresh report.', includeReport: true });
+  assert.notEqual(fresh.reviewId, untrustedId);
+  assert.ok(!fresh.content!.includes('synthetic-private-state'));
+  assert.equal(sent.length, 0);
+  await service.send(fresh.reviewId);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].submissionId, fresh.reviewId);
+  await assert.rejects(service.recover({ confirm: true }), /Check the saved report status/);
+  const restored = createStartupFeedback(options);
+  assert.equal((await restored.context()).pending?.submissionId, fresh.reviewId);
+  assert.equal(sent.length, 1);
+});
+
+test('startup recovery refuses a failed durable backup and retries a recovered status read', async (t) => {
+  const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+  const filesystem = (await import('node:fs/promises')).default;
+  const { syncBuiltinESMExports } = await import('node:module');
+  const { randomUUID } = await import('node:crypto');
+  const root = await mkdtemp(join(tmpdir(), 'nod-status-preserve-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, 'startup-feedback.json');
+  const bytes = Buffer.from('Synthetic corrupt state\u0000private');
+  await filesystem.writeFile(path, bytes);
+  let submits = 0;
+  let lookups = 0;
+  const options = {
+    dataRoot: root,
+    secrets: [],
+    names: [],
+    status: { phase: 'error' },
+    context: {
+      appVersion: '0.9.0',
+      appRelease: 'a'.repeat(40),
+      appModified: false,
+      development: false,
+      source: 'desktop' as const,
+      platform: 'darwin-arm64',
+    },
+    delivery: {
+      configured: true,
+      recipient: 'n8n',
+      async submit(value: import('../src/ports/feedback.ts').FeedbackEnvelope) {
+        submits++;
+        return { submissionId: value.submissionId, status: 'submitted' as const };
+      },
+      async status(id: string) {
+        lookups++;
+        return { submissionId: id, status: 'unknown' as const };
+      },
+    },
+  };
+  const service = createStartupFeedback(options);
+  assert.equal((await service.context()).recovery?.canPreserve, true);
+  const probe = await filesystem.open(path, 'r');
+  const prototype = Object.getPrototypeOf(probe);
+  const originalSync = prototype.sync;
+  await probe.close();
+  try {
+    prototype.sync = async function (this: import('node:fs/promises').FileHandle) {
+      const info = await this.stat();
+      if (info.isFile())
+        throw Object.assign(new Error('EIO: Synthetic backup sync failure.'), { code: 'EIO' });
+      return originalSync.call(this);
+    };
+    await assert.rejects(service.recover({ confirm: true }), /EIO/);
+    assert.deepEqual(await filesystem.readFile(path), bytes);
+    assert.equal((await service.context()).recovery?.canPreserve, true);
+    await assert.rejects(
+      service.review({ feedback: 'Synthetic blocked report.', includeReport: false }),
+    );
+    assert.equal(submits, 0);
+  } finally {
+    prototype.sync = originalSync;
+  }
+  if (process.platform !== 'win32') {
+    try {
+      prototype.sync = async function (this: import('node:fs/promises').FileHandle) {
+        if ((await this.stat()).isDirectory())
+          throw Object.assign(new Error('EIO: Synthetic backup directory sync failure.'), {
+            code: 'EIO',
+          });
+        return originalSync.call(this);
+      };
+      await assert.rejects(service.recover({ confirm: true }), /EIO/);
+      assert.deepEqual(await filesystem.readFile(path), bytes);
+      assert.equal((await service.context()).recovery?.canPreserve, true);
+    } finally {
+      prototype.sync = originalSync;
+    }
+  }
+  await service.recover({ confirm: true });
+  assert.equal((await service.context()).pending, null);
+  const id = randomUUID();
+  await filesystem.writeFile(
+    path,
+    JSON.stringify({ submissionId: id, payloadHash: 'b'.repeat(64) }),
+  );
+  const originalOpen = filesystem.open;
+  let fail = true;
+  const retrying = createStartupFeedback(options);
+  try {
+    filesystem.open = (async (...args: Parameters<typeof originalOpen>) => {
+      if (fail && String(args[0]) === path)
+        throw Object.assign(new Error('EACCES: Synthetic transient read failure.'), {
+          code: 'EACCES',
+        });
+      return originalOpen(...args);
+    }) as typeof originalOpen;
+    syncBuiltinESMExports();
+    const unavailable = await retrying.context();
+    assert.equal(unavailable.recovery?.canPreserve, false);
+    assert.match(unavailable.recovery!.message, /EACCES/);
+    fail = false;
+    assert.equal((await retrying.context()).pending?.submissionId, id);
+    await assert.rejects(retrying.recover({ confirm: true }), /Check the saved report status/);
+    await assert.rejects(
+      retrying.review({ feedback: 'Synthetic duplicate refusal.', includeReport: false }),
+      /previous report status/,
+    );
+    assert.equal(lookups, 1);
+    assert.equal(submits, 0);
+  } finally {
+    filesystem.open = originalOpen;
+    syncBuiltinESMExports();
+  }
+});
+
+test(
+  'startup keeps the saved submission fence when durable save and rollback both fail',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+    const filesystem = (await import('node:fs/promises')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const root = await mkdtemp(join(tmpdir(), 'nod-report-rollback-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const path = join(root, 'startup-feedback.json');
+    let submits = 0;
+    const options = {
+      dataRoot: root,
+      secrets: [],
+      names: [],
+      status: { phase: 'error' },
+      context: {
+        appVersion: '0.9.0',
+        appRelease: 'a'.repeat(40),
+        appModified: false,
+        development: false,
+        source: 'desktop' as const,
+        platform: 'darwin-arm64',
+      },
+      delivery: {
+        configured: true,
+        recipient: 'n8n',
+        async submit(value: import('../src/ports/feedback.ts').FeedbackEnvelope) {
+          submits++;
+          return { submissionId: value.submissionId, status: 'submitted' as const };
+        },
+        async status(id: string) {
+          return { submissionId: id, status: 'unknown' as const };
+        },
+      },
+    };
+    const service = createStartupFeedback(options);
+    const review = await service.review({
+      feedback: 'Synthetic durable report.',
+      includeReport: false,
+    });
+    const directory = await filesystem.open(root, 'r');
+    const prototype = Object.getPrototypeOf(directory);
+    const originalSync = prototype.sync;
+    const originalRm = filesystem.rm;
+    await directory.close();
+    try {
+      prototype.sync = async function (this: import('node:fs/promises').FileHandle) {
+        if ((await this.stat()).isDirectory())
+          throw Object.assign(new Error('EIO: Synthetic directory save failure.'), { code: 'EIO' });
+        return originalSync.call(this);
+      };
+      filesystem.rm = (async (...args: Parameters<typeof originalRm>) => {
+        if (String(args[0]) === path)
+          throw Object.assign(new Error('EPERM: Synthetic rollback refusal.'), { code: 'EPERM' });
+        return originalRm(...args);
+      }) as typeof originalRm;
+      syncBuiltinESMExports();
+      await assert.rejects(
+        service.send(review.reviewId),
+        /previous saved report status could not be restored/,
+      );
+      assert.equal(
+        JSON.parse(await filesystem.readFile(path, 'utf8')).submissionId,
+        review.reviewId,
+      );
+      assert.equal((await service.context()).pending?.submissionId, review.reviewId);
+      assert.equal((await service.send(review.reviewId)).status, 'unknown');
+      await assert.rejects(
+        service.review({ feedback: 'Synthetic replacement.', includeReport: false }),
+        /previous report status/,
+      );
+      assert.equal(submits, 0);
+      assert.equal(
+        (await createStartupFeedback(options).context()).pending?.submissionId,
+        review.reviewId,
+      );
+    } finally {
+      prototype.sync = originalSync;
+      filesystem.rm = originalRm;
+      syncBuiltinESMExports();
+    }
+  },
+);
+
+test('startup exports and receipts hide original overlapping private spans before text changes', async (t) => {
+  const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+  const root = await mkdtemp(join(tmpdir(), 'nod-report-overlap-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const cases = [
+    {
+      name: 'contained',
+      secrets: ['k7X', 'k7Xsynthetic-private-contained'],
+      input: 'k7Xsynthetic-private-contained',
+    },
+    {
+      name: 'crossing',
+      secrets: ['prefixABC', 'ABCsynthetic-private-cross-tail'],
+      input: 'prefixABCsynthetic-private-cross-tail',
+    },
+    {
+      name: 'chain',
+      secrets: ['prefixABC', 'ABCsynthetic-private-middle', 'middleXYZtail'],
+      input: 'prefixABCsynthetic-private-middleXYZtail',
+    },
+    {
+      name: 'adjacent',
+      secrets: ['synthetic-private-first', 'synthetic-private-second'],
+      input: 'synthetic-private-firstsynthetic-private-second',
+    },
+    {
+      name: 'literal',
+      secrets: [String.raw`synthetic+(private)[value]\key`],
+      input: String.raw`synthetic+(private)[value]\key`,
+    },
+    {
+      name: 'repeated masks',
+      secrets: ['red', 'synthetic-private-repeat'],
+      input: '[redacted] synthetic-private-repeat [redacted]',
+    },
+    {
+      name: 'POSIX root',
+      secrets: ['/Applications/Synthetic Owner/engine', 'engine/synthetic-private-path-tail'],
+      input: '/Applications/Synthetic Owner/engine/synthetic-private-path-tail',
+    },
+    {
+      name: 'Windows root',
+      secrets: [
+        String.raw`C:\Synthetic Owner\engine`,
+        String.raw`engine\synthetic-private-path-tail`,
+      ],
+      input: String.raw`C:\Synthetic Owner\engine\synthetic-private-path-tail`,
+    },
+    {
+      name: 'short credential in root',
+      secrets: ['/', '/Applications/Synthetic Owner/engine'],
+      input: '/Applications/Synthetic Owner/engine/startup',
+    },
+  ];
+  for (const [index, item] of cases.entries())
+    await t.test(item.name, async () => {
+      let exported = '';
+      const service = createStartupFeedback({
+        dataRoot: join(root, String(index)),
+        status: {
+          phase: 'error',
+          error: `Synthetic failure EIO ${item.input}`,
+          failure: Object.assign(new Error(item.input), { code: 'EIO' }),
+        },
+        context: {
+          appVersion: '0.9.0',
+          appRelease: 'a'.repeat(40),
+          appModified: false,
+          development: false,
+          source: 'desktop',
+          platform: 'darwin-arm64',
+        },
+        delivery: {
+          configured: true,
+          recipient: 'n8n',
+          async submit(envelope) {
+            exported = Buffer.from(envelope.report!.data, 'base64').toString('utf8');
+            return {
+              submissionId: envelope.submissionId,
+              status: 'submitted',
+              message: `Synthetic collector reason EIO ${item.input}`,
+            };
+          },
+          status: () => assert.fail('No status request is needed.'),
+        },
+      });
+      const review = await service.review({
+        feedback: 'Synthetic overlap report.',
+        includeReport: true,
+      });
+      const result = await service.send(review.reviewId);
+      assert.equal(exported, review.content);
+      assert.equal(result.message, undefined);
+      assert.equal(result.messageOmitted, true);
+      for (const value of [exported, JSON.stringify(result)]) {
+        assert.ok(!value.includes('synthetic-private'));
+        assert.ok(!value.includes('Synthetic Owner'));
+        assert.ok(!value.includes(String.raw`synthetic+(private)[value]\key`));
+        assert.ok(!value.includes('[['));
+      }
+    });
+});
+
+test('startup attachment repair keeps the original ID and bytes and never repeats the description', async (t) => {
+  const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+  const root = await mkdtemp(join(tmpdir(), 'nod-report-repair-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const calls: import('../src/ports/feedback.ts').FeedbackEnvelope[] = [];
+  let release!: (value: import('../src/shared/feedback.ts').FeedbackReceipt) => void;
+  let dispatch!: () => void;
+  const dispatched = new Promise<void>((resolve) => {
+    dispatch = resolve;
+  });
+  let hold = true;
+  let remote: 'partial' | 'submitted' = 'partial';
+  const options = {
+    dataRoot: root,
+    secrets: ['synthetic-private-key'],
+    names: [],
+    status: { phase: 'error', error: 'Synthetic failure synthetic-private-key' },
+    context: {
+      appVersion: '0.9.0',
+      appRelease: 'a'.repeat(40),
+      appModified: false,
+      development: false,
+      source: 'desktop' as const,
+      platform: 'darwin-arm64',
+    },
+    delivery: {
+      configured: true,
+      recipient: 'n8n',
+      async submit(
+        value: import('../src/ports/feedback.ts').FeedbackEnvelope,
+      ): Promise<import('../src/shared/feedback.ts').FeedbackReceipt> {
+        calls.push(value);
+        if (value.action === 'repair' && hold) {
+          dispatch();
+          return new Promise((resolve) => {
+            release = resolve;
+          });
+        }
+        return {
+          submissionId: value.submissionId,
+          status: value.action === 'repair' ? 'submitted' : 'partial',
+          message: 'Synthetic delivery detail synthetic-private-key',
+        };
+      },
+      async status(id: string) {
+        return { submissionId: id, status: remote };
+      },
+    },
+  };
+  const service = createStartupFeedback(options);
+  const review = await service.review({
+    feedback: 'Synthetic original description.',
+    includeReport: true,
+  });
+  const partialReceipt = await service.send(review.reviewId);
+  assert.equal(partialReceipt.canRetryAttachments, true);
+  assert.equal(partialReceipt.message, undefined);
+  assert.equal(partialReceipt.messageOmitted, true);
+  const repairing = service.repair(review.reviewId);
+  await dispatched;
+  const duplicate = service.repair(review.reviewId);
+  assert.equal(calls.length, 2);
+  const { action, ...same } = calls[1];
+  assert.equal(action, 'repair');
+  assert.deepEqual(same, calls[0]);
+  release({ submissionId: review.reviewId, status: 'unknown' });
+  assert.equal((await repairing).status, 'unknown');
+  assert.equal((await duplicate).status, 'unknown');
+  await assert.rejects(service.repair(review.reviewId), /Check the report status/);
+  await assert.rejects(
+    service.review({ feedback: 'Synthetic new description.', includeReport: true }),
+    /previous report status/,
+  );
+  assert.equal((await service.status())?.status, 'partial');
+  hold = false;
+  assert.equal((await service.repair(review.reviewId)).status, 'submitted');
+  assert.equal(calls.filter((value) => !value.action).length, 1);
+  const second = await service.review({
+    feedback: 'Synthetic second report.',
+    includeReport: true,
+  });
+  await service.send(second.reviewId);
+  const restarted = createStartupFeedback(options);
+  assert.equal((await restarted.context()).pending?.canRetryAttachments, false);
+  await assert.rejects(restarted.repair(second.reviewId), /original report bytes/);
+  assert.equal(calls.filter((value) => !value.action).length, 2);
+  const fresh = await restarted.review({ feedback: 'Synthetic fresh bytes.', includeReport: true });
+  assert.notEqual(fresh.reviewId, second.reviewId);
+  const originalNow = Date.now;
+  try {
+    Date.now = () => originalNow() + 3_600_001;
+    assert.equal((await service.status())?.canRetryAttachments, false);
+    await assert.rejects(service.repair(second.reviewId), /original report bytes/);
+  } finally {
+    Date.now = originalNow;
+  }
+  assert.equal(calls.filter((value) => !value.action).length, 2);
+});
+
+test('startup not-sent evidence binds an expired review and survives a clock change', async (t) => {
+  const { createStartupFeedback } = await import('../src/server/startup-feedback.ts');
+  const { writeFile } = await import('node:fs/promises');
+  const root = await mkdtemp(join(tmpdir(), 'nod-report-expiry-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const olderId = randomUUID();
+  await writeFile(
+    join(root, 'startup-feedback.json'),
+    JSON.stringify({ submissionId: olderId, payloadHash: 'a'.repeat(64) }),
+  );
+  let now = Date.now();
+  const originalNow = now;
+  t.mock.method(Date, 'now', () => now);
+  let submits = 0;
+  const service = createStartupFeedback({
+    dataRoot: root,
+    status: { phase: 'error' },
+    context: {
+      appVersion: '0.9.0',
+      appRelease: 'a'.repeat(40),
+      appModified: false,
+      development: false,
+      source: 'desktop',
+      platform: 'darwin-arm64',
+    },
+    delivery: {
+      configured: true,
+      recipient: 'n8n',
+      submit: async (value) => {
+        submits++;
+        return { submissionId: value.submissionId, status: 'submitted' };
+      },
+      status: async (id) => ({ submissionId: id, status: 'submitted' }),
+    },
+  });
+  assert.equal((await service.context()).pending?.submissionId, olderId);
+  const expired = await service.review({
+    feedback: 'Synthetic expired review.',
+    includeReport: false,
+  });
+  now += 3600001;
+  await assert.rejects(service.send(expired.reviewId), /Review the report again/);
+  const evidence = await service.context();
+  assert.equal(evidence.notSentSubmissionId, expired.reviewId);
+  assert.equal(evidence.pending?.submissionId, olderId);
+  now = originalNow;
+  await assert.rejects(service.send(expired.reviewId), /Review the report again/);
+  assert.equal(submits, 0);
+  const fresh = await service.review({ feedback: 'Synthetic fresh review.', includeReport: false });
+  assert.notEqual(fresh.reviewId, expired.reviewId);
+  assert.equal((await service.context()).notSentSubmissionId, undefined);
+  await service.send(fresh.reviewId);
+  assert.equal(submits, 1);
+  assert.equal((await service.context()).notSentSubmissionId, undefined);
+});
+
+test('startup facts omit every prose shape without pattern matching or code inference', () => {
+  const values = [
+    '/Applications/Synthetic Owner/profile/workspaces/synthetic-private-contract.docx',
+    String.raw`C:\Synthetic Owner\profile\synthetic-private-contract.docx`,
+    '<profile>[redacted]workspaces[redacted]synthetic-private-contract.docx',
+    'https:[redacted][redacted]private.example.test[redacted]synthetic-private-url',
+    'synthetic-private-local[redacted]example.test',
+    'synthetic-private-local@example.test',
+    '@synthetic-private-handle',
+    '+34 600 123 456',
+    '%2FUsers%2Fsynthetic-private-owner%2Fcontract',
+    '{"name":"synthetic-private-owner","message":"HTTP 503 EIO"}',
+    'prefixABCsynthetic-private-cross-tail',
+    'prefixABCsynthetic-private-middleXYZtail',
+  ];
+  for (const value of values) {
+    const status = startupStatusFacts({
+      phase: 'error',
+      stage: value,
+      error: value,
+      details: value,
+      failure: { name: value, code: value, syscall: value, status: '503' },
+    });
+    const event = startupEventFacts(value, {
+      error: value,
+      durationMs: value,
+      path: value,
+      line: value,
+    });
+    const log = startupLogFacts({
+      entries: [{ ageMs: 5, line: value, event: value }],
+      truncated: false,
+    });
+    const encoded = JSON.stringify({ status, event, log });
+    assert.ok(!encoded.includes(value));
+    assert.equal(status.stage, 'unknown');
+    assert.equal(status.failure?.httpStatus, undefined);
+    assert.equal(status.failure?.errno, undefined);
+    assert.equal(event.event, 'diagnostic_text_omitted');
+    assert.equal(log.entries[0].textOmitted, true);
+  }
+});
+
+test('startup facts keep only structured bounded codes and do not call getters or serializers', () => {
+  let calls = 0;
+  const error = Object.assign(new TypeError('synthetic-private-error'), {
+    code: 'EACCES',
+    errno: -13,
+    statusCode: 0,
+    syscall: 'open',
+    status: 503,
+    signal: 'SIGTERM',
+    exitCode: 4294967295,
+    toJSON() {
+      calls++;
+      throw new Error('No serialization.');
+    },
+  });
+  Object.defineProperty(error, 'stack', {
+    get() {
+      calls++;
+      throw new Error('No stack read.');
+    },
+  });
+  const facts = startupErrorFacts(error);
+  assert.equal(
+    startupStatusFacts({ phase: 'preparing', runtime: { phase: 'downloading' } }).runtimePhase,
+    'downloading',
+  );
+  assert.deepEqual(facts, {
+    detailsOmitted: true,
+    class: 'TypeError',
+    errno: 'EACCES',
+    syscall: 'open',
+    httpStatus: 503,
+    exitCode: 4294967295,
+    signal: 'SIGTERM',
+  });
+  const poisoned = Object.defineProperties(
+    {},
+    Object.fromEntries(
+      [
+        'name',
+        'code',
+        'syscall',
+        'status',
+        'phase',
+        'stage',
+        'runtime',
+        'error',
+        'failure',
+        'message',
+      ].map((key) => [
+        key,
+        {
+          get() {
+            calls++;
+            throw new Error('No getter read.');
+          },
+        },
+      ]),
+    ),
+  );
+  JSON.stringify(startupStatusFacts(poisoned));
+  JSON.stringify(startupErrorFacts(poisoned));
+  JSON.stringify(startupEventFacts('runtime_failed', poisoned));
+  assert.deepEqual(startupReceiptFacts(poisoned, 'synthetic-owned-id'), {
+    submissionId: 'synthetic-owned-id',
+    status: 'unknown',
+  });
+  const receipt = startupReceiptFacts(
+    { status: 'rejected', message: 'synthetic-private-receipt', httpStatus: 400 },
+    'synthetic-owned-id',
+  );
+  assert.deepEqual(receipt, {
+    submissionId: 'synthetic-owned-id',
+    status: 'rejected',
+    httpStatus: 400,
+    messageOmitted: true,
+  });
+  assert.ok(!startupFailureMessage(error).includes('synthetic-private'));
+  assert.match(startupFailureMessage(error), /EACCES.*open.*HTTP 503/);
+  assert.match(
+    startupFailureMessage(new StartupFeedbackError('review_required')),
+    /Review the report again/,
+  );
+  assert.equal(
+    startupReceiptFacts(
+      { ...receipt, issueUrl: 'https://private.example.test/synthetic-private' },
+      'synthetic-owned-id',
+    ).issueUrl,
+    undefined,
+  );
+  assert.equal(calls, 0);
+  for (const value of [-1, 1.5, Infinity, NaN, 86400001])
+    assert.equal(startupEventFacts('update', { durationMs: value }).durationMs, undefined);
+  assert.equal(
+    startupErrorFacts({ code: 'synthetic-private-code', status: 600 }).httpStatus,
+    undefined,
+  );
+});

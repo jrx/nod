@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import { findPhoneNumbersInText, type CountryCode } from 'libphonenumber-js/max';
+import { addRedactionSpan, redactionMatches, type RedactionSpan } from './redaction-spans.ts';
 
 export interface PersonalProfile {
   names: string[];
@@ -248,28 +249,37 @@ function valueEnd(text: string, start: number) {
   return primitive ? start + primitive[0].length : -1;
 }
 
-function personalValues(text: string) {
+function* personalValueRanges(text: string) {
   const key = /"((?:[^"\\]|\\.){1,60})"\s*:\s*/g;
-  let result = '';
-  let offset = 0;
   for (let match = key.exec(text); match; match = key.exec(text)) {
     if (!personalKey(match[1])) continue;
     const start = match.index + match[0].length;
     const end = valueEnd(text, start);
     if (end < 0 || ['null', '""', '[]', '{}'].includes(text.slice(start, end))) continue;
+    yield { start, end };
+    key.lastIndex = end;
+  }
+}
+
+function personalValues(text: string) {
+  let result = '';
+  let offset = 0;
+  for (const { start, end } of personalValueRanges(text)) {
     result += text.slice(offset, start) + '"[personal]"';
     offset = end;
-    key.lastIndex = end;
   }
   return result + text.slice(offset);
 }
 
-function phones(text: string, region?: string) {
-  let result = text;
-  const found = findPhoneNumbersInText(text, {
+function phoneMatches(text: string, region?: string) {
+  return findPhoneNumbersInText(text, {
     ...(region ? { defaultCountry: region as CountryCode } : {}),
   });
-  for (const match of found.reverse())
+}
+
+function phones(text: string, region?: string) {
+  let result = text;
+  for (const match of phoneMatches(text, region).reverse())
     result = result.slice(0, match.startsAt) + '[phone]' + result.slice(match.endsAt);
   return result;
 }
@@ -290,22 +300,60 @@ function ownerNames(names: string[]) {
     : null;
 }
 
-function replaceValid(match: string, replacement: string, valid?: (match: string) => boolean) {
-  if (!valid) return replacement;
+function validPrefixEnd(match: string, valid?: (match: string) => boolean) {
+  if (!valid) return match.length;
   for (let end = match.length; end > 0; end--)
-    if ((end === match.length || /[ -]/.test(match[end])) && valid(match.slice(0, end)))
-      return replacement + match.slice(end);
-  return match;
+    if ((end === match.length || /[ -]/.test(match[end])) && valid(match.slice(0, end))) return end;
+  return 0;
+}
+
+function replaceValid(match: string, replacement: string, valid?: (match: string) => boolean) {
+  const end = validPrefixEnd(match, valid);
+  return end ? replacement + match.slice(end) : match;
+}
+
+function profileRegion(profile: PersonalProfile) {
+  return profile.region && /^[A-Z]{2}$/.test(profile.region) ? profile.region : undefined;
 }
 
 export function createPersonalDataRedactor(profile: PersonalProfile) {
   const names = ownerNames(profile.names);
-  const region = profile.region && /^[A-Z]{2}$/.test(profile.region) ? profile.region : undefined;
+  const region = profileRegion(profile);
   return (input: string) => {
     let text = personalValues(input);
     for (const [pattern, replacement, valid] of detectors)
       text = text.replace(pattern, (match) => replaceValid(match, replacement, valid));
     text = phones(text, region);
     return names ? text.replace(names, '[owner]') : text;
+  };
+}
+
+export function createPersonalDataSpans(profile: PersonalProfile) {
+  const names = ownerNames(profile.names);
+  const region = profileRegion(profile);
+  return (input: string) => {
+    const spans: RedactionSpan[] = [];
+    for (const { start, end } of personalValueRanges(input))
+      addRedactionSpan(spans, start, end, '"[personal]"');
+    for (const [pattern, replacement, valid] of detectors)
+      redactionMatches(
+        input,
+        pattern,
+        (match) => {
+          const end = validPrefixEnd(match[0], valid);
+          addRedactionSpan(spans, match.index, match.index + end, replacement);
+        },
+        true,
+      );
+    for (const match of phoneMatches(input, region))
+      addRedactionSpan(spans, match.startsAt, match.endsAt, '[phone]');
+    if (names)
+      redactionMatches(
+        input,
+        names,
+        (match) => addRedactionSpan(spans, match.index, match.index + match[0].length, '[owner]'),
+        true,
+      );
+    return spans;
   };
 }

@@ -1,5 +1,10 @@
 import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
-import { captureSurvey, watchAnalyticsSurvey, type AnalyticsSurvey } from '../lib/analytics';
+import {
+  captureSurvey,
+  surveyKey,
+  watchAnalyticsSurvey,
+  type AnalyticsSurvey,
+} from '../lib/analytics';
 import { BrandMark } from './brand';
 import { X } from './icons';
 import { Button } from './ui';
@@ -24,7 +29,7 @@ export function SurveyCard() {
     () =>
       watchAnalyticsSurvey((next) =>
         setSurvey((current) =>
-          !next ? undefined : (current ?? (closed.current.has(next.id) ? undefined : next)),
+          !next ? undefined : (current ?? (closed.current.has(surveyKey(next)) ? undefined : next)),
         ),
       ),
     [],
@@ -32,10 +37,10 @@ export function SurveyCard() {
   if (!survey) return null;
   return (
     <SurveyForm
-      key={survey.id}
+      key={surveyKey(survey)}
       survey={survey}
       onClose={() => {
-        closed.current.add(survey.id);
+        closed.current.add(surveyKey(survey));
         setSurvey(undefined);
       }}
     />

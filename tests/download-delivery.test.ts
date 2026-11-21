@@ -81,6 +81,7 @@ test(
     const fetchLocal = globalThis.fetch.bind(globalThis);
     const captured = new Map<string, Artifact>();
     const publicationPaths = new Map<string, string>();
+    let publicationQueryFailures = 0;
     const held = new Map<string, RuntimeContext>();
     const release = new Map<string, () => void>();
     const runtimes = new Map<string, ReturnType<typeof createAgentRuntime>>();
@@ -384,6 +385,10 @@ test(
         artifacts: {
           ...localArtifacts,
           async publishArtifact(...args) {
+            if (args[1].endsWith('/query-failure.txt')) {
+              publicationQueryFailures += 1;
+              await args[4]!.query('SELECT 1/0');
+            }
             const artifact = await localArtifacts.publishArtifact(...args);
             const row = (
               await args[4]!.query('SELECT storage_path FROM artifacts WHERE id=$1', [artifact.id])
@@ -411,6 +416,7 @@ test(
           assert.ok(runtime, 'A turn must use its assigned synthetic runtime.');
           return runtime.runTurn({
             ...context,
+            background: true,
             reply(...args) {
               const operation = context.reply(...args);
               publicationOperations.push(operation);
@@ -871,10 +877,9 @@ test(
             assert.deepEqual(response.rawPayload, bytes);
             assert.ok(messages[0].text.includes(files[index].url));
           }
-          await assert.rejects(context.reply(`Missing: \`${root}/missing.txt\``));
           await writeFile(join(local, 'uncommitted.txt'), 'Uncommitted output');
           await assert.rejects(
-            context.reply(`\`${root}/uncommitted.txt\` and \`${root}/missing.txt\``),
+            context.reply(`\`${root}/uncommitted.txt\``, undefined, randomUUID()),
           );
           assert.equal(
             (
@@ -888,29 +893,39 @@ test(
           await assert.rejects(readFile(publicationPaths.get('uncommitted.txt')!), {
             code: 'ENOENT',
           });
-          await assert.rejects(
-            context.reply(`\`${root}/uncommitted.txt\``, undefined, randomUUID()),
-          );
-          await assert.rejects(readFile(publicationPaths.get('uncommitted.txt')!), {
-            code: 'ENOENT',
-          });
           const foreign = randomUUID();
           await mkdir(join(dataRoot, 'workspaces', foreign));
           await writeFile(
             join(dataRoot, 'workspaces', foreign, 'private.txt'),
             'Foreign workspace',
           );
-          await assert.rejects(context.reply(`Foreign: \`/workspace/${foreign}/private.txt\``));
           await writeFile(join(dataRoot, 'workspaces', 'private.txt'), 'Outside workspace');
-          await assert.rejects(context.reply(`Escape: \`${root}/../private.txt\``));
-          assert.equal(
-            (
-              await db.pool.query("SELECT id FROM messages WHERE turn_id=$1 AND role='assistant'", [
-                turnId,
-              ])
-            ).rowCount,
-            1,
+          await mkdir(join(local, 'notes'));
+          await writeFile(join(local, 'query-failure.txt'), 'Synthetic output');
+          const unavailable = [
+            `${root}/query-failure.txt`,
+            `/workspace/${foreign}/private.txt`,
+            `${root}/../private.txt`,
+            `${root}/missing.txt`,
+            `${root}/notes`,
+          ];
+          await context.reply(
+            `Not files here: ${unavailable.map((path) => `\`${path}\``).join(', ')}. ` +
+              `Output: \`${root}/uncommitted.txt\``,
           );
+          const delivered = (
+            await db.pool.query(
+              "SELECT text,attachments FROM messages WHERE turn_id=$1 AND role='assistant' ORDER BY created_at DESC,id DESC LIMIT 1",
+              [turnId],
+            )
+          ).rows[0];
+          assert.deepEqual(
+            delivered.attachments.map((file: Artifact) => file.name),
+            ['uncommitted.txt'],
+          );
+          for (const path of unavailable) assert.ok(delivered.text.includes(`\`${path}\``));
+          assert.ok(delivered.text.includes(`(${delivered.attachments[0].url})`));
+          assert.equal(publicationQueryFailures, 1);
           const shared = await context.publish('calendar.ics');
           await context.reply(`Calendar again: \`${root}/calendar.ics\``);
           const again = (
@@ -920,7 +935,7 @@ test(
             )
           ).rows;
           assert.deepEqual(
-            again[1].attachments.map((file: Artifact) => file.id),
+            again.at(-1).attachments.map((file: Artifact) => file.id),
             [shared.id],
           );
           release.get(turnId)!();

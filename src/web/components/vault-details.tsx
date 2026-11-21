@@ -285,7 +285,7 @@ export function VaultDetails({
     } catch (error) {
       if (current())
         setError(
-          error instanceof ApiError && error.status === 400
+          error instanceof ApiError
             ? error.message
             : isCard
               ? 'This card could not be updated. Try again.'

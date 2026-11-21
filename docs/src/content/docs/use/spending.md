@@ -31,9 +31,15 @@ Sign-ins and card submissions open the saved Vault item when it is still availab
 
 To review or change [standing instructions](/trust/approvals/#standing-instructions), [rules](/trust/approvals/#your-rules) or task check-ins, ask Nod in chat.
 
-Chat messages don't include cost or action receipts. Review spending and app actions in **Usage**. On **Scheduled**, an enabled recurring schedule shows its projected monthly cost once there's priced usage to base it on, and its details show its runs and their recorded costs. A new schedule's projection uses your other schedules' recent runs, your recent requests, or the request that set it up, until it has finished runs of its own. When Nod creates a recurring schedule or changes its timing, its reply states the projection. Plan usage and unpriced runs have no cost amount.
+Chat messages don't include cost or action receipts. Review spending and app actions in **Usage**. On **Scheduled**, an enabled recurring schedule shows its projected monthly cost once there's priced usage to base it on, and its details show its runs and their recorded costs. A new schedule's projection uses your other schedules' recent runs, your recent requests, or the request that set it up, until it has finished runs of its own. When Nod creates a recurring schedule or changes its timing, its reply states the projection. Plan usage and unpriced runs have no recorded cost amount. If you switch a schedule from a ChatGPT plan to a priced API model, its forecast uses recorded tokens. A run with an unknown supporting charge, such as a review, cannot be used for the forecast.
 
 With an API model selected, select this month's total to see a chart and a forecast, such as "On track for $12.40". It also says how much was background work: source checks, schedules and tasks Nod started, plus work that runs outside any of them, such as email checks, memory upkeep and writing style. Point to or select a day on the chart to see that day’s spend and the total so far. You can also focus the chart and use the arrow keys. Every app action is recorded, reads included.
+
+Model and schedule forecasts reuse the cost of the main model requests when the model and its recorded rates match the current choice. If the rates changed or were never saved, Nod prices those recorded tokens at the current rates, including long-context tiers. Supporting model work, such as reviews or memory updates, contributes its recorded charge or API-price estimate. A model whose catalog lists zero token rates can still have supporting costs.
+
+A schedule forecast cannot use a run if a successful model request has no known cost and no token counts. A cancelled request with no usage does not prevent the forecast.
+
+Older cache writes without a saved duration use the standard cache-write rate. The usage record combines text and audio tokens, which have different input rates. Native audio forecasts therefore need matching recorded rates. The original amounts are available in Usage and schedule history.
 
 To spend less on work you don't watch, choose a lighter model for schedules or for work Nod starts on its own. See [Models for each kind of work](/connect/models/#models-for-each-kind-of-work).
 
@@ -46,6 +52,8 @@ How Nod counts usage depends on how you pay for the model.
 | A paid model through an API key or a cloud account, such as OpenAI, Anthropic, OpenRouter or Amazon Bedrock        | Estimated API cost                           | Counts        | Counts               |
 | A ChatGPT plan                                                                                                     | API-price estimate of what your plan covered | Doesn't count | Counts at API prices |
 | A model with no price, such as an [OpenAI-compatible server](/connect/local-models/), a free model or a token plan | **No price**                                 | Doesn't count | Doesn't count        |
+
+If Nod cannot save usage for a completed model request, voice reply, or transcription, it keeps the result and holds the unsaved usage in memory. Nod tries to save it before another model request, voice reply, or transcription. If that save fails, the new request stops. Saving usage again does not repeat completed work or an app action. If Nod restarts before it saves the usage, that usage can be lost from Usage and monthly-limit accounting.
 
 Costs are Nod's estimates from each model's API price. Your provider's bill is the final word. Any request whose API price Nod doesn't know shows **No price**, on a ChatGPT plan too, as does a voice reply or transcription without a known price.
 
@@ -100,7 +108,7 @@ Conservative bounds can pause preparation before its recorded spending reaches t
 
 ## Task check-ins
 
-A task checks in with you when its spending since your last message to it passes the check-in amount, $5 by default. Nod stops before its next step. It states the cost and what continuing would do, then asks whether to keep going. It includes a completed result only when that helps your decision and you can inspect the result.
+A task checks in with you when its spending since your last message to it passes the check-in amount, $5 by default. Nod stops before its next step. It first shows everything useful it found so far, then states what the task has spent at the moment it asks and what continuing would add, and asks whether to keep going.
 
 - Say yes, and the task continues until it spends that amount again.
 - Say no, and Nod stops the task.

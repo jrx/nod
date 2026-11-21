@@ -1,7 +1,13 @@
 import type { AccountTheme, AccountUser } from '../../shared/account';
 
 export type AccountTab =
-  'General' | 'Notifications' | 'Models' | 'Voice & audio' | 'Memory' | 'Privacy & data';
+  | 'General'
+  | 'Notifications'
+  | 'Models'
+  | 'Voice & audio'
+  | 'Memory'
+  | 'Computer use'
+  | 'Privacy & data';
 export interface AccountControls {
   user: AccountUser;
   theme: AccountTheme;

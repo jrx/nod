@@ -194,12 +194,12 @@ export function createOnboardingProfile(options: {
       if (!options.updatesEmail.enabled())
         return response.code(409).send({
           error:
-            'Sharing was turned off while submitting. Your email may already have been saved. Use Send feedback to request deletion.',
+            'Sharing was turned off while submitting. Your email may already have been saved. Write to privacy@n8n.io to request deletion.',
         });
       if (!saved)
         return response.code(502).send({
           error:
-            'Nod couldn’t finish signing you up. Your email may already be saved. Try again, or use Send feedback to request deletion.',
+            'Nod couldn’t finish signing you up. Your email may already be saved. Try again, or write to privacy@n8n.io to request deletion.',
         });
       return { ok: true };
     });

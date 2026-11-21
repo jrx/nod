@@ -23,12 +23,14 @@ import type {
   WorkUsage,
 } from '../../shared/models';
 import { modelKeyError } from '../../shared/model-keys';
+import { appPages } from '../../shared/app-links';
 import {
   modelProviderInfo,
   modelProviderNames,
   modelProviders,
   modelSource,
   openAIRegions,
+  canReuseWorkCost,
   repriceUsd,
 } from '../../shared/models';
 import { analyticsForCurrentSession } from '../lib/analytics';
@@ -145,7 +147,7 @@ export function ModelKeyHelp({
         <a href={`https://${info.keyUrl}`} target="_blank" rel="noreferrer">
           Get API key
         </a>
-        {info.catalog === 'bundled' && ' Access checked on first use.'}
+        {info.catalog === 'bundled' && ' Access is checked after you select a model.'}
       </p>
       {provider === 'google' && (
         <p className={className}>
@@ -731,11 +733,23 @@ export function ModelSettings({ onDirtyChange }: { onDirtyChange?(dirty: boolean
                             </span>
                           )}
                           {data.selection?.connectionId === connection.id && (
-                            <span className="model-connection-selected">Current model</span>
+                            <span className="model-connection-meta model-connection-selected">
+                              Current model:{' '}
+                              {connection.models.find(
+                                (model) => model.id === data.selection?.modelId,
+                              )?.name ?? data.selection.modelId}
+                            </span>
                           )}
                         </div>
                       </div>
                       <div className="model-service-actions">
+                        {data.selection?.connectionId === connection.id && available && (
+                          <ModelPicker
+                            appearance="quiet"
+                            label="Change model"
+                            manageConnections={false}
+                          />
+                        )}
                         {connection.status === 'reconnect' && !connection.managed && (
                           <Button
                             type="button"
@@ -1023,8 +1037,8 @@ function tokenPrice(pricing: ModelChoice['pricing']) {
 export function workPrice(usage: WorkUsage | undefined, model: ModelChoice | undefined) {
   const spent = usage ? usage.agentUsd + usage.otherUsd : 0;
   if (!usage || spent <= 0 || !model) return null;
-  if (usage.models.length === 1 && usage.models[0] === model.id) return money(spent);
-  const value = repriceUsd(usage, model.pricing);
+  if (canReuseWorkCost(usage, model.id, model.pricing)) return money(spent);
+  const value = repriceUsd(usage, model.pricing, model.audio);
   return value === null ? 'No price' : `≈ ${money(value)}`;
 }
 
@@ -1309,7 +1323,7 @@ export function ModelPicker({
         model &&
         connection?.status === 'reconnect' && (
           <a className="model-needs-reconnect" href="/settings/models">
-            Reconnect in Settings &gt; Models
+            Reconnect in {appPages['/settings/models']}
           </a>
         )}
       <Dialog

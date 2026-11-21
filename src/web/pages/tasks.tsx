@@ -150,11 +150,7 @@ export function TaskCard({
   onReply?(): void;
 }) {
   const headingId = useId();
-  const stuck = task.status === 'failed';
-  const [expanded, setExpanded] = useState(stuck);
-  useEffect(() => {
-    if (stuck) setExpanded(true);
-  }, [stuck]);
+  const [expanded, setExpanded] = useState(false);
   const card = useRef<HTMLElement>(null);
   const inChat = Boolean(onReply);
   useEffect(() => {
@@ -200,6 +196,7 @@ export function TaskCard({
       ? task.now || 'Waiting for your answer'
       : taskHeadline(task);
   const showLive = live && (task.status === 'working' || task.status === 'queued') ? live : null;
+  const shownInChat = inChat && ['needs_you', 'done', 'cancelled'].includes(task.status);
   return (
     <article
       ref={card}
@@ -217,7 +214,7 @@ export function TaskCard({
       <h2 className="task-preview-heading">
         <button
           type="button"
-          className="task-preview-head"
+          className={`task-preview-head${showLive ? ' task-preview-head-live' : ''}`}
           aria-expanded={expanded}
           aria-controls={`${headingId}-body`}
           onClick={() => {
@@ -239,17 +236,20 @@ export function TaskCard({
             </span>
             {chevron}
           </span>
-          <span className="task-preview-line">
-            {showLive ? (
-              <LiveLine item={showLive} />
-            ) : (
+          {!showLive && !shownInChat && (
+            <span className="task-preview-line">
               <Markdown allowedElements={[]} unwrapDisallowed>
                 {line}
               </Markdown>
-            )}
-          </span>
+            </span>
+          )}
         </button>
       </h2>
+      {showLive && (
+        <div className="task-preview-live-line">
+          <LiveLine item={showLive} />
+        </div>
+      )}
       <div
         className="task-preview-disclosure"
         id={`${headingId}-body`}
@@ -474,6 +474,14 @@ export function Scheduled({
     .filter((schedule) => schedule.enabled && schedule.nextRun)
     .sort((a, b) => a.nextRun!.localeCompare(b.nextRun!) || a.id.localeCompare(b.id));
   const inactive = (schedules.data ?? []).filter((schedule) => !upcoming.includes(schedule));
+  const inactiveGroup = useRef<HTMLDetailsElement>(null);
+  const showInactiveByDefault = upcoming.length === 0;
+  const hasActiveInactiveSchedule = inactive.some(
+    (schedule) => schedule.activeRun || activity.some((item) => item.scheduleId === schedule.id),
+  );
+  useEffect(() => {
+    if (hasActiveInactiveSchedule && inactiveGroup.current) inactiveGroup.current.open = true;
+  }, [hasActiveInactiveSchedule, showInactiveByDefault]);
   const empty = Boolean(schedules.data && !schedules.data.length);
   return (
     <div className="content-page secondary-page tasks-page">
@@ -511,7 +519,12 @@ export function Scheduled({
           {upcoming.length ? (
             <div className="saved-plan-list">
               {upcoming.map((schedule) => (
-                <ScheduleRow key={schedule.id} schedule={schedule} onAsk={onAsk} />
+                <ScheduleRow
+                  key={schedule.id}
+                  schedule={schedule}
+                  activity={activity}
+                  onAsk={onAsk}
+                />
               ))}
             </div>
           ) : empty ? (
@@ -531,14 +544,19 @@ export function Scheduled({
             <p className="muted">No upcoming schedules.</p>
           )}
           {inactive.length > 0 && (
-            <details className="schedule-inactive" open={!upcoming.length}>
+            <details className="schedule-inactive" ref={inactiveGroup} open={showInactiveByDefault}>
               <summary>
                 Inactive <span>{inactive.length}</span>
                 <ChevronDown size={16} aria-hidden="true" />
               </summary>
               <div className="saved-plan-list">
                 {inactive.map((schedule) => (
-                  <ScheduleRow key={schedule.id} schedule={schedule} onAsk={onAsk} />
+                  <ScheduleRow
+                    key={schedule.id}
+                    schedule={schedule}
+                    activity={activity}
+                    onAsk={onAsk}
+                  />
                 ))}
               </div>
             </details>

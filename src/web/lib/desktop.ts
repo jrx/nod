@@ -49,6 +49,12 @@ export type DesktopUpdateStatus = {
   progress?: number;
   readyVersion?: string;
   dismissedVersion?: string;
+  failure?: {
+    id: number;
+    phase: 'checking' | 'preparing' | 'downloading' | 'restart';
+    message: string;
+    dismissed?: boolean;
+  };
 };
 
 export type DesktopSettingsChange = Partial<
@@ -87,7 +93,9 @@ type DesktopWindow = Window & {
     onStatus?(listener: (status: DesktopStatus) => void): () => void;
     updateStatus?(): Promise<DesktopUpdateStatus>;
     onUpdateStatus?(listener: (status: DesktopUpdateStatus) => void): () => void;
-    dismissUpdate?(version: string): Promise<void>;
+    dismissUpdate?(version: string | number): Promise<void>;
+    retryUpdate?(id: number): Promise<void>;
+    downloadUpdate?(): Promise<void>;
     restartUpdate?(): Promise<void>;
     prepare?(options?: { retry: boolean }): Promise<DesktopStatus>;
     savePreferences?(input: DesktopSettingsChange): Promise<DesktopSettings>;
@@ -327,10 +335,22 @@ export function subscribeDesktopUpdateStatus(listener: (status: DesktopUpdateSta
   return (window as DesktopWindow).nodDesktop?.onUpdateStatus?.(listener) ?? (() => {});
 }
 
-export function dismissDesktopUpdate(version: string) {
+export function dismissDesktopUpdate(version: string | number) {
   const dismiss = (window as DesktopWindow).nodDesktop?.dismissUpdate;
   if (!dismiss) return Promise.reject(new Error('Desktop updates are unavailable.'));
   return dismiss(version);
+}
+
+export function retryDesktopUpdate(id: number) {
+  const retry = (window as DesktopWindow).nodDesktop?.retryUpdate;
+  if (!retry) return Promise.reject(new Error('Desktop updates are unavailable.'));
+  return retry(id);
+}
+
+export function downloadDesktopUpdate() {
+  const download = (window as DesktopWindow).nodDesktop?.downloadUpdate;
+  if (!download) return Promise.reject(new Error('Desktop updates are unavailable.'));
+  return download();
 }
 
 export function restartDesktopUpdate() {

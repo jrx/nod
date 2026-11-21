@@ -38,7 +38,7 @@ class AppBoundary extends Component<
                 className="button button-outline button-default"
                 onClick={() => this.setState({ feedbackOpen: true })}
               >
-                Send feedback
+                Report bug
               </button>
               <FeedbackDialog
                 ownerId={this.props.ownerId}

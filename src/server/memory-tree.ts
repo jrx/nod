@@ -13,13 +13,13 @@ import {
 export const areas = memoryAreas;
 export const maxBytes = 256 * 1024;
 
-const digitRun = /\d+(?:[ -]\d+)*/g;
+const digitRun = /\d+(?:[\s-]+\d+)*/g;
 const keyOrLoginLink = new RegExp(
   String.raw`https?:\/\/[^\s/@]+:[^\s/@]+@|` + secretToken.source,
   'i',
 );
 function holdsCard(run: string) {
-  const groups = run.split(/[ -]/);
+  const groups = run.split(/[\s-]+/);
   for (let start = 0; start < groups.length; start++) {
     let digits = '';
     for (let end = start; end < groups.length; end++) {
@@ -35,7 +35,10 @@ export function personalSecret(text: string) {
 }
 const slugPattern = '[a-z0-9]+(?:-[a-z0-9]+)*';
 export function unsafe(...texts: Array<string | undefined>) {
-  return texts.some((text) => !!text && personalSecret(text));
+  return texts.some(
+    (text) =>
+      !!text && (personalSecret(text) || personalSecret(text.replace(/[^\S\n]*\n\s*/g, ''))),
+  );
 }
 
 export const id = z.uuid();
@@ -52,18 +55,20 @@ export const line = (max = noteChars) =>
     .min(1)
     .max(max)
     .refine((value) => !/\p{Cc}/u.test(value));
+export const lines = (max = noteChars) =>
+  z
+    .string()
+    .trim()
+    .min(1)
+    .max(max)
+    .refine((value) => !/[^\P{Cc}\t\n]/u.test(value));
 const timestamp = z.iso.datetime({ offset: true });
 export const skillName = z
   .string()
   .regex(new RegExp(`^${slugPattern}$`))
   .max(64);
 export const skillDescription = line(skillDescriptionChars);
-export const skillBody = z
-  .string()
-  .trim()
-  .min(1)
-  .max(skillChars)
-  .refine((value) => !/[^\P{Cc}\t\n]/u.test(value));
+export const skillBody = lines(skillChars);
 const skillSchema = z.object({
   name: skillName,
   description: skillDescription,
@@ -89,7 +94,7 @@ export const factSchema = z
 const entryFields = z.object({
   area,
   slug,
-  text: line(),
+  text: lines(),
   abstract: line(120).optional(),
   origin: z.enum(['stated', 'inferred', 'email']),
   updated: timestamp,
@@ -97,7 +102,7 @@ const entryFields = z.object({
   sources: z.array(id).max(5),
   expires: z.iso.date().optional(),
   fact: factSchema.optional().catch(undefined),
-  quote: line(400).optional().catch(undefined),
+  quote: lines(400).optional().catch(undefined),
 });
 const evidenced = (entry: z.infer<typeof entryFields>) =>
   entry.sources.length > 0 || !!entry.edited || entry.origin === 'email';
@@ -158,7 +163,10 @@ export const pathOf = (entry: { area: Area; slug: string }) => `${entry.area}/${
 const bySlug = (a: Entry, b: Entry) => a.slug.localeCompare(b.slug);
 export const locate = (tree: Tree, target: string) =>
   tree.entries.find((entry) => pathOf(entry) === target);
-export const fold = (value: string) => value.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+export const fold = (value: string) =>
+  value.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').toLowerCase();
+export const foldQuote = (value: string) =>
+  fold(value.replace(/[“”«»„‟]/g, '"').replace(/[‘’‚‛‹›]/g, "'"));
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
 const cjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const tokens = (value: string) =>
@@ -392,7 +400,7 @@ export function view(
   const sources = (entry: Entry) =>
     entry.sources.map((id) => {
       const found = source(id);
-      return entry.quote && found.text && fold(found.text).includes(fold(entry.quote))
+      return entry.quote && found.text && foldQuote(found.text).includes(foldQuote(entry.quote))
         ? { ...found, quote: entry.quote }
         : found;
     });

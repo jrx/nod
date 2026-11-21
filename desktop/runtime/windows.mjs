@@ -84,11 +84,38 @@ export async function installWsl({ signal } = {}) {
   );
 }
 
-async function download({ url, bytes, sha256 }, path, { signal, fetch, onProgress = () => {} }) {
+async function download(
+  { url, bytes, sha256 },
+  path,
+  { signal, fetch, onProgress = () => {}, stallTimeout = 5 * 60_000 },
+) {
+  signal?.throwIfAborted();
+  const saved = await lstat(path).catch((error) => {
+    if (error.code !== 'ENOENT') throw error;
+  });
+  if (saved?.isFile() && saved.size === bytes) {
+    if ((await assetHash(path, signal)) === sha256) {
+      onProgress(1);
+      return;
+    }
+    await rm(path, { force: true });
+  }
+  const stalled = new AbortController();
+  const downloadSignal = AbortSignal.any([...(signal ? [signal] : []), stalled.signal]);
+  let timer;
+  const alive = () => {
+    clearTimeout(timer);
+    timer = setTimeout(
+      () => stalled.abort(new Error('The Nod download stopped receiving data.')),
+      stallTimeout,
+    );
+    timer.unref?.();
+  };
   const { start, stream, interrupted } = await resumableDownload(url, path, {
     bytes,
     fetch,
-    signal,
+    signal: downloadSignal,
+    onData: alive,
   });
   const hash = createHash('sha256');
   const estimate = timeLeft();
@@ -106,12 +133,16 @@ async function download({ url, bytes, sha256 }, path, { signal, fetch, onProgres
     },
   });
   try {
-    await pipeline(stream, check, { signal });
+    alive();
+    await pipeline(stream, check, { signal: downloadSignal });
     if (received !== bytes || hash.digest('hex') !== sha256)
       throw new Error('The Nod download failed its integrity check. Try again.');
   } catch (error) {
     if (!interrupted()) await rm(path, { force: true });
+    if (stalled.signal.aborted) throw stalled.signal.reason;
     throw error;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -153,45 +184,54 @@ export async function stageWindowsUpdate(
     includeRuntime = true,
     onProgress = () => {},
     unsigned = unsignedWindowsFiles,
+    stallTimeout,
   },
 ) {
   if (
     !/^\d+\.\d+\.\d+$/.test(candidate?.version) ||
     candidate.installer?.file !== 'nod-Setup-x64.exe' ||
-    candidate.runtime?.file !== 'nod-Runtime-win32-x64.tar.gz'
+    candidate.runtime?.file !== 'nod-Runtime-win32-x64.tar.gz' ||
+    [candidate.installer, candidate.runtime].some(
+      (file) =>
+        !Number.isSafeInteger(file.bytes) ||
+        file.bytes < 1 ||
+        file.bytes > 8 * 1024 ** 3 ||
+        !/^[a-f0-9]{64}$/.test(file.sha256),
+    )
   )
     throw new Error('The Nod update is invalid.');
   const target = join(directory, candidate.version);
-  await rm(directory, { recursive: true, force: true });
   await mkdir(target, { recursive: true });
-  try {
-    const files = [candidate.installer];
-    if (includeRuntime) {
-      const installed = JSON.parse(
-        await readFile(join(resourcesPath, 'windows-runtime/manifest.json'), 'utf8').catch(
-          () => '{}',
-        ),
-      );
-      if (installed.guest?.sha256 !== candidate.runtime.sha256) files.unshift(candidate.runtime);
-    }
-    const total = files.reduce((sum, file) => sum + file.bytes, 0);
-    let done = 0;
-    for (const file of files) {
-      await download(file, join(target, file.file), {
-        signal,
-        fetch,
-        onProgress: (progress) => onProgress((done + progress * file.bytes) / total),
-      });
-      done += file.bytes;
-      onProgress(done / total);
-    }
-    if ((await unsigned([join(target, candidate.installer.file)], { signal })).length)
-      throw new Error(`The Nod update is not signed by ${windowsPublisher.name}.`);
-    return target;
-  } catch (error) {
-    await rm(directory, { recursive: true, force: true });
-    throw error;
+  for (const name of await readdir(directory))
+    if (/^\d+\.\d+\.\d+$/.test(name) && name !== candidate.version)
+      await rm(join(directory, name), { recursive: true, force: true });
+  const files = [candidate.installer];
+  if (includeRuntime) {
+    const installed = JSON.parse(
+      await readFile(join(resourcesPath, 'windows-runtime/manifest.json'), 'utf8').catch(
+        () => '{}',
+      ),
+    );
+    if (installed.guest?.sha256 !== candidate.runtime.sha256) files.unshift(candidate.runtime);
   }
+  if (files.length === 1) await rm(join(target, candidate.runtime.file), { force: true });
+  const total = files.reduce((sum, file) => sum + file.bytes, 0);
+  let done = 0;
+  for (const file of files) {
+    await download(file, join(target, file.file), {
+      signal,
+      fetch,
+      stallTimeout,
+      onProgress: (progress) => onProgress((done + progress * file.bytes) / total),
+    });
+    done += file.bytes;
+    onProgress(done / total);
+  }
+  if ((await unsigned([join(target, candidate.installer.file)], { signal })).length) {
+    await rm(join(target, candidate.installer.file), { force: true });
+    throw new Error(`The Nod update is not signed by ${windowsPublisher.name}.`);
+  }
+  return target;
 }
 
 export async function prepareWindowsRuntime(options, onComputerStart) {

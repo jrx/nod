@@ -72,9 +72,14 @@ export async function createAppGrantVault(
     }
     return values;
   }
-  async function replace(id: string, version: number, value: string) {
+  async function replace(
+    id: string,
+    version: number,
+    value: string,
+    client: Pool | PoolClient = pool,
+  ) {
     const validId = z.uuid().parse(id);
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE vault_app_grants SET ciphertext=$4,version=version+1,updated_at=now()
        WHERE id=$1 AND owner_id=$2 AND version=$3`,
       [validId, owner, version, seal(await key(), owner, validId, value)],

@@ -40,6 +40,8 @@ Linux bundles include the runtime pack. The build allows at most two parts, each
 
 Desktop builds include the server source, built web files, production dependencies, required runtime files, and licenses. The server runs TypeScript through `tsx`.
 
+Mac release jobs install optional dependencies for their target CPU and ARM64. Intel jobs use x64 Node through Rosetta on Apple silicon runners. Bun selects its native ARM64 binary there, so both CPU variants must be available during installation. The packaged app still uses its target CPU.
+
 Builds exclude frontend source, duplicate public files, lockfiles, development package settings, source maps, and type declarations. Dependency tests, examples, build scripts, and unused TypeScript sources are also excluded. Files that a package declares as runtime entry points stay in the bundle. Speech source archives stay with their licenses.
 
 Packaged windows disable DevTools. The production menu excludes developer tools and force reload. It keeps standard reload, zoom, fullscreen, and onboarding replay. Source runs keep the development controls.
@@ -186,18 +188,42 @@ The optional `video` object saves its attachment `url` and a `releaseSha256` dig
 
 ### Write release highlights
 
-Use the [v0.7.0 release notes](https://github.com/n8n-io/nod/releases/tag/nod-v0.7.0) as the style reference. A person or coding agent writes the highlights before starting **Release desktop**. The version PR is the copy review.
+A person or coding agent writes the highlights before starting **Release desktop**. They are the first thing people read about an update, so write them plainly. Use the [v0.8.0 release notes](https://github.com/n8n-io/nod/releases/tag/nod-v0.8.0) as the style reference. The version PR is the copy review. For a minor version, such as 0.9.0, ask product marketing to review the highlights before merging.
 
-- Write for people who use Nod. Lead with the most useful change and what they can try.
-- Keep the copy near 150–250 words. Use two or three short sections for the main changes and a few bullets for smaller fixes.
-- Keep the tone friendly and playful. One or two relevant emoji in headings are enough. Use concrete examples, such as renaming invoices in Downloads.
-- Use short sentences and direct verbs. Avoid slogans, repeated sentence patterns, abstract promises, and claims such as “game-changing.”
-- Check each claim against changes included since the previous release. State previews and limits. Keep any required upgrade action visible.
+**Who reads them.** Write for someone who runs their own business or a small team and has never opened a terminal. They know what Nod does for them, not how it works inside. Tell them what they can do now, what they will notice, and what they no longer need to worry about.
+
+**What gets a section.** Ask of each change: would we write about it if it were the only change in this release? If yes, it can have a section. If not, give it one bullet under **Also in this release**, or leave it to the changelog. Use at most three sections, and lead with the change most people will use.
+
+**Fix releases.** When no change passes that test, write no sections. Write one short bullet under **Fixed in this release** for each fix that users reported or that many users would notice. Each says what went wrong for the user and what works now, and what to try when that helps. Put any action the user must take first. Keep each bullet to one or two sentences and the note under about 200 words. Leave fixes that only a few setups would notice to the changelog, but never drop a required action.
+
+**Headings.** Say what the user can do or what changed for them, such as “A model for each job” or “Run a schedule right now.” Skip wordplay that hides the subject, such as “Background checks take a breath.” One relevant emoji per heading is enough.
+
+**Plain words.** Describe the effect, not the mechanism. Leave out status codes, error strings, internal component names, services the user never sees, file system names and model internals. Name a service only when the user picks it or sees it in Nod, such as Gmail, Attio or OpenAI. If a detail only helps support, say what to share and where. If a change has no effect the user can notice, leave it to the changelog.
+
+| Instead of                                                                                                  | Write                                                                                                         |
+| ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| After a known connection-service 429 or 503, Gmail waits for its next scheduled inbox check.                | When the connection service turns a request away, Gmail waits for its next check instead of retrying at once. |
+| On managed networks, the local engine uses private CAs trusted by your operating system for Composio HTTPS. | Apps now connect on company networks that use their own security certificates.                                |
+| Unchanged sources skip the monitoring model check.                                                          | Nod no longer spends budget checking apps where nothing changed.                                              |
+| Periodic app checks spread across the five-minute cycle while keeping their cadence.                        | Leave it out. Nothing changes for the user.                                                                   |
+
+**Sentences.** Give each sentence one idea. Most sentences should be 20 words or fewer; split any over 30. Use “you” and direct verbs. Write settings paths as **Settings → Models**. Bold only labels people see in Nod and bullet lead-ins. Don't use em dashes. Call an unfinished feature a preview, not a beta.
+
+**Tone.** Plain first, friendly second. A concrete example or a prompt to try, such as “Try telling Nod: ‘Run my schedules on the light model,’” does more than a joke. Avoid slogans, abstract promises and claims such as “game-changing.”
+
+**Facts.** Check each claim against the changes since the previous release. State previews and limits. Keep any required upgrade action visible. Plain words must not change the claim:
+
+- Don't round a specific case up to a broader one. A fix for clocks that run fast is not a Windows fix, and a usage limit is not “busy.”
+- Don't add advice, steps or numbers the change doesn't support, such as “try again in a few minutes” or “costs less,” unless someone measured it.
+- When a change only adjusts how the model is guided, or wasn't tested against the real service, say what Nod now tries to do, not what it always does.
+
+**Length.** Aim for 120–250 words in a feature release. A fix release is usually shorter, but its length follows the number of fixes.
+
+**Media.**
+
 - Try to create a separate video for each release. If it cannot meet the quality standard, use text notes. Add a compact screenshot, short GIF, or demo link when it helps. Show product UI with synthetic data and label example data. Check that the media loads.
 - Use public media URLs, pinned repository images, or GitHub attachments. Do not add media as a release asset: older app updaters accept at most 30 assets.
 - Leave download links and the commit list to the publisher. Highlights are required Markdown, up to 8 KiB. They can contain media links.
-
-For a small fix release, write a shorter note that says what failed, what now works, and what users can test. The section titles and examples must fit that release.
 
 Nod releases are tagged `nod-v*`. Releases built from this code download metadata and assets from GitHub without an account or bundled credential. The install guide loads its scripts from the public repository. New releases include versioned `nod-install.sh` and `nod-install.ps1` assets; earlier releases do not gain them retroactively. The n8n download service at `webhook/nod/desktop` remains for installed private builds.
 
@@ -239,7 +265,7 @@ The Mac build logs show separate times for signing, notarization, ZIP creation, 
 Drafts are never offered to the installer or the updater.
 
 - Mac and Windows apps check at startup, even when their runtime fails to start, every six hours while open, and after waking if a check is due. **Check for Updates…** checks right away. Linux users install the next bundle; Nod's own update checks are off there.
-- After a failed automatic check, Nod retries after 15 minutes, doubling up to six hours, and the menu shows **Update Failed. Try Again…**.
+- After a failed automatic check, Nod retries after one minute, doubling up to 15 minutes, and the menu shows **Update Failed. Try Again…**.
 - Existing private-service builds try up to three newer releases and offer the first complete one. Public GitHub builds use the latest regular release and fail closed if its platform files are incomplete. The publisher checks all four bundles before publication and returns a release to draft if public asset delivery fails.
 - A Mac app outside Applications offers to move itself there at startup, because it can update itself only from Applications.
 - Updates download in the background. While a runtime pack or Windows installer downloads, the update menu item shows its percentage. On a Mac with a running local VM, Nod tries to load the new runtime's images before restart; a deferred or failed preload leaves that work for startup. Windows applies a changed WSL runtime after restart.
@@ -250,7 +276,7 @@ Drafts are never offered to the installer or the updater.
 - A Windows runtime follows the same rule, plus its own Dockerfile, guest script and build script. When it hasn't changed, the release build downloads the published one, checks it against its manifest and GitHub's asset digest, and runs the full Windows install check on it. A Windows install that already has that runtime then updates with only the installer.
 - The first release built in a new week (from Monday, UTC) rebuilds both runtimes and refetches the images' system packages, such as Chromium, instead of reusing Docker's cached layers. Later releases that week reuse them. A week without a release build ships no refresh.
 - A Windows app refuses a downloaded installer unless n8n GmbH signed it with the `nod-windows` profile.
-- On Windows, the restart runs the verified installer silently over the current install, then opens Nod again. The profile is kept. Nod starts the install script through `Start-Process` and waits for that to succeed before it quits, because a PowerShell process spawned detached from Nod exits before it runs anything. The Windows update check starts its final update from the running fixture app the same way.
+- On Windows, the restart runs the verified installer silently over the current install, then opens Nod again. The installer moves the previous version's `resources` folder aside before it copies the new one and deletes it afterward, so files a release retired don't stay behind; it keeps the runtime archive stored there. If that folder can't be moved because a file in it is open, the installer stops before it replaces the current `resources` folder. The profile is kept. Nod starts the install script through `Start-Process` and waits for that to succeed before it quits, because a PowerShell process spawned detached from Nod exits before it runs anything. The Windows update check starts its final update from the running fixture app the same way.
 
 ## Help with desktop installation
 
@@ -262,7 +288,7 @@ Windows users can run the [PowerShell installer](/get-started/install-desktop/) 
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Not enough storage    | On a Mac, Nod needs the runtime's extracted size plus 512 MiB, and the error says how much to free. On Windows, it needs room for two copies of the expanded computer, its images, the rest of the download and 2 GiB. Free space and retry. Existing data is kept. |
 | Setup was interrupted | Retry it. A stopped download continues where it stopped, unless a Mac had no room to keep the downloaded part.                                                                                                                                                      |
-| It still fails        | Open **Send feedback** in Chat, choose **Bug**, review the selected diagnostic report, and send. If Chat can't open, describe the visible setup error.                                                                                                              |
+| It still fails        | Open **Report bug** in Chat, review the selected diagnostic report, and send. If Chat can't open, select **Report bug** on the setup error screen; if Nod can't restart, select **Show startup log** and describe the visible setup error.                          |
 | Starting over         | Select **Remove all data…** in the **Nod** menu. It deletes the profile and private computer, keeps the runtime, then restarts and opens setup.                                                                                                                     |
 
 The report includes recent messages, tool inputs and results, errors, and app activity after best-effort redaction. Review it for personal details before sending, or untick **Include diagnostic report**. It excludes screenshots, binary data, system prompts, and model thinking. Database and journal sections mark unavailable sources and omitted entries. See [Report contents and limits](/deploy/troubleshooting/#report-contents-and-limits). If preparation fails, select **Continue without report**, then **Send feedback**. Your text and selected attachments stay in the draft; check these for personal information.
@@ -308,6 +334,8 @@ This is an ad-hoc signed local app, not a release. It reuses the cached workspac
 
 The Linux app is a Flatpak preview with the runtime pack inside it. **Build Linux desktop** builds and checks the x64 package. The desktop release workflow calls it and includes its files in the release. You can also run it separately from **Actions** to get the `desktop-linux-x64` artifact. On pull requests, this check runs only for `desktop/flatpak/**`, `desktop/scripts/*linux*.mjs`, and `desktop/test/*linux*.test.mjs`. Shared runtime and build files use standard CI. Run the package workflow from **Actions** when those changes need a Linux package check.
 
+CI installs Flatpak and `flatpak-builder` from the Ubuntu package archive. It does not need an extra package source. The manifest installs Meson libraries in `/app/lib` so QEMU can find its local dependencies.
+
 CI installs the bundle and checks its server imports and native image library inside Flatpak. It does not verify a complete chat, secure storage, desktop integration, or KVM startup. Check those on a Linux desktop before wider distribution. Linux ARM builds are not published.
 
 To build locally, use a 64-bit Linux computer with Docker and `flatpak-builder`. Running a local assistant also needs access to `/dev/kvm`:
@@ -341,7 +369,7 @@ Updates check the new build against n8n's Apple team, or the Windows certificate
 
 GitHub-hosted Mac runners can't run nested virtualization. CI checks binaries and packaging, but it can't prove Nod's private computer boots on a real Mac.
 
-The native update checks cover both Mac key storage names in a disposable Keychain. They check an upgrade from the original name and migration of values saved by 0.4.0. Both paths must keep the vault key, server token, and integration identity. A second read must leave the saved settings unchanged.
+The native update checks cover both Mac key storage names in a disposable Keychain. They check an upgrade from the original name and migration of values saved by 0.4.0. Both paths must keep the vault key, server token, and integration identity. A second read must leave the saved settings unchanged. The install case also opens the old app again while it quits to install. That copy must close at once, and the new version must still install and open.
 
 <details>
 

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://nod.n8n.io/docs/schemas/apps/v1/contract.schema.json",
+  "source": "https://linear.app/docs/mcp",
+  "tool": {
+    "name": "list_issues",
+    "description": "List issues that match a query.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": ["query"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  "input": {
+    "query": "synthetic issue"
+  },
+  "output": {
+    "issues": [
+      {
+        "id": "synthetic-issue",
+        "title": "Sample issue"
+      }
+    ]
+  }
+}

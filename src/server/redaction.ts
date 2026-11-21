@@ -1,4 +1,5 @@
-import { modelProviderInfo } from '../shared/models.ts';
+import { addRedactionSpan, redactionMatches, type RedactionSpan } from './redaction-spans.ts';
+export { environmentSecrets } from '../shared/environment-secrets.mjs';
 
 const payloadDefault = 16_384;
 const hidden = '[redacted]';
@@ -13,60 +14,90 @@ const secretAssignment = new RegExp(
   'gi',
 );
 
-const tokenShapes = String.raw`\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b|-----BEGIN [^-]*PRIVATE KEY-----`;
+const privateKeyStart = '-----BEGIN [^-]*PRIVATE KEY-----';
+const privateKeyBlock = new RegExp(
+  privateKeyStart + String.raw`[\s\S]*?-----END [^-]*PRIVATE KEY-----`,
+  'g',
+);
+const bearerToken = /\bBearer\s+[A-Za-z0-9+/_.=:~-]+/gi;
+const basicToken = /\bBasic\s+([A-Za-z0-9+/_.=:-]+)/gi;
+const privateHeader =
+  /\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token)\s*:\s*[^\r\n]+/gi;
+const privateRoute = /((?:https?:\/\/[^\s/"'<>]+)?\/(?:vault|credentials|approvals)\/)[^\s"'<>]+/gi;
+const privateQuery =
+  /([?&#](?:access_token|refresh_token|id_token|token|code|state|key|api_key|secret|password|signature|sig|x-amz-signature|x-amz-credential|x-amz-security-token|x-goog-signature|x-goog-credential)=)[^\s&"'<>]*/gi;
+const privateUserInfo = /(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi;
+const base64Data = /\bdata:[^,\s]+;base64,[A-Za-z0-9+/=]+/g;
+
+const tokenShapes = String.raw`\b(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{12,}|(?:AKIA|ASIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|glpat-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b|${privateKeyStart}`;
 export const secretToken = new RegExp(tokenShapes);
 
-export function environmentSecrets(environment: Record<string, string | undefined>) {
-  const modelKeys = new Set(Object.values(modelProviderInfo).map((provider) => provider.env));
-  const secrets = Object.entries(environment)
-    .filter(
-      ([key]) =>
-        modelKeys.has(key) ||
-        /(?:API_KEY|SECRET|PASSWORD|VAULT_KEY|BOT_TOKEN|ACCESS_TOKEN|AUTH_TOKEN|FEEDBACK_TOKEN|TRACES_TOKEN|UPDATES_TOKEN)$/.test(
-          key,
+export function secretField(key: string) {
+  return secretKey.test(key.replace(/[^a-z0-9]/gi, ''));
+}
+
+function validBasic(token: string) {
+  const decoded = Buffer.from(token, 'base64');
+  const encoded = decoded.toString('base64');
+  return decoded.includes(58) && (token === encoded || token === encoded.replace(/=+$/u, ''));
+}
+
+export function secretTextSpans(input: string) {
+  const spans: RedactionSpan[] = [];
+  const whole = (pattern: RegExp, replacement = hidden) =>
+    redactionMatches(
+      input,
+      pattern,
+      (match) => addRedactionSpan(spans, match.index, match.index + match[0].length, replacement),
+      true,
+    );
+  const suffix = (pattern: RegExp, trailing = 0) =>
+    redactionMatches(
+      input,
+      pattern,
+      (match) =>
+        addRedactionSpan(
+          spans,
+          match.index + match[1].length,
+          match.index + match[0].length - trailing,
+          hidden,
         ),
-    )
-    .flatMap(([, value]) => (value ? [value] : []));
-  if (environment.DATABASE_URL) {
-    secrets.push(environment.DATABASE_URL);
-    try {
-      const password = decodeURIComponent(new URL(environment.DATABASE_URL).password);
-      if (password) secrets.push(password);
-    } catch {}
-  }
-  return secrets;
+      true,
+    );
+  const keyStart = new RegExp(privateKeyStart).exec(input);
+  if (keyStart) addRedactionSpan(spans, keyStart.index, input.length, hidden);
+  whole(bearerToken);
+  redactionMatches(
+    input,
+    basicToken,
+    (match) => {
+      if (validBasic(match[1]))
+        addRedactionSpan(spans, match.index, match.index + match[0].length, hidden);
+    },
+    true,
+  );
+  whole(privateHeader);
+  whole(new RegExp(tokenShapes, 'g'));
+  suffix(privateRoute);
+  suffix(privateQuery);
+  suffix(privateUserInfo, 1);
+  suffix(secretAssignment);
+  whole(base64Data, '[binary omitted]');
+  return spans;
 }
 
 export function redactSecretText(value: string): string {
   return value
-    .replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/g, hidden)
-    .replace(
-      /\b(Bearer|Basic)\s+([A-Za-z0-9+/_.=:-]+)/gi,
-      (match, scheme: string, token: string) => {
-        if (scheme.toLowerCase() !== 'basic') return hidden;
-        const decoded = Buffer.from(token, 'base64');
-        const encoded = decoded.toString('base64');
-        return decoded.includes(58) && (token === encoded || token === encoded.replace(/=+$/u, ''))
-          ? hidden
-          : match;
-      },
-    )
-    .replace(
-      /\b(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token)\s*:\s*[^\r\n]+/gi,
-      hidden,
-    )
+    .replace(privateKeyBlock, hidden)
+    .replace(bearerToken, hidden)
+    .replace(basicToken, (match, token: string) => (validBasic(token) ? hidden : match))
+    .replace(privateHeader, hidden)
     .replace(new RegExp(tokenShapes, 'g'), hidden)
-    .replace(
-      /((?:https?:\/\/[^\s/"'<>]+)?\/(?:vault|credentials|approvals)\/)[^\s"'<>]+/gi,
-      '$1[redacted]',
-    )
-    .replace(
-      /([?&#](?:access_token|refresh_token|id_token|token|code|state|key|api_key|secret|password|signature|sig|x-amz-signature|x-amz-credential|x-amz-security-token|x-goog-signature|x-goog-credential)=)[^\s&"'<>]*/gi,
-      '$1[redacted]',
-    )
-    .replace(/(https?:\/\/)[^\s/@]+:[^\s/@]+@/gi, '$1[redacted]@')
+    .replace(privateRoute, '$1[redacted]')
+    .replace(privateQuery, '$1[redacted]')
+    .replace(privateUserInfo, '$1[redacted]@')
     .replace(secretAssignment, '$1[redacted]')
-    .replace(/\bdata:[^,\s]+;base64,[A-Za-z0-9+/=]+/g, '[binary omitted]');
+    .replace(base64Data, '[binary omitted]');
 }
 
 function secretText(secrets: string[], minimumSecretLength = 8) {

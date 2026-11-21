@@ -6,15 +6,9 @@ import {
   type DiscoveredOAuth,
   type DiscoveredOAuthState,
 } from '../../ports/discovered.ts';
-import { publicUrl } from '../agent-browser/network.ts';
-import { safeRemoteFetch } from './remote.ts';
+import { publicHttps, safeRemoteFetch } from './remote.ts';
 
-async function publicSignIn(link: string) {
-  const destination = await publicUrl(link);
-  if (destination.url.protocol !== 'https:')
-    throw new Error('The service sign-in link must use HTTPS.');
-  return destination.url.href;
-}
+const publicSignIn = async (link: string) => (await publicHttps(link)).url.href;
 
 export function createDiscoveredOAuth(
   fetchFn: FetchLike = safeRemoteFetch,
@@ -82,11 +76,26 @@ export function createDiscoveredOAuth(
   }
 
   return {
-    async begin(endpoint, redirectUri, state, scope, clientId) {
+    async begin(endpoint, redirectUri, state, scope, clientId, metadata) {
       const saved: DiscoveredOAuthState = {
         redirectUri,
         ...(scope ? { scope } : {}),
-        ...(clientId ? { clientInformation: { client_id: clientId } } : {}),
+        ...(clientId
+          ? {
+              clientInformation: {
+                client_id: clientId,
+                ...(metadata ? { issuer: metadata.issuer } : {}),
+              },
+            }
+          : {}),
+        ...(metadata
+          ? {
+              discovery: {
+                authorizationServerUrl: metadata.issuer,
+                authorizationServerMetadata: metadata,
+              },
+            }
+          : {}),
       };
       const result = await run(endpoint, saved, { state }, AbortSignal.timeout(30_000));
       if (result.result !== 'REDIRECT' || !result.url)

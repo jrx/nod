@@ -1,4 +1,4 @@
-import { browserErrorCodes } from '../../shared/browser-errors.ts';
+import { browserErrorCodes, browserSignInGuards } from '../../shared/browser-errors.ts';
 import { z } from 'zod';
 import { browserHandoffInput } from '../../shared/browser-handoff.ts';
 import { fileBytes } from '../../shared/files.ts';
@@ -334,6 +334,7 @@ export const browserResponse = z.discriminatedUnion('ok', [
       ok: z.literal(false),
       error: z.union([z.enum(['cancelled', 'locked', 'unavailable']), z.enum(browserErrorCodes)]),
       detail: z.string().optional(),
+      signInGuard: z.enum(browserSignInGuards).optional(),
       metadata: browserMetadata,
     })
     .strict(),

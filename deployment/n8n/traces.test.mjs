@@ -83,6 +83,101 @@ test('the broker forwards at most its per-minute limit across all senders', () =
   assert.equal(json.ok, false);
 });
 
+test('the broker keeps trace join IDs, error types and numeric known costs', () => {
+  for (const source of ['agent', 'curator'])
+    for (const cost of [0, 0.03]) {
+      const metadata = {
+        source,
+        user_id: `local:${id}`,
+        thread_id: 'a'.repeat(32),
+        turn_id: 'b'.repeat(32),
+        cost_usd: cost,
+        error_type: 'quota',
+      };
+      const result = checkTrace(trace({ metadata, error: 'Synthetic quota exceeded.' }), 'nod');
+      assert.equal(result.ok, true);
+      for (const [key, value] of Object.entries(metadata))
+        assert.equal(result.run.extra.metadata[key], value);
+      assert.equal(result.run.error, 'Synthetic quota exceeded.');
+    }
+  for (const cost_usd of [-1, NaN, Infinity, '0.03', null])
+    assert.equal(checkTrace(trace({ metadata: { cost_usd } }), 'nod').ok, false);
+});
+
+test(
+  'the largest producer metadata survives delivery and the broker enforces the 20-key boundary',
+  { timeout: 5000 },
+  async () => {
+    const { createModelTraces } = await import('../../src/server/traces.ts');
+    const { createN8nTraces } = await import('../../src/providers/n8n/traces.ts');
+    const { piModelTrace } = await import('../../src/providers/pi/traces.ts');
+    const { fauxAssistantMessage } = await import('@earendil-works/pi-ai/providers/faux');
+    for (const userId of [undefined, `local:${id}`]) {
+      let receive;
+      const delivered = new Promise((resolve) => {
+        receive = resolve;
+      });
+      const traces = createModelTraces(
+        createN8nTraces({
+          url: 'https://traces.example.test/',
+          token: 'synthetic-trace-token',
+          request: async (_url, request) => {
+            receive(JSON.parse(String(request.body)));
+            return new Response(null, { status: 202 });
+          },
+        }),
+        '0.9.0',
+      );
+      traces.configure({ enabled: true, userId });
+      const message = fauxAssistantMessage('Synthetic answer.');
+      traces.record(
+        piModelTrace(
+          {
+            model: { id: 'fixture-model', provider: 'fixture' },
+            context: { messages: [] },
+            message: {
+              ...message,
+              stopReason: 'error',
+              errorMessage: 'Synthetic refusal. (HTTP 503)',
+              usage: {
+                input: 10,
+                output: 2,
+                cacheRead: 1,
+                cacheWrite: 1,
+                totalTokens: 14,
+                cost: { input: 0.01, output: 0.02, cacheRead: 0.01, cacheWrite: 0.01, total: 0.05 },
+              },
+            },
+            startedAt: new Date().toISOString(),
+            request: { requestPhase: 'response', requestKind: 'regular' },
+          },
+          {
+            source: 'agent',
+            session_id: id,
+            turn_id: id,
+            run_id: id,
+            parent_run_id: id,
+            task: 'plan',
+          },
+        ),
+      );
+      const payload = await delivered;
+      assert.equal(traces.active(), true);
+      assert.equal(checkTrace(payload, 'nod').ok, true);
+      assert.equal(payload.run.metadata.user_id, userId);
+      assert.equal(payload.run.metadata.error_type, 'provider_unavailable');
+      assert.equal(payload.run.metadata.cost_usd, 0.05);
+      const metadata = payload.run.metadata;
+      const names = 'abcdefghijklmnopqrst';
+      for (let index = 0; Object.keys(metadata).length < 20; index++)
+        metadata[`reserved_${names[index]}`] = 'synthetic';
+      assert.equal(checkTrace(payload, 'nod').ok, true);
+      metadata.over_limit = 'synthetic';
+      assert.equal(checkTrace(payload, 'nod').ok, false);
+    }
+  },
+);
+
 test('malformed or oversized traces never reach LangSmith', () => {
   for (const changes of [
     { id: 'not-a-uuid' },

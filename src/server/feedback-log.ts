@@ -167,6 +167,7 @@ function entry(value: unknown): FeedbackLogEntry | null {
 export async function createFeedbackLog(options: {
   dataRoot: string;
   ownerId: string;
+  name?: 'failures';
   sanitize(value: unknown): unknown | Promise<unknown>;
   now?: () => number;
   maxFileBytes?: number;
@@ -180,7 +181,11 @@ export async function createFeedbackLog(options: {
   const snapshotLimit = bounded(options.snapshotLimit, 200, 1, 1000);
   const now = options.now ?? Date.now;
   const parent = join(options.dataRoot, 'feedback-logs');
-  const directory = join(parent, createHash('sha256').update(options.ownerId).digest('hex'));
+  const directory = join(
+    parent,
+    createHash('sha256').update(options.ownerId).digest('hex') +
+      (options.name ? `-${options.name}` : ''),
+  );
   const file = (index: number) => join(directory, `journal-${index}.jsonl`);
   let dropped = 0;
   let truncated = false;

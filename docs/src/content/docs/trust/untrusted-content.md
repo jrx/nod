@@ -35,7 +35,7 @@ What an email, page or file says is its sender's claim, not your word. An email 
 
 Each mail-shaped record gets a separate check on each read. A check never receives another email in the same request. Nod does not reuse an earlier decision. A failed, invalid or missing decision keeps that record private. Nod keeps its sender, recipients, date and IDs, and the read result says how many emails it withheld and why, such as a failed model request with its HTTP status, or a check that took longer than 15 seconds. The model's own error text is never included, because it can repeat email content. Nod then tells you instead of treating those emails as empty.
 
-Nod runs up to six checks at a time and queues the rest. The 15-second limit starts when a check runs, so a large read waits its turn instead of running out of time in the queue. If a check doesn't answer in time, Nod stops the rest of that read's checks, keeps those emails private and frees its place in the queue, even if the model never answers.
+Nod runs up to six checks at a time and queues the rest. The 15-second limit starts when a check runs, so a large read waits its turn instead of running out of time in the queue. If a check doesn't answer in time, Nod keeps that email private and frees its place in the queue, even if the model never answers; the read's other checks continue. Once six checks in a row in one read have run out of time with no answer between them, Nod stops the rest of that read's checks and keeps those emails private, so a model that has stopped answering doesn't hold up the read.
 
 ## Memory ignores outside content
 

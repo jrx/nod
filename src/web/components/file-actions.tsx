@@ -93,11 +93,16 @@ export function FileActions({
   const image = /^image\/(png|jpeg|webp|gif|avif|bmp)$/.test(item.mimeType ?? '');
   useEffect(() => {
     const target =
-      actions.current?.closest<HTMLElement>('.attachment-card,.attachment-image-item') ??
-      actions.current;
+      actions.current?.closest<HTMLElement>(
+        '.attachment-card,.attachment-image-item,.artifact-drawer-panel',
+      ) ?? actions.current;
     if (!target || !desktopFilesAvailable()) return;
     const open = (event: MouseEvent) => {
-      if (selectedText(target)) return;
+      if (
+        selectedText(target) ||
+        (event.target as Element).closest('a[href],input,textarea,select,[contenteditable]')
+      )
+        return;
       event.preventDefault();
       event.stopPropagation();
       void menu();

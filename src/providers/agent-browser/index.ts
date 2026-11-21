@@ -20,6 +20,7 @@ import type {
 } from '../../ports/computer.ts';
 import { BrowserActionError } from '../../ports/computer.ts';
 import { fileBytes } from '../../shared/files.ts';
+import { isEnterKey } from '../../shared/browser-keys.ts';
 import type { BrowserHandoffInput } from '../../shared/browser-handoff.ts';
 import { threadIdentity } from '../../ports/thread-identity.ts';
 import { runProcess, serviceEnvironment } from '../process.ts';
@@ -247,7 +248,12 @@ export function createAgentBrowserComputer(options: {
   const screenStatuses = new Map<string, ReturnType<NonNullable<Computer['screenStatus']>>>();
   const namespace = `sk-${createHash('sha256').update(runtimeRoot).digest('hex').slice(0, 12)}`;
   const uploadRoot = resolve('/tmp/nod-browser-uploads', namespace);
-  const cachePath = (state: BrowserState) => resolve('/tmp/nod-browser-cache', namespace, state.id);
+  const cacheRoot = resolve('/tmp/nod-browser-cache', namespace);
+  const cachePath = (state: BrowserState) => resolve(cacheRoot, state.id);
+  const internalPaths = new RegExp(
+    `(?:${[runtimeRoot, uploadRoot, cacheRoot].map((path) => path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})[^\\s'"]*`,
+    'g',
+  );
   const executable =
     options.executable ?? resolve(process.cwd(), 'node_modules/.bin/agent-browser');
   const run = options.run ?? runProcess;
@@ -598,8 +604,30 @@ export function createAgentBrowserComputer(options: {
         'The workspace browser could not respond. Restart its container and try again.',
       );
     }
+    const reason = typeof response.error === 'string' ? response.error : undefined;
+    const failed = Boolean(result.exitCode) || response.success === false;
+    const known =
+      action !== 'navigate' || response.success !== false || reason === undefined
+        ? undefined
+        : /^Navigation failed: net::ERR_[A-Z_]+/.test(reason)
+          ? new BrowserActionError('browser_navigation_failed')
+          : reason.startsWith('Operation timed out.')
+            ? new DaemonCommandError()
+            : undefined;
     if (action === 'navigate') {
-      await drainInterruptedCommand(state, 'connect', () => daemonSocket(state, options.signal));
+      await drainInterruptedCommand(state, 'connect', () =>
+        daemonSocket(state, options.signal),
+      ).catch((error: unknown) => {
+        if (!failed) throw error;
+        throw (
+          known ??
+          new BrowserActionError(
+            'browser_start_failed',
+            reason &&
+              redactBrowserText(reason, state.secrets).replace(internalPaths, '[browser data]'),
+          )
+        );
+      });
       state.recovered = false;
       state.pageSize = undefined;
       if (viewport)
@@ -609,22 +637,8 @@ export function createAgentBrowserComputer(options: {
           { signal: options.signal },
         );
     }
-    if (
-      action === 'navigate' &&
-      response.success === false &&
-      typeof response.error === 'string' &&
-      /^Navigation failed: net::ERR_[A-Z_]+/.test(response.error)
-    )
-      throw new BrowserActionError('browser_navigation_failed');
-    if (
-      action === 'navigate' &&
-      response.success === false &&
-      typeof response.error === 'string' &&
-      response.error.startsWith('Operation timed out.')
-    )
-      throw new DaemonCommandError();
-    if (result.exitCode || response.success === false)
-      throw new DaemonCommandError(typeof response.error === 'string' ? response.error : undefined);
+    if (known) throw known;
+    if (failed) throw new DaemonCommandError(reason);
     return response.data ?? {};
   }
 
@@ -644,9 +658,15 @@ export function createAgentBrowserComputer(options: {
     try {
       return await command(state, request, options);
     } catch (error) {
-      if (error instanceof DaemonCommandError)
-        throw new BrowserActionError('browser_observation_failed');
-      throw error;
+      if (!(error instanceof DaemonCommandError)) throw error;
+      const scope = request.action === 'snapshot' ? request.selector : undefined;
+      if (typeof scope === 'string') {
+        if (error.detail === `Selector '${scope}' did not match any element`)
+          throw new BrowserActionError('browser_snapshot_scope_missing');
+        if (error.detail?.startsWith(`Invalid selector '${scope}': SyntaxError:`))
+          throw new BrowserActionError('browser_snapshot_scope_invalid');
+      }
+      throw new BrowserActionError('browser_observation_failed');
     }
   }
 
@@ -1063,7 +1083,7 @@ export function createAgentBrowserComputer(options: {
             [input.text, input.url, input.load].filter(Boolean).length !== 1 ||
             (input.load && !['load', 'domcontentloaded', 'networkidle'].includes(input.load))
           )
-            throw new Error('Wait for one of text, url or load.');
+            throw new BrowserActionError('browser_wait_condition_required');
           try {
             await command(
               state,
@@ -1357,34 +1377,77 @@ export function createAgentBrowserComputer(options: {
     submitSelector: string | undefined,
     operation: (devtools: Awaited<ReturnType<typeof openDevtools>>, document: string) => Promise<T>,
     submitOrigins: string[] = [],
+    signal?: AbortSignal,
   ): Promise<T> {
     if (state.injecting) throw new BrowserLockedError();
+    const assertOpen = () => {
+      signal?.throwIfAborted();
+      if (state.closed || state.closing)
+        throw new Error('The browser session has expired. Open the URL again.');
+    };
     state.injecting = true;
     try {
       return await serialize(state, async () => {
-        const devtools = await inspector(state);
+        const devtools = await inspector(state, signal);
         try {
           const document = await checkout(state, devtools);
           state.privateDocument = document;
           state.saved.sensitive = true;
           await saveState(state);
+          assertOpen();
           const result = await operation(devtools, document);
           if (submitSelector && (await devtools.document()) !== document)
             throw new BrowserActionError('browser_card_changed');
           if ((await devtools.document()) === document) {
             if (submitSelector) {
-              const field = await focusField(state, devtools, selector(submitSelector));
+              const control = selector(submitSelector);
+              assertOpen();
+              await devtools.blur();
+              const readyBy = performance.now() + 30_000;
+              for (;;) {
+                assertOpen();
+                if ((await devtools.document()) !== document)
+                  throw new BrowserActionError('browser_card_changed');
+                const { enabled } = z.object({ enabled: z.boolean() }).parse(
+                  await command(
+                    state,
+                    { action: 'isenabled', selector: control },
+                    { signal },
+                  ).catch(async (error) => {
+                    signal?.throwIfAborted();
+                    if (!(error instanceof DaemonCommandError)) throw error;
+                    const changed = await devtools.document().then(
+                      (current) => current !== document,
+                      () => false,
+                    );
+                    signal?.throwIfAborted();
+                    if (changed) throw new BrowserActionError('browser_card_changed');
+                    throw error;
+                  }),
+                );
+                if (enabled) break;
+                if (performance.now() >= readyBy)
+                  throw new BrowserActionError('browser_card_disabled');
+                await delay(100, undefined, { signal });
+              }
+              const field = await focusField(state, devtools, control);
               const origin = new URL(await currentUrl(state)).origin;
               if (
                 (field.origin !== origin && !submitOrigins.includes(field.origin)) ||
                 (await devtools.document()) !== document
               )
                 throw new Error('The submit control is not on this page.');
-              await command(state, {
-                action: 'scrollintoview',
-                selector: selector(submitSelector),
-              });
-              await command(state, { action: 'click', selector: selector(submitSelector) });
+              assertOpen();
+              await command(
+                state,
+                {
+                  action: 'scrollintoview',
+                  selector: control,
+                },
+                { signal },
+              );
+              assertOpen();
+              await command(state, { action: 'click', selector: control }, { signal });
             }
           }
           state.privateDocument = undefined;
@@ -1399,37 +1462,52 @@ export function createAgentBrowserComputer(options: {
     }
   }
 
-  async function injectCredentials(input: CredentialInput): Promise<CredentialSubmission> {
+  async function injectCredentials(
+    input: CredentialInput,
+    signal?: AbortSignal,
+  ): Promise<CredentialSubmission> {
+    signal?.throwIfAborted();
     const state = browsers.get(threadIdentity(input.threadId));
     if (!state?.started) throw new Error('The browser session has expired. Reopen the login page.');
     if (browserUrl(input.origin).origin !== input.origin)
       throw new Error('An exact login origin is required.');
     const fields = credentialFields(input);
-    return privateEntry(state, input.submitSelector, async (devtools, document) => {
-      if (new URL(await currentUrl(state)).origin !== input.origin)
-        throw new Error('The page is not on the website for this login.');
-      for (const step of fields) {
-        const secret = input.kind === 'otp' ? input.code! : step.value;
-        const identifier = input.kind === 'identifier' || step.value === input.username;
-        if (!identifier) state.secrets.add(secret);
-        const field = await focusField(state, devtools, step.selector);
-        if (field.origin !== input.origin)
-          throw new Error('The login field is on a different origin.');
-        if (step.code) {
-          if (!(await devtools.code(field, step.selector, step.value)))
-            throw new Error('The code fields changed during private entry.');
-          continue;
+    return privateEntry(
+      state,
+      input.submitSelector,
+      async (devtools, document) => {
+        if (new URL(await currentUrl(state)).origin !== input.origin)
+          throw new Error('The page is not on the website for this login.');
+        for (const step of fields) {
+          signal?.throwIfAborted();
+          const secret = input.kind === 'otp' ? input.code! : step.value;
+          const identifier = input.kind === 'identifier' || step.value === input.username;
+          if (!identifier) state.secrets.add(secret);
+          const field = await focusField(state, devtools, step.selector);
+          if (field.origin !== input.origin)
+            throw new Error('The login field is on a different origin.');
+          signal?.throwIfAborted();
+          if (step.code) {
+            if (!(await devtools.code(field, step.selector, step.value)))
+              throw new Error('The code fields changed during private entry.');
+            continue;
+          }
+          if (!(await devtools.arm(field)))
+            throw new Error('The login field is no longer available.');
+          if (
+            (await devtools.document()) !== document ||
+            !(await devtools.insert(field, step.value))
+          )
+            throw new Error(
+              'The login field changed during entry. Check the result before another attempt.',
+            );
         }
-        if (!(await devtools.arm(field)))
-          throw new Error('The login field is no longer available.');
-        if ((await devtools.document()) !== document || !(await devtools.insert(field, step.value)))
-          throw new Error(
-            'The login field changed during entry. Check the result before another attempt.',
-          );
-      }
-      await saveState(state);
-      return { status: 'submitted' as const };
-    });
+        await saveState(state);
+        return { status: 'submitted' as const };
+      },
+      [],
+      signal,
+    );
   }
 
   async function privateDocumentOpen(state: BrowserState, signal?: AbortSignal) {
@@ -1559,7 +1637,8 @@ export function createAgentBrowserComputer(options: {
     });
   }
 
-  async function fillCard(input: CardEntry): Promise<void> {
+  async function fillCard(input: CardEntry, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     const state = browsers.get(threadIdentity(input.threadId));
     if (!state?.started) throw new Error('The checkout page is no longer open.');
     if (state.injecting) throw new BrowserLockedError();
@@ -1610,6 +1689,7 @@ export function createAgentBrowserComputer(options: {
       async (devtools, document) => {
         if (document !== input.document) throw new BrowserActionError('browser_card_changed');
         for (const step of steps) {
+          signal?.throwIfAborted();
           const privateValue = step.field === 'number' || step.field === 'securityCode';
           if (privateValue) for (const value of step.values) state.secrets.add(value);
           const selection = fields[step.field]!;
@@ -1620,6 +1700,7 @@ export function createAgentBrowserComputer(options: {
           );
           if (field.origin !== input.destinations[step.field])
             throw new BrowserActionError('browser_card_site');
+          signal?.throwIfAborted();
           const tag = await devtools.arm(field, privateValue);
           if (!tag) throw new BrowserActionError('browser_card_field');
           if (tag === 'SELECT') {
@@ -1633,6 +1714,7 @@ export function createAgentBrowserComputer(options: {
         }
       },
       steps.map((step) => input.destinations[step.field]!),
+      signal,
     );
   }
 
@@ -1669,7 +1751,14 @@ export function createAgentBrowserComputer(options: {
       .object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() })
       .passthrough()
       .parse(await command(state, { action: 'boundingbox', selector: `@${ref}` }));
-    return { pixel: { x: box.x + box.width / 2, y: box.y + box.height / 2 } };
+    const control = state.refs.get(ref);
+    const same = [...state.refs.values()].filter(
+      (item) => item.role === control?.role && item.name === control.name,
+    );
+    return {
+      pixel: { x: box.x + box.width / 2, y: box.y + box.height / 2 },
+      ...(same.length === 1 ? { control } : {}),
+    };
   }
 
   async function submissionOf(
@@ -1706,7 +1795,7 @@ export function createAgentBrowserComputer(options: {
             : { focused: step.action === 'type' };
     const { controls, identity: sourceIdentity } = await controlsOf(state, target);
     const enter =
-      (step.action === 'press' && step.key === 'Enter') ||
+      (step.action === 'press' && isEnterKey(step.key)) ||
       (step.action === 'type' && /[\r\n]/.test(step.text ?? ''));
     const submits =
       step.action === 'click' || enter ? await submissionOf(state, target, enter) : undefined;
@@ -1846,38 +1935,52 @@ export function createAgentBrowserComputer(options: {
   ) {
     signal?.throwIfAborted();
     if (browserUrl(origin).origin !== origin || !methods.length || methods.length > 10)
-      throw new BrowserActionError('browser_target_changed');
+      throw new BrowserActionError('browser_target_changed', undefined, 'invalid_request');
     const state = await recoverBrowser(id);
-    if (!state?.started || state.saved.navigationFailed)
-      throw new BrowserActionError('browser_target_changed');
+    if (!state?.started)
+      throw new BrowserActionError('browser_target_changed', undefined, 'browser_unavailable');
+    if (state.saved.navigationFailed)
+      throw new BrowserActionError('browser_target_changed', undefined, 'navigation_failed');
     return serialize(state, async () => {
       state.signInMethods = undefined;
       signal?.throwIfAborted();
       if (state.injecting || (await privateDocumentOpen(state, signal)))
         throw new BrowserLockedError();
       if (originOf(await currentUrl(state, signal)) !== origin)
-        throw new BrowserActionError('browser_target_changed');
+        throw new BrowserActionError('browser_target_changed', undefined, 'origin_changed');
       const devtools = await inspector(state, signal);
       try {
         const document = await checkout(state, devtools);
         const controls = new Map<string, BoundSignInControl>();
         const choices: { id: string; label: string; page: BrowserPage }[] = [];
-        for (const method of methods) {
+        for (const [index, method] of methods.entries()) {
           signal?.throwIfAborted();
           const target = selector(method.selector);
           const ref = referenceOf(target);
           const observed = ref ? state.refs.get(ref) : undefined;
-          if (ref && !observed) throw new BrowserActionError('browser_target_changed');
-          const control = await devtools.signInControl(
-            ref ? await pointOf(state, ref) : { selector: target },
+          if (ref && !observed)
+            throw new BrowserActionError('browser_target_changed', undefined, 'reference_missing');
+          const refused = (guard: BrowserActionError['signInGuard']) =>
+            new BrowserActionError(
+              'browser_sign_in_choice',
+              `Choice ${index + 1} of ${methods.length}.`,
+              guard,
+            );
+          const control = await (async () =>
+            devtools.signInControl(ref ? await pointOf(state, ref) : { selector: target }))().catch(
+            (error: unknown) => {
+              throw error instanceof BrowserActionError && error.code === 'browser_sign_in_choice'
+                ? refused(error.signInGuard)
+                : error;
+            },
           );
+          if (control.origin !== origin) throw refused('choice_foreign_origin');
           if (
-            control.origin !== origin ||
             [...controls.values()].some(
               (previous) => previous.backendNodeId === control.backendNodeId,
             )
           )
-            throw new BrowserActionError('browser_target_changed');
+            throw new BrowserActionError('browser_target_changed', undefined, 'choice_duplicate');
           const methodId = randomUUID();
           controls.set(methodId, control);
           const page: BrowserPage = {
@@ -1898,11 +2001,11 @@ export function createAgentBrowserComputer(options: {
           };
           const bound = page.controls![0]!;
           if (observed && (observed.role !== bound.role || observed.name !== bound.name))
-            throw new BrowserActionError('browser_target_changed');
+            throw new BrowserActionError('browser_target_changed', undefined, 'control_changed');
           choices.push({ id: methodId, label: bound.name, page });
         }
         if ((await devtools.document()) !== document)
-          throw new BrowserActionError('browser_target_changed');
+          throw new BrowserActionError('browser_target_changed', undefined, 'document_changed');
         state.signInMethods = { document, origin, controls };
         return { document, methods: choices };
       } finally {
@@ -1918,29 +2021,39 @@ export function createAgentBrowserComputer(options: {
   ) {
     signal?.throwIfAborted();
     const state = browsers.get(threadIdentity(id));
-    if (!state?.started) throw new BrowserActionError('browser_target_changed');
+    if (!state?.started)
+      throw new BrowserActionError('browser_target_changed', undefined, 'browser_unavailable');
     await serialize(state, async () => {
       signal?.throwIfAborted();
       const batch = state.signInMethods;
       state.signInMethods = undefined;
       const control = batch?.controls.get(input.methodId);
-      if (
-        !batch ||
-        !control ||
-        batch.origin !== input.origin ||
-        batch.document !== input.document ||
-        state.saved.navigationFailed
-      )
-        throw new BrowserActionError('browser_target_changed');
+      if (!batch)
+        throw new BrowserActionError('browser_target_changed', undefined, 'selection_missing');
+      if (!control)
+        throw new BrowserActionError('browser_target_changed', undefined, 'selection_unknown');
+      if (batch.origin !== input.origin)
+        throw new BrowserActionError(
+          'browser_target_changed',
+          undefined,
+          'selection_origin_changed',
+        );
+      if (batch.document !== input.document)
+        throw new BrowserActionError(
+          'browser_target_changed',
+          undefined,
+          'selection_document_changed',
+        );
+      if (state.saved.navigationFailed)
+        throw new BrowserActionError('browser_target_changed', undefined, 'navigation_failed');
       if (state.injecting || (await privateDocumentOpen(state, signal)))
         throw new BrowserLockedError();
       const devtools = await inspector(state, signal);
       try {
-        if (
-          (await checkout(state, devtools)) !== batch.document ||
-          originOf(await currentUrl(state, signal)) !== batch.origin
-        )
-          throw new BrowserActionError('browser_target_changed');
+        if ((await checkout(state, devtools)) !== batch.document)
+          throw new BrowserActionError('browser_target_changed', undefined, 'document_changed');
+        if (originOf(await currentUrl(state, signal)) !== batch.origin)
+          throw new BrowserActionError('browser_target_changed', undefined, 'origin_changed');
         signal?.throwIfAborted();
         await devtools.selectSignInControl(control);
       } finally {

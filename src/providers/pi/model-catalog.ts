@@ -7,8 +7,10 @@ import {
   cloudflareGatewayPattern,
   modelProviderInfo,
   modelProviderNames,
+  type OpenAIRegion,
   type ModelProvider,
 } from '../../shared/models.ts';
+import { openAIBaseUrl } from '../openai/api.ts';
 
 const modelId = z
   .string()
@@ -28,6 +30,71 @@ const catalogEndpoints = {
   together: 'https://api.together.xyz/v1/models',
   nvidia: 'https://integrate.api.nvidia.com/v1/models',
 } as const;
+
+export function openAIModels(region: OpenAIRegion = 'global'): Model<'openai-responses'>[] {
+  const rate = region === 'global' ? 1 : 1.1;
+  return [
+    {
+      id: 'gpt-6.2-sol',
+      name: 'GPT-6.2 Sol',
+      cost: { input: 2, output: 10, cacheRead: 0.1, cacheWrite: 2.5 },
+    },
+    {
+      id: 'gpt-6.2-astra',
+      name: 'GPT-6.2 Astra',
+      cost: { input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 },
+    },
+  ].map((model) => ({
+    ...model,
+    provider: 'openai',
+    api: 'openai-responses',
+    baseUrl: openAIBaseUrl(region),
+    reasoning: true,
+    input: ['text', 'image'],
+    contextWindow: 1_050_000,
+    maxTokens: 128_000,
+    cost: {
+      input: model.cost.input * rate,
+      output: model.cost.output * rate,
+      cacheRead: model.cost.cacheRead * rate,
+      cacheWrite: model.cost.cacheWrite * rate,
+      tiers: [
+        {
+          inputTokensAbove: 272_000,
+          input: model.cost.input * 2 * rate,
+          output: model.cost.output * 1.5 * rate,
+          cacheRead: model.cost.cacheRead * 2 * rate,
+          cacheWrite: model.cost.cacheWrite * 2 * rate,
+        },
+      ],
+    },
+    thinkingLevelMap: {
+      off: null,
+      minimal: null,
+      low: 'low',
+      medium: 'medium',
+      high: 'high',
+      xhigh: 'xhigh',
+      max: 'max',
+    },
+    compat: {
+      supportsStrictMode: true,
+      supportsOpenAIGrammarTools: true,
+      supportsAdditionalTools: true,
+      supportsToolSearch: true,
+      supportsMidConvoSystemMessages: true,
+      supportsExplicitPromptCacheMode: true,
+      supportsMidConvoEffort: true,
+    },
+    inputLimits: {
+      maxRequestBytes: 536_870_912,
+      images: {
+        maxPerRequest: 1500,
+        resize: { maxWidth: 2000, maxHeight: 2000, maxBytes: 4_718_592, jpegQuality: 80 },
+      },
+    },
+  }));
+}
 
 export const nativeAudioModel: Model<'openai-completions'> = {
   id: 'gpt-audio-1.5',

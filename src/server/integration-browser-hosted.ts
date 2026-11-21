@@ -7,6 +7,8 @@ import {
 } from '../ports/integrations.ts';
 import { logFailure } from './failure-log.ts';
 
+export const integrationPrivacyNotice = `<p>App data that Nod reads or sends passes through this connection service and Composio. This includes email content for Gmail and Outlook. Both services can read this content. By default, n8n runs the connection service.</p><p>Retention depends on the connection service's settings and Composio plan. When Zero Data Retention is on for the project, covered calls keep request arguments, response data and error text out of Composio execution logs. Composio still processes calls and keeps metadata. Calls through Composio Managed OAuth apps need Enterprise for this coverage. Files, triggers and tool searches have separate rules.</p><p><a href="https://nod.n8n.io/docs/trust/privacy/#composio-zero-data-retention" target="_blank" rel="noopener noreferrer">Read about data handling and retention</a></p>`;
+
 const token = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const input = z
   .object({
@@ -25,7 +27,7 @@ function page(
     '<',
     '\\u003c',
   );
-  return String.raw`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect your app · Nod</title><style nonce="${nonce}">:root{color-scheme:light dark}body{font:16px system-ui;margin:0;min-height:100svh;display:grid;place-items:center;background:light-dark(#fafafa,#191919);color:light-dark(#191919,#fafafa)}main{max-width:360px;padding:32px;text-align:center}h1{font-size:21px;font-weight:550;letter-spacing:-.4px}p{line-height:1.6;color:light-dark(#676767,#bfbfbf)}button{font:inherit;padding:12px 20px;border:0;border-radius:8px;background:light-dark(#191919,#fafafa);color:light-dark(#fafafa,#191919);cursor:pointer}button:disabled{opacity:.5;cursor:default}</style></head><body><main><h1>Connect your app</h1><p id="status" role="status">Keep this page open while you sign in.</p><button id="connect" type="button">Continue to sign in</button></main><script nonce="${nonce}">
+  return String.raw`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect your app · Nod</title><style nonce="${nonce}">:root{color-scheme:light dark}body{font:16px system-ui;margin:0;min-height:100svh;display:grid;place-items:center;background:light-dark(#fafafa,#191919);color:light-dark(#191919,#fafafa)}main{max-width:360px;padding:32px;text-align:center}h1{font-size:21px;font-weight:550;letter-spacing:-.4px}p{line-height:1.6;color:light-dark(#676767,#bfbfbf)}button{font:inherit;padding:12px 20px;border:0;border-radius:8px;background:light-dark(#191919,#fafafa);color:light-dark(#fafafa,#191919);cursor:pointer}button:disabled{opacity:.5;cursor:default}a{color:inherit;text-underline-offset:3px}</style></head><body><main><h1>Connect your app</h1>${integrationPrivacyNotice}<p id="status" role="status">Review the data path, then continue to the service’s permission screen.</p><button id="connect" type="button">Continue to sign in</button></main><script nonce="${nonce}">
 const {brokerOrigin,id,expiresAt,bridgeKey}=${values};
 const button=document.getElementById('connect');
 const status=document.getElementById('status');
@@ -88,7 +90,14 @@ export function createHostedIntegrationBrowser(origin: string): IntegrationConne
       const capability = randomBytes(32).toString('base64url');
       const url = `${origin}/api/apps/connect/${capability}`;
       const expiresAt = Date.now() + 10 * 60_000;
-      const timer = setTimeout(() => finish(id), expiresAt - Date.now());
+      const timer = setTimeout(() => {
+        const attempt = attempts.get(capability);
+        if (attempt)
+          logFailure('app_connection_expired', undefined, {
+            step: attempt.remote ? 'consent' : attempt.bootstrapped ? 'start' : 'open',
+          });
+        finish(id);
+      }, expiresAt - Date.now());
       timer.unref();
       attempts.set(capability, {
         id,

@@ -45,8 +45,10 @@ Passkeys are turned off in Nod's browser, because your passkeys live on your own
 | What's stored   | Username and password, encrypted by Vault             | The browser profile: cookies and site storage |
 | How you add it  | **Add → Login**, an import or the private form        | Sign in once in Nod's browser                 |
 | How Nod uses it | The server types the values into the fields Nod picks | Nod opens the signed-in profile               |
-| Where it works  | Fields on the login's exact origin                    | Any public website, never your local network  |
+| Where it works  | Saved origin and its matching root/`www` origin       | Any public website, never your local network  |
 | Best for        | Username and password sign-in                         | Sign-ins you do by hand, such as magic links  |
+
+The two login origins must use the same protocol and port. The [Vault matching rules](/trust/vault/#website-matching) define which host pairs apply.
 
 Like the rest of Nod's browser, a saved profile reaches only public addresses: never your computer, your local network or other containers.
 

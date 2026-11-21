@@ -17,7 +17,7 @@ export function Privacy({ arrived, onNext, onBack, nextLabel, traces, usageShare
             14 days, never used to train AI.
           </Bubble>,
         ]
-      : [<Bubble>Conversation traces aren’t available in this version of Nod.</Bubble>]),
+      : []),
     ...(usageShared
       ? [
           <Bubble>

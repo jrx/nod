@@ -1133,6 +1133,54 @@ input[type='range']:disabled {
   font-size: var(--text-control);
   padding: 8px 0;
 }
+.live-line {
+  min-width: 0;
+}
+.live-line > summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 28px;
+  list-style: none;
+  cursor: pointer;
+}
+.live-line > summary::-webkit-details-marker {
+  display: none;
+}
+.live-line > summary::marker {
+  content: '';
+}
+.live-line > summary > svg {
+  flex: none;
+  color: var(--muted-foreground);
+}
+.live-line[open] > summary > svg {
+  transform: rotate(180deg);
+}
+.live-line > ol {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 2px;
+  padding: 0 0 0 12px;
+  border-left: 1px solid var(--border);
+  list-style: none;
+  color: var(--muted-foreground);
+  font-size: var(--text-control);
+  line-height: 1.5;
+}
+.live-line > ol > li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.live-line > ol > li > svg {
+  flex: none;
+}
+.live-line-site {
+  color: var(--text-secondary);
+}
 .thinking-dots {
   display: flex;
   gap: 4px;

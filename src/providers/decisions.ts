@@ -176,6 +176,10 @@ export function createDecisionModel(options: {
       if (!connection || options.configured?.() === false) return undefined;
       const service = services[connection.provider];
       const model = connection.model ?? service.model;
+      const url =
+        connection.provider === 'openai'
+          ? `${openAIBaseUrl(connection.region)}/decisions`
+          : service.url;
       const {
         instructions,
         input,
@@ -252,11 +256,9 @@ export function createDecisionModel(options: {
       );
       const started = performance.now();
       let dispatched = false;
+      let failure = 'decision_transport';
+      let httpStatus: number | undefined;
       try {
-        const url =
-          connection.provider === 'openai'
-            ? `${openAIBaseUrl(connection.region)}/decisions`
-            : service.url;
         const requestSignal = AbortSignal.any([
           AbortSignal.timeout(45_000),
           ...(signal ? [signal] : []),
@@ -273,18 +275,26 @@ export function createDecisionModel(options: {
           signal: requestSignal,
           body: requestBody,
         });
+        httpStatus = response.status;
         if (!response.ok) {
+          failure = 'decision_http';
           if (connection.provider === 'openai')
             throw await openAIRequestError(response, connection.key);
+          void response.body?.cancel().catch(() => {});
           throw new Error();
         }
+        failure = 'decision_response';
+        const text = await response.text();
+        failure = 'decision_json';
+        const value = JSON.parse(text);
+        failure = 'decision_validation';
         const body = z
           .object({
             answers: z.unknown(),
             usage: usageSchema,
             model: z.unknown().optional(),
           })
-          .parse(await response.json());
+          .parse(value);
         usage = body.usage;
         const answers =
           connection.provider === 'openai'
@@ -341,8 +351,20 @@ export function createDecisionModel(options: {
         };
       } catch (error) {
         status = signal?.aborted ? 'cancelled' : 'failed';
-        if (error instanceof ModelServiceError) throw error;
-        throw new Error('The decision service could not complete the check.');
+        signal?.throwIfAborted();
+        if (error instanceof ModelServiceError) {
+          Object.assign(error, { code: failure });
+          throw error;
+        }
+        throw Object.assign(new Error('The decision service could not complete the check.'), {
+          code: failure,
+          ...(typeof httpStatus === 'number' &&
+          Number.isInteger(httpStatus) &&
+          httpStatus >= 100 &&
+          httpStatus <= 599
+            ? { status: httpStatus }
+            : {}),
+        });
       } finally {
         const cacheRead =
           connection.provider === 'openai' ? (usage?.input_tokens_details?.cached_tokens ?? 0) : 0;

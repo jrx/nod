@@ -79,9 +79,15 @@ export function trustDecision(words: TrustWords) {
   };
 }
 
+const identifier = /[@/\\]|[\p{L}\p{N}]\p{M}*\.[\p{L}\p{N}]/u;
+
 const plain = (text: string) =>
   text
-    .normalize('NFKC')
+    .normalize('NFKD')
+    .split(/(\s+)/)
+    .map((word) => (identifier.test(word) ? word : word.replace(/(\p{L})[̀-ͯ]+/gu, '$1')))
+    .join('')
+    .normalize('NFC')
     .toLowerCase()
     .replace(/[“”«»„]/g, '"')
     .replace(/[‘’‚]/g, "'")
@@ -113,6 +119,7 @@ export function trustBasis(
     'NOD_schedule_pause',
     'NOD_schedule_cancel',
     'NOD_limits_update',
+    'NOD_bug_report_send',
     'NOD_notification_preferences_update',
     'NOD_memory_forget',
     'NOD_memory_control',
@@ -121,13 +128,8 @@ export function trustBasis(
   const command = action?.arguments?.command;
   const requiresQuote =
     settings ||
-    [
-      'NOD_sign_in',
-      'NOD_browser_session',
-      'NOD_vault_allow',
-      'LOCAL_FILES_READ',
-      'LOCAL_FILES_IMPORT',
-    ].includes(action?.name ?? '') ||
+    ['NOD_sign_in', 'NOD_browser_session', 'NOD_vault_allow'].includes(action?.name ?? '') ||
+    opensContent(action?.name) ||
     (action?.name === 'NOD_browser' &&
       (action.arguments?.step === 'upload' ||
         (command &&
@@ -141,7 +143,7 @@ export function trustBasis(
       : undefined;
   const quote = because
     .trim()
-    .replace(/^["'“”«»„‘’‚]+|["'“”«»„‘’‚.!?…]+$/gu, '')
+    .replace(/^["'“”«»„‘’‚.…]+|["'“”«»„‘’‚.!?…]+$/gu, '')
     .trim();
   const needle = plain(quote);
   if (!needle) return undefined;
@@ -199,4 +201,8 @@ export function becauseOf(
   if ((basis.kind === 'message' || (basis.kind === 'schedule' && basis.messageId)) && !said)
     return undefined;
   return { kind: basis.kind, text: basis.quote };
+}
+
+export function opensContent(action: string | undefined) {
+  return ['LOCAL_FILES_READ', 'LOCAL_FILES_IMPORT', 'COMPUTER_OPEN'].includes(action ?? '');
 }

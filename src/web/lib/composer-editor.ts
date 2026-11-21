@@ -6,8 +6,20 @@ import { TableKit } from '@tiptap/extension-table';
 import TaskList from '@tiptap/extension-task-list';
 import TaskItem from '@tiptap/extension-task-item';
 import { Fragment, Slice } from '@tiptap/pm/model';
-import { Plugin } from '@tiptap/pm/state';
+import { AllSelection, Plugin, TextSelection } from '@tiptap/pm/state';
 import { safeMessageLink } from './message-links';
+
+const touchKeyboardQuery = '(hover: none) and (pointer: coarse)';
+
+export function touchKeyboard() {
+  return typeof window !== 'undefined' && window.matchMedia?.(touchKeyboardQuery).matches === true;
+}
+
+export function subscribeTouchKeyboard(change: () => void) {
+  const query = typeof window === 'undefined' ? undefined : window.matchMedia?.(touchKeyboardQuery);
+  query?.addEventListener('change', change);
+  return () => query?.removeEventListener('change', change);
+}
 
 export function clipboardFiles(clipboard: DataTransfer): File[] {
   const files = Array.from(clipboard.files ?? []);
@@ -28,6 +40,28 @@ function plainTextPasteSlice(editor: Editor, value: string) {
       ...(line ? [schema.text(line, [raw])] : []),
     ]);
   return new Slice(Fragment.from(schema.nodes.paragraph.create(null, content)), 1, 1);
+}
+
+function linkPastedUrl(editor: Editor, value: string) {
+  const url = value.trim();
+  if (!/^https?:\/\//i.test(url) || /\p{White_Space}/u.test(url)) return false;
+  const { selection: current, doc, schema } = editor.state;
+  const selection =
+    current instanceof AllSelection ? TextSelection.between(current.$from, current.$to) : current;
+  if (
+    !(selection instanceof TextSelection) ||
+    selection.empty ||
+    !selection.$from.sameParent(selection.$to) ||
+    selection.$from.parent.type.spec.code ||
+    !doc.textBetween(selection.from, selection.to).trim() ||
+    doc.rangeHasMark(selection.from, selection.to, schema.marks.code)
+  )
+    return false;
+  const link = safeMessageLink(url, window.location.origin);
+  if (!link) return false;
+  const chain = editor.chain();
+  if (selection !== current) chain.setTextSelection({ from: selection.from, to: selection.to });
+  return chain.unsetMark('rawPaste').setLink({ href: link.href }).run();
 }
 
 export function createComposerExtensions(callbacks: {
@@ -107,7 +141,14 @@ export function createComposerExtensions(callbacks: {
                   event.keyCode === 229
                 )
                   return false;
-                if (event.shiftKey || event.altKey) {
+                if (
+                  event.shiftKey ||
+                  event.altKey ||
+                  (callbacks.mode !== 'feedback' &&
+                    touchKeyboard() &&
+                    !event.metaKey &&
+                    !event.ctrlKey)
+                ) {
                   if (event.metaKey || event.ctrlKey) return false;
                   const { $from, empty } = view.state.selection;
                   const item = $from.depth > 0 ? $from.node(-1).type.name : undefined;
@@ -137,6 +178,12 @@ export function createComposerExtensions(callbacks: {
                 if (files.length) callbacks.upload(files);
                 if (text) {
                   const value = text.replace(/\r\n?/g, '\n');
+                  if (
+                    callbacks.mode !== 'feedback' &&
+                    !files.length &&
+                    linkPastedUrl(editor, value)
+                  )
+                    return true;
                   const { tr, selection } = view.state;
                   const code = Boolean(selection.$from.parent.type.spec.code);
                   if (code) tr.insertText(value);

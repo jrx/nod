@@ -18,6 +18,7 @@ export function ServiceLogo({
   const [failed, setFailed] = useState<string[]>([]);
   const base = slug.replace(/_mcp$/, '');
   const source = [
+    logoUrl?.startsWith('/api/apps/catalog/') ? logoUrl : undefined,
     bundled.has(base) ? `/logos/${base}.svg` : undefined,
     logoUrl,
     connectionId ? `/api/apps/${encodeURIComponent(connectionId)}/icon` : undefined,

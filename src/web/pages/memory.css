@@ -192,6 +192,7 @@
   font-size: var(--text-body);
   font-weight: 500;
   line-height: 1.6;
+  white-space: pre-wrap;
   text-wrap: pretty;
   overflow-wrap: anywhere;
 }

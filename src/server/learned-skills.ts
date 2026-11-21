@@ -78,21 +78,26 @@ export function createLearnedSkills(options: {
   async function prepare(
     draft: { name: string; description: string; body: string },
     sensitive: boolean,
+    signal?: AbortSignal,
   ) {
     if (!options.curator.configured) throw new Error('Learning skills needs the memory model.');
     const reply = prepared.safeParse(
-      await options.curator.curate({
-        task: 'skill',
-        instructions: instructions(sensitive),
-        input: {
-          draft: {
-            name: draft.name,
-            description: options.redact(draft.description),
-            body: options.redact(draft.body),
+      await options.curator.curate(
+        {
+          task: 'skill',
+          instructions: instructions(sensitive),
+          input: {
+            draft: {
+              name: draft.name,
+              description: options.redact(draft.description),
+              body: options.redact(draft.body),
+            },
           },
         },
-      }),
+        signal,
+      ),
     );
+    signal?.throwIfAborted();
     if (!reply.success) throw new Error('The skill could not be prepared. Nothing was saved.');
     if (!reply.data.skill) return undefined;
     const description = skillDescription.safeParse(reply.data.skill.description);
@@ -108,7 +113,9 @@ export function createLearnedSkills(options: {
     raw: unknown,
     turn: string,
     commit: <T>(write: () => Promise<T>) => Promise<T> = (write) => write(),
+    signal?: AbortSignal,
   ) {
+    signal?.throwIfAborted();
     const input = skillInput.parse(raw);
     if (options.builtIn.includes(input.name))
       throw new Error(
@@ -133,7 +140,7 @@ export function createLearnedSkills(options: {
         body: `${current.body.slice(0, at)}${input.new}${current.body.slice(at + input.old.length)}`,
       };
     } else draft = { name: input.name, description: input.description, body: input.body };
-    const skill = await prepare(draft, tree.sensitive);
+    const skill = await prepare(draft, tree.sensitive, signal);
     if (!skill)
       return { status: 'not_saved', reason: 'Nothing reusable remained without personal details.' };
     const saved = await commit(() =>

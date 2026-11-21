@@ -1,0 +1,31 @@
+{
+  "$schema": "https://nod.n8n.io/docs/schemas/apps/v1/contract.schema.json",
+  "source": "https://developers.notion.com/docs/mcp",
+  "tool": {
+    "name": "notion-search",
+    "description": "Search pages by a query.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": ["query"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  "input": {
+    "query": "synthetic page"
+  },
+  "output": {
+    "results": [
+      {
+        "id": "synthetic-page",
+        "title": "Sample page"
+      }
+    ]
+  }
+}

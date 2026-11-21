@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { classifyVerificationReply, securityCodeIn } from '../shared/verification-code.ts';
 import { isMessageReaction } from '../shared/emoji.ts';
 import { transaction } from './transaction.ts';
-import { logFailure } from './failure-log.ts';
+import { logFailure, logRepeatedFailure } from './failure-log.ts';
 import { languageText } from './communication.ts';
 import { ChannelMediaFailure, type ChannelMedia } from './channel-media.ts';
 import type { WorkAdmission } from './work-admission.ts';
@@ -16,18 +16,19 @@ import type { LiveWork } from './activity.ts';
 import { MessagingConnectionError } from '../ports/messaging.ts';
 import type {
   ChannelPairingRequest,
+  InboundApproval,
   InboundMessage,
   InboundReaction,
   MessagingAttachment,
   MessagingTransport,
 } from '../ports/messaging.ts';
-import { loopbackHost } from '../shared/loopback.ts';
 import type { ChatConfirmationInput } from './approvals.ts';
-import { appPagePath, appPages, appPageUrl } from '../shared/app-links.ts';
+import { channelText } from './channel-text.ts';
+import { appPages } from '../shared/app-links.ts';
 import { pendingAnswerChoicesSql } from './answer-choices.ts';
 
 const replyCommand = /^\/(memory|context|usage)(?:@[A-Za-z0-9_]+)?$/i;
-const taskCommand = /^\/(tasks|status|stop)(?:@[A-Za-z0-9_]+)?$/i;
+const taskCommand = /^\/(tasks|status|stop|clear)(?:@[A-Za-z0-9_]+)?$/i;
 
 export type ChannelPresentation =
   | {
@@ -97,6 +98,18 @@ interface ChannelOptions {
     channel: string,
     replyToMessageId?: string,
   ) => Promise<ChatConfirmationInput['answer']>;
+  acceptApproval?: (
+    client: PoolClient,
+    input: {
+      threadId: string;
+      messageId: string;
+      approvalId: string;
+      channel: string;
+      approved: boolean;
+      label?: string;
+      stopSignal?: AbortSignal;
+    },
+  ) => Promise<void>;
   reacted?: (messageId: string, reaction: string | null) => Promise<unknown>;
   subscribe: (listener: () => void) => () => void;
   refresh?: () => void;
@@ -121,9 +134,10 @@ interface ChannelOptions {
   ) => Promise<{ text: string; attachments: Artifact[]; presentation?: ChannelPresentation }>;
   taskCommand?: (
     client: PoolClient,
-    command: 'tasks' | 'status' | 'stop',
+    command: 'tasks' | 'status' | 'stop' | 'clear',
     replyToMessageId?: string,
     hasReply?: boolean,
+    channel?: string,
   ) => Promise<{
     threadId: string;
     replies: Array<{ text: string; replyToMessageId?: string; presentation?: ChannelPresentation }>;
@@ -210,55 +224,6 @@ function inboundMessageId(ownerId: string, sourceId: string) {
   return `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`;
 }
 
-function channelText(text: string) {
-  let secureAction = false;
-  let artifact = false;
-  const privateUrl = (value: string) => {
-    let url: URL;
-    try {
-      url = new URL(value, 'https://nod.invalid');
-    } catch {
-      return false;
-    }
-    if (url.pathname.startsWith('/api/artifacts/')) {
-      artifact = true;
-      return true;
-    }
-    if (loopbackHost(url.hostname)) {
-      secureAction = true;
-      return true;
-    }
-    if (
-      /^\/(?:vault|credentials|payments|approvals)\//.test(url.pathname) ||
-      url.pathname === '/browser' ||
-      (['/vault', '/trust'].includes(url.pathname) && url.searchParams.has('add'))
-    ) {
-      if (!/^https?:\/\//.test(value)) {
-        secureAction = true;
-        return true;
-      }
-    }
-    return false;
-  };
-  const safe = text
-    .replace(
-      /\[((?:\\.|[^\]\\])*)\]\((https?:\/\/[^\s)]+|\/[^\s)]+)\)/g,
-      (match, label: string, url: string) => {
-        const path = appPagePath(url);
-        if (path) {
-          const page = appPages[path as keyof typeof appPages];
-          return `${page && label !== page ? `${label} (${page})` : label}: ${appPageUrl(path)}`;
-        }
-        return privateUrl(url) ? label : match;
-      },
-    )
-    .replace(
-      /https?:\/\/[^\s)]+|\/(?:api\/artifacts|vault|trust|browser|credentials|payments|approvals)[^\s)]*/g,
-      (url) => (privateUrl(url) ? '' : url),
-    );
-  return { text: safe.trim(), secureAction, artifact };
-}
-
 async function presentChannelText(
   threadId: string | null,
   input: ChannelPresentation,
@@ -340,9 +305,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         channel.error &&
         channel.error !== channels.find((previous) => previous.id === channel.id)?.error
       )
-        logFailure('channel_connection_failed', new MessagingConnectionError(channel.error), {
-          provider: channel.id,
-        });
+        logRepeatedFailure(
+          'channel_connection_failed',
+          `${channel.id}:${channel.error}`,
+          new MessagingConnectionError(channel.error),
+          { provider: channel.id },
+        );
     channels = transport.channels.map((channel) => ({
       ...channel,
       allowedSenderIds: [...channel.allowedSenderIds],
@@ -371,6 +339,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   ALTER TABLE channel_inbox ADD COLUMN IF NOT EXISTS conversation_thread_id uuid;
   ALTER TABLE channel_inbox ADD COLUMN IF NOT EXISTS media_usage_ids text[] NOT NULL DEFAULT '{}';
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS provider_message_ids text[] NOT NULL DEFAULT '{}';
+  ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS approval_delivery text
+    CHECK (approval_delivery IN ('buttons','written'));
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS presentation jsonb;
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS claim_id uuid;
   ALTER TABLE channel_outbox ADD COLUMN IF NOT EXISTS live_status text;
@@ -407,7 +377,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   ) {
     const replyId = randomUUID();
     await client.query(
-      "INSERT INTO messages(id,owner_id,role,text,thread_id,attachments,reply_to_message_id) VALUES($1,$2,'assistant',$3,$4,$5,$6)",
+      "INSERT INTO messages(id,owner_id,role,text,thread_id,attachments,reply_to_message_id,created_at) VALUES($1,$2,'assistant',$3,$4,$5,$6,clock_timestamp())",
       [
         replyId,
         ownerId,
@@ -575,6 +545,114 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     ).rows[0]?.message_id;
   }
 
+  async function pendingTelegramApproval(database: Pool | PoolClient, messageId: string) {
+    const { rows } = await database.query<{
+      approval_id: string;
+      thread_id: string;
+      text: string;
+      title: string | null;
+      decline: string | null;
+    }>(
+      `SELECT a.id AS approval_id,m.thread_id,m.text,a.title,a.decline FROM messages m
+       JOIN approvals a ON a.confirmation_message_id=m.id AND a.owner_id=m.owner_id
+         AND a.thread_id=m.thread_id AND a.turn_id=m.turn_id
+       JOIN turns u ON u.id=m.turn_id AND u.owner_id=m.owner_id AND u.thread_id=m.thread_id
+       WHERE m.id=$1 AND m.owner_id=$2 AND m.role='assistant' AND m.hidden_at IS NULL
+         AND m.attachments='[]'::jsonb AND a.status='pending' AND a.action<>'NOD_vault_allow'
+         AND u.status IN ('running','waiting') AND u.handoff_browser_id IS NULL
+       LIMIT 1`,
+      [messageId, ownerId],
+    );
+    const approval = rows[0];
+    if (approval && channelText(approval.text).text === approval.text.trim()) return approval;
+  }
+
+  async function acceptApproval(input: InboundApproval, channelId: string) {
+    if (channelId !== 'telegram' || input.channelId !== channelId) return;
+    const identity = {
+      provider: channelId,
+      account_id: input.accountId,
+      sender_id: input.senderId,
+      thread_id: input.threadId,
+    };
+    const stop = options.stopSignal?.();
+    const signal = stop ? AbortSignal.any([receiving.signal, stop]) : receiving.signal;
+    const messageAccepted = options.messageAccepted?.();
+    const active = () =>
+      !signal.aborted &&
+      !options.admission?.paused &&
+      !options.admission?.closed &&
+      permitted(identity);
+    const record = options.acceptApproval;
+    let result: Parameters<InboundApproval['acknowledge']>[0] = 'unavailable';
+    if (record && active()) {
+      result = await transaction<Parameters<InboundApproval['acknowledge']>[0]>(
+        async (client) => {
+          const route = [ownerId, input.accountId, input.senderId, input.threadId];
+          const { rows } = await client.query<{ message_id: string; state: 'sent' | 'sending' }>(
+            `SELECT o.message_id,o.state FROM channel_outbox o JOIN channel_inbox i ON i.source_id=o.source_id
+           WHERE i.owner_id=$1 AND i.provider='telegram' AND i.account_id=$2
+             AND i.sender_id=$3 AND i.thread_id=$4
+             AND ((o.state='sent' AND o.approval_delivery='buttons' AND o.provider_message_ids=ARRAY[$5::text])
+               OR (o.state='sending' AND EXISTS (SELECT 1 FROM approvals a
+                 WHERE a.confirmation_message_id=o.message_id AND a.owner_id=$1 AND a.status='pending')))
+           ORDER BY (o.state='sent') DESC LIMIT 1`,
+            [...route, input.messageId],
+          );
+          const target = rows[0];
+          if (!target) return 'unavailable';
+          if (target.state === 'sending') return 'retry';
+          const current = await options.activeThread?.(client);
+          const approval = await pendingTelegramApproval(client, target.message_id);
+          if (!approval || (current && current.id !== approval.thread_id) || !active())
+            return 'unavailable';
+          const earlier = await client.query(
+            `SELECT 1 FROM channel_inbox WHERE owner_id=$1 AND provider='telegram' AND account_id=$2
+           AND sender_id=$3 AND thread_id=$4 AND state='pending' LIMIT 1`,
+            route,
+          );
+          if (earlier.rowCount) return 'retry';
+          await record(client, {
+            threadId: approval.thread_id,
+            messageId: target.message_id,
+            approvalId: approval.approval_id,
+            channel: conversationChannel(identity),
+            approved: input.approved,
+            label:
+              approval.title && approval.decline
+                ? input.approved
+                  ? approval.title
+                  : approval.decline
+                : undefined,
+            stopSignal: stop,
+          });
+          return 'recorded';
+        },
+        pool,
+        signal,
+      ).catch((cause: unknown) => {
+        if (signal.aborted) return 'unavailable' as const;
+        if (
+          cause &&
+          typeof cause === 'object' &&
+          'statusCode' in cause &&
+          (cause.statusCode === 404 || cause.statusCode === 409)
+        )
+          return 'unavailable' as const;
+        throw cause;
+      });
+    }
+    if (result === 'recorded') {
+      try {
+        messageAccepted?.(channelId);
+      } catch {}
+      options.refresh?.();
+    }
+    await input.acknowledge(result).catch((cause: unknown) => {
+      logFailure('channel_approval_acknowledgement_failed', cause);
+    });
+  }
+
   async function hiddenReplyTarget(database: Pool | PoolClient, messageId: string) {
     const result = await database.query<{ text: string }>(
       'SELECT text FROM messages WHERE id=$1 AND owner_id=$2 AND hidden_at IS NOT NULL',
@@ -586,12 +664,18 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
   async function acceptMessage(message: InboundMessage, channelId: string) {
     const receiveSignal = receiving.signal;
     const parsed = messageSchema.safeParse(message);
-    if (!parsed.success || parsed.data.channelId !== channelId) return;
+    const dropped = (reason: string) =>
+      logRepeatedFailure('channel_inbound_dropped', `${channelId}:${reason}`, undefined, {
+        provider: channelId,
+        reason,
+      });
+    if (!parsed.success || parsed.data.channelId !== channelId) return dropped('invalid_message');
     const { accountId, senderId, messageId, threadId, sentAt, replyToMessageId } = parsed.data;
     let { text } = parsed.data;
     const identity = { provider: channelId, account_id: accountId, sender_id: senderId };
-    if (closed || replacing || !permitted(identity) || sentAt.getTime() > Date.now() + 300000)
-      return;
+    if (closed || replacing) return;
+    if (!permitted(identity)) return dropped('not_linked');
+    if (sentAt.getTime() > Date.now() + 300000) return dropped('future_timestamp');
     let media: Awaited<ReturnType<ChannelMedia['prepare']>> | undefined;
     try {
       const sourceId = `channel:${channelId}:${accountId}:${messageId}`;
@@ -634,7 +718,9 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           await replyWithoutTurn(
             client,
             { ...identity, sourceId, threadId, sentAt, text: '' },
-            () => ({ text: 'Connect a model service and choose a model in Settings → Models.' }),
+            () => ({
+              text: `Connect a model service and choose a model in ${appPages['/settings/models']}.`,
+            }),
           );
         }, pool);
         options.refresh?.();
@@ -665,6 +751,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           if (text.length > 100_000) throw new ChannelMediaFailure('text_too_long');
         } catch (error) {
           if (closed || replacing || receiveSignal.aborted || !permitted(identity)) return;
+          if (error instanceof ChannelMediaFailure && error.cause)
+            logFailure('channel_attachment_unavailable', error.cause);
           if (modelMissingAtIntake || options.modelConfigured?.() === false) {
             await requestModelSetup();
             return;
@@ -978,7 +1066,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     const command =
       !pending.attachments?.length && options.taskCommand
         ? (taskCommand.exec(pending.text.trim())?.[1]?.toLowerCase() as
-            'tasks' | 'status' | 'stop' | undefined)
+            'tasks' | 'status' | 'stop' | 'clear' | undefined)
         : undefined;
     const retiredAnswer =
       permittedBeforeAnswer && retiredBeforeAnswer && hiddenBeforeAnswer && !command
@@ -1060,6 +1148,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           command,
           retiredBeforeAnswer ? undefined : replyToMessageId,
           retiredBeforeAnswer ? command === 'stop' : Boolean(row.provider_reply_id),
+          channel,
         );
         for (const message of reply.replies)
           await saveReply(client, row.source_id, reply.threadId, message);
@@ -1345,6 +1434,11 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
             )
           ).rows[0] as { provider_message_id: string; text: string } | undefined)
         : undefined;
+      const approval =
+        row.provider === 'telegram' &&
+        options.acceptApproval &&
+        text === row.text.trim() &&
+        (await pendingTelegramApproval(pool, row.message_id));
       const post = (database: Pool | PoolClient) => {
         const input = {
           ...(target
@@ -1359,10 +1453,18 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
           accountId: row.account_id,
           threadId: row.thread_id,
           text,
+          ...(approval
+            ? {
+                approval:
+                  approval.title && approval.decline
+                    ? { approve: approval.title, decline: approval.decline }
+                    : { approve: 'Approve', decline: 'Cancel' },
+              }
+            : {}),
           ...(attachments
             ? {
                 attachments,
-                attachmentFailure: async (names: string[]) => {
+                attachmentFailure: async (files: { name: string; reason?: string }[]) => {
                   const notice = await presentChannelText(
                     row.message_thread_id,
                     {
@@ -1370,7 +1472,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
                       text: '',
                       attachments: 'in_nod',
                       secureAction: false,
-                      files: names.map((name) => channelText(name).text),
+                      files: files.map(({ name }) => channelText(name).text),
                     },
                     options.present,
                   );
@@ -1381,7 +1483,12 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
                     !permitted(row)
                   )
                     return undefined;
-                  return notice;
+                  return [
+                    notice,
+                    ...files.flatMap(({ name, reason }) =>
+                      reason ? [channelText(`${name}: ${reason}`).text] : [],
+                    ),
+                  ].join('\n\n');
                 },
               }
             : {}),
@@ -1413,14 +1520,15 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
         return true;
       }
       await pool.query(
-        `WITH sent AS (UPDATE channel_outbox SET state='sent',provider_message_id=$2,provider_message_ids=$3,claim_id=NULL,updated_at=now()
+        `WITH sent AS (UPDATE channel_outbox SET state='sent',provider_message_id=$2,provider_message_ids=$3,approval_delivery=$5,claim_id=NULL,updated_at=now()
            WHERE message_id=$1 AND claim_id=$4 AND state='sending' RETURNING message_id)
-         UPDATE messages m SET delivered_channel=$5 FROM sent WHERE m.id=sent.message_id AND m.owner_id=$6 AND m.turn_id IS NULL`,
+         UPDATE messages m SET delivered_channel=$6 FROM sent WHERE m.id=sent.message_id AND m.owner_id=$7 AND m.turn_id IS NULL`,
         [
           row.message_id,
           sent.id,
           sent.ids ?? [sent.id],
           claimId,
+          approval ? (sent.approvalButtons ? 'buttons' : 'written') : null,
           conversationChannel(row),
           ownerId,
         ],
@@ -1483,7 +1591,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
        WHERE m.owner_id=$1 AND i.provider='telegram' AND o.state='sent'
          AND (th.archived_at IS NULL OR o.live_status IS NOT NULL)
          AND cardinality(o.provider_message_ids)=1 AND m.attachments='[]'::jsonb
-         AND m.presentation IS NULL AND o.presentation IS NULL
+         AND m.presentation IS NULL AND o.presentation IS NULL AND o.approval_delivery IS NULL
          AND (o.live_status IS NOT NULL OR o.message_id=ANY($2::uuid[]))`,
       [ownerId, [...targets.keys()]],
     );
@@ -1721,6 +1829,7 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
               (message) => accept(message, message.channelId),
               completePairing,
               (reaction) => acceptReaction(reaction, reaction.channelId),
+              (approval) => acceptApproval(approval, approval.channelId),
             );
             pollingError = null;
           } catch (cause) {
@@ -1728,7 +1837,11 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
               cause instanceof MessagingConnectionError
                 ? cause.message
                 : 'Channels could not check for new messages. Check the channel setup.';
-            logFailure('channel_poll_failed', cause);
+            logRepeatedFailure(
+              'channel_poll_failed',
+              cause instanceof Error ? cause.message : String(cause),
+              cause,
+            );
           }
           const attempt = async (step: () => Promise<unknown>) => {
             try {
@@ -1868,6 +1981,8 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
             for (const message of result.messages ?? []) await accept(message, channelId);
             for (const reaction of result.reactions ?? [])
               await acceptReaction(reaction, channelId);
+            for (const approval of result.approvals ?? [])
+              await acceptApproval(approval, channelId);
             if (result.messages?.length) void drain();
             if (result.pairing?.channelId === channelId) await completePairing(result.pairing);
           }
@@ -1883,6 +1998,14 @@ export async function createChannels(pool: Pool, options: ChannelOptions) {
     drain,
     close,
     replaceTransport,
+    canDeliverLiteral(channel: string, text: string, literal: string) {
+      const channelId = channel.split(':')[0]!;
+      return (
+        !closed &&
+        !replacing &&
+        (transport.canDeliverLiteral?.({ channelId, text, literal }) ?? false)
+      );
+    },
     announcePairing,
     react,
     async pairing() {

@@ -58,6 +58,7 @@ import {
 import { stagedLoginBrowser } from './login-fixture.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { accessCookie, accessKey } from '../src/server/access.ts';
+import { withFailureLog } from '../src/ports/failure-log.ts';
 
 // Shared helpers
 
@@ -220,7 +221,7 @@ test(
         [randomUUID(), nextTurnId],
       );
       const fallback = (await request('/api/browser')).json();
-      assert.equal(fallback.currentBrowser.threadId, next.id);
+      assert.equal(fallback.currentBrowser.browserId, next.id);
 
       fail = false;
       const click = { type: 'mouse', event: 'down', x: 0.5, y: 0.25, button: 'left' };
@@ -635,6 +636,81 @@ function result(response: BrowserResponse) {
   return response.ok ? response.result : undefined;
 }
 
+for (const kind of ['login', 'card'] as const)
+  test(`private ${kind} cancellation crosses the browser bridge without a later submission`, async () => {
+    const entered = deferred();
+    const release = deferred();
+    let operationSignal: AbortSignal | undefined;
+    let submissions = 0;
+    const wait = async (signal?: AbortSignal) => {
+      operationSignal = signal;
+      entered.resolve();
+      await release.promise;
+      signal?.throwIfAborted();
+      submissions++;
+    };
+    const fixture = await harness({
+      computer: fakeComputer({
+        injectCredentials: async (_input, signal) => {
+          await wait(signal);
+          return { status: 'submitted' };
+        },
+        fillCard: async (_input, signal) => {
+          await wait(signal);
+        },
+      }),
+    });
+    const computer = fixture.client(`/synthetic/private-${kind}`);
+    const controller = new AbortController();
+    const pending =
+      kind === 'login'
+        ? computer.injectCredentials(
+            {
+              threadId: 'task',
+              origin: 'https://example.com',
+              kind: 'password',
+              password: 'Synthetic bridge password',
+              passwordSelector: '#password',
+              submitSelector: '#submit',
+            },
+            controller.signal,
+          )
+        : computer.fillCard(
+            {
+              threadId: 'task',
+              fields: { number: '#number' },
+              document: 'synthetic-document',
+              destinations: { number: 'https://example.com' },
+              submitSelector: '#submit',
+              card: {
+                cardNumber: '4111111111111111',
+                expiryMonth: 12,
+                expiryYear: 2099,
+                cardholder: 'Synthetic owner',
+              },
+            },
+            controller.signal,
+          );
+    const rejected = assert.rejects(pending, /cancelled/);
+    try {
+      await entered.promise;
+      assert.ok(operationSignal);
+      assert.equal(operationSignal.aborted, false);
+      controller.abort();
+      for (let attempt = 0; !operationSignal.aborted && attempt < 100; attempt++) await delay(10);
+      assert.equal(operationSignal.aborted, true);
+      release.resolve();
+      await rejected;
+      assert.equal(submissions, 0);
+      await assert.rejects(computer.act('task', { action: 'snapshot' }), /unavailable/);
+      assert.ok(await computer.act('task', { action: 'open', url: 'https://example.com/reopen' }));
+    } finally {
+      release.resolve();
+      await rejected;
+      await fixture.close();
+    }
+  });
+
 test('quiesce refuses a pending request without aborting or querying its browser', async () => {
   const entered = deferred();
   const release = deferred();
@@ -880,7 +956,7 @@ for (const action of ['snapshot', 'click'] as const)
       browser.fail('snapshot', upstreamError);
       const before = browser.actions.length;
       await assert.rejects(
-        computer.act('fixture', { action, ...(action === 'click' ? { selector: 'button' } : {}) }),
+        computer.act('fixture', { action, selector: 'button' }),
         (error: unknown) => {
           assert.ok(error instanceof BrowserActionError);
           assert.equal(error.code, 'browser_observation_failed');
@@ -945,6 +1021,8 @@ test('a card goes only into the approved fields on the approved sites and stays 
       }
       if (command[0] === 'get' && command[1] === 'url') data = { url };
       if (command[0] === 'get' && command[1] === 'cdp-url') data = { cdpUrl: devtools.url };
+      if (command[0] === 'is' && command[1] === 'enabled')
+        data = { enabled: Boolean(model.frameOf[command[2]!]) };
       if (command[0] === 'get' && command[1] === 'attr')
         data = {
           value: command[3] === 'autocomplete' ? (autocomplete[command[2]!] ?? null) : null,
@@ -1275,7 +1353,8 @@ async function runtimeFixture(
   const runtime = createAgentRuntime({ agent, computer, workspace: fakeWorkspace() });
   const context: RuntimeContext = {
     threadId,
-    sessionId: threadId,
+    sessionId: randomUUID(),
+    background: true,
     turnId: randomUUID(),
     prompt: 'Open the synthetic destination after dismissing its covering dialog.',
     history: [],
@@ -1671,6 +1750,112 @@ test('a failed workspace browser action names only Nod-authored reasons', async 
   }
 });
 
+test('sign-in refusal guards cross the worker boundary without private values or merged causes', async () => {
+  const privateValue = 'picker-private@example.test/private-selector';
+  let failure: Error;
+  const failures: unknown[] = [];
+  const fixture = await harness({
+    computer: {
+      ...syntheticComputer(),
+      signInMethods: async () => {
+        throw failure;
+      },
+    },
+  });
+  try {
+    const computer = fixture.client('/synthetic/sign-in-guard');
+    const inspect = () =>
+      withFailureLog(
+        (event, error, context) => failures.push({ event, error, context }),
+        () =>
+          computer.signInMethods!('task', 'https://example.test', [
+            { label: privateValue, selector: `[data-account="${privateValue}"]` },
+          ]),
+      );
+    for (const guard of ['control_changed', 'choice_duplicate'] as const) {
+      failure = Object.assign(new BrowserActionError('browser_target_changed', undefined, guard), {
+        cause: privateValue,
+      });
+      await assert.rejects(inspect(), (error: unknown) => {
+        assert.ok(error instanceof BrowserActionError);
+        assert.equal(error.signInGuard, guard);
+        assert.equal(error.code, 'browser_target_changed');
+        assert.equal(error.detail, undefined);
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+    }
+    assert.deepEqual(
+      failures.map((failure) => Object(failure).context.signInGuard),
+      ['control_changed', 'choice_duplicate'],
+    );
+    failure = Object.assign(new Error(privateValue), { signInGuard: 'control_covered' });
+    await assert.rejects(inspect(), (error: unknown) => {
+      assert.equal(Object(error).signInGuard, 'control_covered');
+      assert.equal(
+        Object(error).message,
+        'The workspace browser could not complete this action. Try again.',
+      );
+      return true;
+    });
+    failure = Object.assign(new Error(privateValue), { signInGuard: privateValue });
+    await assert.rejects(inspect(), (error: unknown) => {
+      assert.equal(Object(error).signInGuard, undefined);
+      assert.ok(
+        !JSON.stringify(
+          Object.getOwnPropertyNames(error).map((key) => Object(error)[key]),
+        ).includes(privateValue),
+      );
+      return true;
+    });
+    assert.equal(Object(failures.at(-1)).context.signInGuard, undefined);
+    assert.ok(!JSON.stringify(failures).includes(privateValue));
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('a browser that fails to start reports why through the workspace browser', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'nod-browser-start-failure-'));
+  let failure = (args: string[]) =>
+    `Chrome exited early (exit code: 21) for ${args[args.indexOf('--profile') + 1]} and ${/--disk-cache-dir=([^,]+)/.exec(args.join(' '))?.[1]}`;
+  const fixture = await harness({
+    computer: createAgentBrowserComputer({
+      dataRoot: directory,
+      headless: true,
+      run: async (_executable, args) => ({
+        exitCode: args.includes('info') ? 0 : 1,
+        stderr: '',
+        stdout: JSON.stringify(
+          args.includes('info')
+            ? { success: true, data: { active: false } }
+            : {
+                success: false,
+                error: failure(args),
+              },
+        ),
+      }),
+    }),
+  });
+  try {
+    await assert.rejects(
+      fixture.client(directory).act('fixture', { action: 'open', url: 'https://example.com/' }),
+      {
+        message:
+          'The workspace browser could not start, so no page opened. The browser said: Chrome exited early (exit code: 21) for [browser data] and [browser data]',
+      },
+    );
+    failure = () => 'Navigation failed: net::ERR_NAME_NOT_RESOLVED';
+    await assert.rejects(
+      fixture.client(directory).act('fixture', { action: 'open', url: 'https://example.com/' }),
+      { message: new BrowserActionError('browser_navigation_failed').message },
+    );
+  } finally {
+    await fixture.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 async function interruptedBrowser(fixture: Awaited<ReturnType<typeof harness>>, dataRoot: string) {
   const computer = fixture.client(dataRoot, { timeoutMs: 200, drainTimeoutMs: 20 });
   await computer.act('task', { action: 'snapshot' });
@@ -2027,6 +2212,116 @@ test('visual browser actions fence the session when releasing the pointer fails'
 });
 
 describe('native browser controls', { concurrency: 3 }, () => {
+  test(
+    'the browser bridge reports invalid wait conditions and keeps the page usable',
+    {
+      skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true' || process.platform !== 'linux',
+      timeout: 30_000,
+    },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-wait-'));
+      const server = createHttpServer((_request, response) => {
+        response.setHeader('content-type', 'text/html');
+        response.end('<p>Results ready</p>');
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const bridge = await harness({
+        computer: createAgentBrowserComputer({
+          ...containerBrowserOptions(directory),
+          privateNetwork: true,
+        }),
+      });
+      const computer = bridge.client('/synthetic/browser-wait');
+      try {
+        const url = `http://127.0.0.1:${address.port}/`;
+        await computer.act('fixture', { action: 'open', url });
+        for (const args of [{ waitMs: 3000 }, { text: 'Results ready', load: 'load' as const }])
+          await assert.rejects(computer.act('fixture', { action: 'wait', ...args }), {
+            name: 'BrowserActionError',
+            code: 'browser_wait_condition_required',
+          });
+        const ready = await computer.act('fixture', { action: 'wait', text: 'Results ready' });
+        assert.equal(ready.url, url);
+        assert.match(ready.text, /Results ready/);
+        assert.doesNotMatch(ready.text, /condition was not met/);
+        const timeout = await computer.act('fixture', {
+          action: 'wait',
+          text: 'An absent result',
+          waitMs: 50,
+        });
+        assert.equal(timeout.url, url);
+        assert.match(timeout.text, /condition was not met/);
+        assert.match(timeout.text, /Results ready/);
+      } finally {
+        await bridge.close();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test(
+    'a rejected snapshot scope preserves the page and reports its reason across the bridge',
+    {
+      skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true' || process.platform !== 'linux',
+      timeout: 30_000,
+    },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-snapshot-scope-'));
+      const server = createHttpServer((_request, response) => {
+        response.setHeader('content-type', 'text/html');
+        response.end(
+          '<article id="summary"><button>Continue</button></article><aside>Outside scope</aside>',
+        );
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const bridge = await harness({
+        computer: createAgentBrowserComputer({
+          ...containerBrowserOptions(directory),
+          privateNetwork: true,
+        }),
+      });
+      const computer = bridge.client('/synthetic/snapshot-scope');
+      try {
+        const url = `http://127.0.0.1:${address.port}/`;
+        await computer.act('fixture', { action: 'open', url });
+        const missing = '[data-region="synthetic-private-value"]';
+        const snapshot = (selector?: string) =>
+          computer.act('fixture', { action: 'snapshot', selector });
+        const rejectScope = (selector: string, code: string) =>
+          assert.rejects(snapshot(selector), (error: unknown) => {
+            assert.ok(error instanceof BrowserActionError);
+            assert.equal(error.code, code);
+            assert.equal(error.detail, undefined);
+            assert.doesNotMatch(error.message, /synthetic-private-value/);
+            return true;
+          });
+        await rejectScope(missing, 'browser_snapshot_scope_missing');
+        assert.ok((await computer.screenshot('fixture'))?.length);
+        await rejectScope(missing, 'browser_snapshot_scope_missing');
+        await rejectScope(
+          '[data-region="synthetic-private-value"]]',
+          'browser_snapshot_scope_invalid',
+        );
+        const scoped = await snapshot('#summary');
+        assert.match(scoped.text, /Continue/);
+        assert.doesNotMatch(scoped.text, /Outside scope/);
+        const recovered = await snapshot();
+        assert.equal(recovered.url, url);
+        assert.match(recovered.text, /Continue/);
+        assert.match(recovered.text, /Outside scope/);
+      } finally {
+        await bridge.close();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   test(
     'native container browser stays responsive, streams live frames and refuses passkeys after heavy stderr output',
     {
@@ -2593,6 +2888,152 @@ test('a password typed through the handoff in several pauses hides only the fini
 });
 
 test(
+  'native browser targets keep their own name before named ancestor context',
+  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-target-name-native-'));
+    const server = createHttpServer((_request, response) => {
+      response.setHeader('content-type', 'text/html');
+      response.end(`<title>Synthetic target names</title>
+        <style>#blank{position:fixed;left:0;top:0;width:20vw;height:20vh}body{padding-top:25vh}</style>
+        <form aria-label="Named form"><button type="button" id="form-button"></button></form>
+        <section role="region" aria-label="Named region"><button id="blank"></button><input id="field"></section>
+        <button id="named">Named exact button<div id="child"></div></button>
+        <div id="custom" role="treeitem" aria-label="Named custom target" tabindex="0"></div>
+        <form action="/submit" method="post" aria-label="Known form"><input id="known"></form>`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const origin = `http://127.0.0.1:${address.port}`;
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+    });
+    try {
+      await computer.act('target-name', { action: 'open', url: origin });
+      for (const [selector, ancestor] of [
+        ['#form-button', 'Named form'],
+        ['#blank', 'Named region'],
+        ['#child', 'Named exact button'],
+      ]) {
+        const page = await computer.currentPage('target-name', { action: 'click', selector });
+        assert.equal(page.controls?.[0]?.name, '', selector);
+        assert.ok(
+          page.controls?.slice(1).some(({ name }) => name === ancestor),
+          selector,
+        );
+        assert.match(page.target!, /^[0-9a-f]{64}$/);
+      }
+      for (const step of [
+        { action: 'click', x: 0.05, y: 0.05 },
+        {
+          action: 'click',
+          points: [
+            { x: 0.05, y: 0.05 },
+            { x: 0.05, y: 0.05 },
+          ],
+        },
+      ] satisfies BrowserAction[]) {
+        const page = await computer.currentPage('target-name', step);
+        assert.equal(page.controls?.[0]?.name, '');
+        assert.equal(page.controls?.[1]?.name, 'Named region');
+      }
+      await computer.act('target-name', { action: 'fill', selector: '#field', text: 'synthetic' });
+      for (const step of [
+        { action: 'press', key: 'Enter' },
+        { action: 'type', text: 'synthetic\n' },
+      ] satisfies BrowserAction[]) {
+        const page = await computer.currentPage('target-name', step);
+        assert.deepEqual(page.controls?.[0], { role: 'textbox', name: '' });
+        assert.equal(page.controls?.[1]?.name, 'Named region');
+        assert.equal(page.submits, undefined);
+      }
+      for (const [selector, name] of [
+        ['#named', 'Named exact button'],
+        ['#custom', 'Named custom target'],
+      ]) {
+        const page = await computer.currentPage('target-name', { action: 'click', selector });
+        assert.equal(page.controls?.[0]?.name, name);
+      }
+      await computer.act('target-name', { action: 'fill', selector: '#known', text: 'synthetic' });
+      const known = await computer.currentPage('target-name', { action: 'press', key: 'Enter' });
+      assert.deepEqual(known.controls?.[0], { role: 'textbox', name: '' });
+      assert.equal(known.controls?.[1]?.name, 'Known form');
+      assert.deepEqual(known.submits, { method: 'POST', to: `${origin}/submit` });
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  'native coordinate targets follow normal pointer hit testing',
+  { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'nod-pointer-target-native-'));
+    const requests: string[] = [];
+    const server = createHttpServer((request, response) => {
+      if (request.method === 'POST' || request.url?.startsWith('/overlay')) {
+        requests.push(`${request.method} ${request.url}`);
+        response.writeHead(204).end();
+        return;
+      }
+      const named = request.url === '/named';
+      response.setHeader('content-type', 'text/html');
+      response.end(`<title>Synthetic pointer target</title>
+        <style>button{position:fixed;inset:0;width:100vw;height:100vh;border:0}#overlay{pointer-events:none;opacity:.2}</style>
+        <form method="post" action="/actual-${named ? 'named' : 'blank'}"><button${named ? ' aria-label="Named actual target"' : ''}></button></form>
+        <form method="get" action="/overlay"><button id="overlay" aria-label="Named overlay">Named overlay</button></form>`);
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== 'string');
+    const computer = createAgentBrowserComputer({
+      dataRoot: directory,
+      browserExecutable: process.env.NOD_TEST_BROWSER_EXECUTABLE,
+      privateNetwork: true,
+      headless: true,
+    });
+    try {
+      const expected: string[] = [];
+      for (const named of [false, true]) {
+        await computer.act('pointer-target', {
+          action: 'open',
+          url: `http://127.0.0.1:${address.port}/${named ? 'named' : 'blank'}`,
+        });
+        const step: BrowserAction = { action: 'click', x: 0.5, y: 0.5 };
+        const page = await computer.currentPage('pointer-target', step);
+        assert.ok(page.target);
+        assert.deepEqual(page.controls?.[0], {
+          role: 'button',
+          name: named ? 'Named actual target' : '',
+        });
+        assert.deepEqual(page.submits, {
+          method: 'POST',
+          to: `http://127.0.0.1:${address.port}/actual-${named ? 'named' : 'blank'}`,
+        });
+        assert.deepEqual(requests, expected);
+        await computer.act('pointer-target', { ...step, expectTarget: page.target });
+        expected.push(`POST /actual-${named ? 'named' : 'blank'}`);
+        for (let i = 0; i < 500 && requests.length < expected.length; i++) await delay(10);
+        assert.deepEqual(requests, expected);
+      }
+    } finally {
+      await computer.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   'native secure entry completes single and split OTP controls without maxlength hints',
   { skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true', timeout: 60_000 },
   async () => {
@@ -2786,6 +3227,693 @@ test('the owner time zone and region reach a new browser launch without injectin
   }
 });
 
+test('feedback redaction checks original text and structure before masking', async (t) => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  type Probe = {
+    id: string;
+    input: unknown;
+    secrets?: string[];
+    names?: string[];
+    privateParts: string[];
+    kept?: string[];
+    omitted?: boolean;
+  };
+
+  const path = '/Users/Synthetic Owner/PrivateLedger.docx';
+  const url = 'https://synthetic.invalid/PrivateLedger.docx';
+  const email = 'PrivateMailbox@synthetic.invalid';
+  const opaque = 'PrivateOpaqueValue';
+  const payload = JSON.stringify({ payload: opaque });
+  const password = JSON.stringify({ password: opaque });
+  const unicode = '{"pass\\u0077ord":"PrivateOpaqueValue"}';
+  const tuple = ['Authorization', opaque];
+  const keyHeader = ['-----BEGIN', 'PRIVATE', 'KEY-----'].join(' ');
+  const keyFooter = ['-----END', 'PRIVATE', 'KEY-----'].join(' ');
+  const cases: Probe[] = [
+    { id: 'path-control', input: path, privateParts: ['Synthetic Owner', 'PrivateLedger'] },
+    {
+      id: 'path-slash-secret',
+      input: path,
+      secrets: ['/'],
+      privateParts: ['Synthetic Owner', 'PrivateLedger'],
+    },
+    {
+      id: 'path-name-root',
+      input: path,
+      names: ['Users'],
+      privateParts: ['Synthetic Owner', 'PrivateLedger'],
+    },
+    { id: 'url-control', input: url, privateParts: ['synthetic.invalid', 'PrivateLedger'] },
+    {
+      id: 'url-slash-secret',
+      input: url,
+      secrets: ['/'],
+      privateParts: ['synthetic.invalid', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-url-control',
+      input: encodeURIComponent(url),
+      privateParts: ['synthetic.invalid', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-url-slash-secret',
+      input: encodeURIComponent(url),
+      secrets: ['/'],
+      privateParts: ['synthetic.invalid', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-path-control',
+      input: encodeURIComponent(path),
+      privateParts: ['Synthetic Owner', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-path-slash-secret',
+      input: encodeURIComponent(path),
+      secrets: ['/'],
+      privateParts: ['Synthetic', 'PrivateLedger'],
+    },
+    { id: 'email-control', input: email, privateParts: ['PrivateMailbox', 'synthetic.invalid'] },
+    {
+      id: 'email-at-secret',
+      input: email,
+      secrets: ['@'],
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'encoded-email-control',
+      input: encodeURIComponent(email),
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'encoded-email-at-secret',
+      input: encodeURIComponent(email),
+      secrets: ['@'],
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'literal-overlap-control',
+      input: 'AlphaBridgeOmega',
+      secrets: ['AlphaBridgeOmega'],
+      privateParts: ['Alpha', 'Bridge', 'Omega'],
+    },
+    {
+      id: 'literal-overlap',
+      input: 'AlphaBridgeOmega',
+      secrets: ['AlphaBridge', 'BridgeOmega'],
+      privateParts: ['Alpha', 'Bridge', 'Omega'],
+    },
+    {
+      id: 'object-password-control',
+      input: { password: opaque },
+      secrets: ['pass'],
+      privateParts: [opaque],
+    },
+    { id: 'json-password-control', input: password, privateParts: [opaque] },
+    { id: 'json-password-quote-secret', input: password, secrets: ['"'], privateParts: [opaque] },
+    {
+      id: 'embedded-password-quote-secret',
+      input: `failed: ${password}`,
+      secrets: ['"'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'wrapped-password-quote-secret',
+      input: JSON.stringify(password),
+      secrets: ['"'],
+      privateParts: [opaque],
+    },
+    { id: 'json-unicode-password-control', input: unicode, privateParts: [opaque] },
+    {
+      id: 'json-unicode-password-backslash-secret',
+      input: unicode,
+      secrets: ['\\'],
+      privateParts: [opaque],
+    },
+    { id: 'object-vault-key-control', input: { vaultKey: opaque }, privateParts: [opaque] },
+    {
+      id: 'object-vault-key-literal',
+      input: { vaultKey: opaque },
+      secrets: ['vault'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'object-master-key-literal',
+      input: { masterKey: opaque },
+      secrets: ['master'],
+      privateParts: [opaque],
+    },
+    { id: 'tuple-control', input: tuple, privateParts: [opaque] },
+    {
+      id: 'private-tuple-tail',
+      input: ['Authorization', opaque, 'PrivateTrailingValue'],
+      privateParts: [opaque, 'PrivateTrailingValue'],
+    },
+    {
+      id: 'private-tuple-tail-with-literal',
+      input: ['Authorization', opaque, 'PrivateTrailingValue'],
+      secrets: ['Author'],
+      privateParts: [opaque, 'PrivateTrailingValue'],
+    },
+    {
+      id: 'encoded-secret-key',
+      input: { 'pass%77ord': opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-tuple-label',
+      input: ['Authoriz%61tion', opaque],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-escaped-tuple-label',
+      input: ['"\\u0041uthorization"', opaque],
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-name-alias',
+      input: { 'n%61me': 'Authorization', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-media-alias',
+      input: { 't%79pe': 'image', data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-media-value',
+      input: { type: 'im%61ge', data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-data-alias',
+      input: { type: 'image', 'd%61ta': opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-name-vault-alias',
+      input: { 'n%61me': 'vaultKey', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-media-value-with-literal',
+      input: { type: '"\\u0069mage"', data: opaque },
+      secrets: ['"'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-uri-named-value',
+      input: { name: '"vault%4Bey"', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'invalid-tuple-label',
+      input: ['Authoriz%61tion%ZZ', opaque, 'PrivateTrailingValue'],
+      privateParts: [opaque, 'PrivateTrailingValue'],
+    },
+    {
+      id: 'invalid-media-label',
+      input: { type: 'im%61ge%ZZ', data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'decoded-object-tuple-label',
+      input: [encodeURIComponent('{"password":"PrivateInnerValue"}'), opaque],
+      privateParts: [opaque, 'PrivateInnerValue'],
+    },
+    {
+      id: 'decoded-array-tuple-label',
+      input: [encodeURIComponent('["token","public"]'), opaque],
+      privateParts: [opaque],
+    },
+    {
+      id: 'decoded-object-media-label',
+      input: { type: encodeURIComponent('{"type":"image"}'), data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'raw-structured-entry-is-not-a-tuple-label',
+      input: ['{"password":"PrivateInnerValue"}', 'Public scalar detail'],
+      privateParts: ['PrivateInnerValue'],
+      kept: ['Public scalar detail'],
+    },
+    {
+      id: 'raw-bracketed-entry-keeps-public-tail',
+      input: ['[notice]', 'Public scalar detail'],
+      privateParts: [],
+      kept: ['[notice]', 'Public scalar detail'],
+    },
+    {
+      id: 'metadata-uri-depth-limit',
+      input: [
+        Array.from({ length: 3 }).reduce<string>(
+          (value) => encodeURIComponent(value),
+          'Authoriz%61tion',
+        ),
+        opaque,
+      ],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-json-depth-limit',
+      input: [
+        Array.from({ length: 11 }).reduce<string>(
+          (value) => JSON.stringify(value),
+          'Authorization',
+        ),
+        opaque,
+      ],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-byte-limit',
+      input: [JSON.stringify(' '.repeat(31_981) + '"Authorization"'), opaque],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-count-limit',
+      input: Array.from({ length: 100 }, (_, index) => [
+        ' '.repeat(index) + '%41uthorization',
+        opaque,
+      ]),
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-after-rendered-field-limit',
+      input: Object.assign(
+        { value: opaque, data: opaque },
+        Object.fromEntries(Array.from({ length: 100 }, (_, index) => ['field' + index, index])),
+        { name: 'Authorization', type: 'image' },
+      ),
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-name-after-field-limit',
+      input: Object.assign(
+        { value: opaque },
+        Object.fromEntries(Array.from({ length: 99 }, (_, index) => ['field' + index, index])),
+        { 'n%61me': 'Authorization' },
+      ),
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'encoded-type-after-field-limit',
+      input: Object.assign(
+        { data: opaque },
+        Object.fromEntries(Array.from({ length: 99 }, (_, index) => ['field' + index, index])),
+        { 't%79pe': 'image' },
+      ),
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'safe-object-below-field-limit',
+      input: Object.assign(
+        { status: 503 },
+        Object.fromEntries(Array.from({ length: 98 }, (_, index) => ['field' + index, index])),
+      ),
+      privateParts: [],
+      kept: ['"status":503', '"field97":97'],
+    },
+    {
+      id: 'safe-object-at-field-limit',
+      input: Object.assign(
+        { status: 503 },
+        Object.fromEntries(Array.from({ length: 99 }, (_, index) => ['field' + index, index])),
+      ),
+      privateParts: [],
+      kept: ['"status":503', '"field98":98'],
+    },
+    {
+      id: 'oversized-encoded-name-key',
+      input: { value: opaque, ['n%61me' + '-'.repeat(195)]: 'Authorization' },
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'oversized-encoded-media-key',
+      input: { data: opaque, ['t%79pe' + '-'.repeat(195)]: 'image' },
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'safe-key-below-length-limit',
+      input: { status: 503, ['x'.repeat(199)]: 'Useful technical value' },
+      privateParts: [],
+      kept: ['"status":503', 'Useful technical value'],
+    },
+    {
+      id: 'safe-key-at-length-limit',
+      input: { status: 503, ['x'.repeat(200)]: 'Useful technical value' },
+      privateParts: [],
+      kept: ['"status":503', 'Useful technical value'],
+    },
+    { id: 'tuple-literal', input: tuple, secrets: ['Author'], privateParts: [opaque] },
+    {
+      id: 'json-tuple-literal',
+      input: JSON.stringify(tuple),
+      secrets: ['Author'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'named-vault-key-control',
+      input: { name: 'vaultKey', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'named-vault-key-literal',
+      input: { name: 'vaultKey', value: opaque },
+      secrets: ['vault'],
+      privateParts: [opaque],
+    },
+    { id: 'cookie-control', input: `Cookie: ${opaque}`, privateParts: [opaque] },
+    {
+      id: 'overlapping-bearer-prefix',
+      input: `Bearer Bearer ${opaque}`,
+      privateParts: [opaque],
+    },
+    {
+      id: 'overlapping-basic-prefix',
+      input: 'Basic Basic ' + Buffer.from('synthetic-user:synthetic-password').toString('base64'),
+      privateParts: [Buffer.from('synthetic-user:synthetic-password').toString('base64')],
+    },
+    {
+      id: 'quoted-then-unquoted-url',
+      input: `"https://public.invalid" https://${opaque}/path`,
+      privateParts: [opaque],
+    },
+    {
+      id: 'overlapping-key-blocks',
+      input: [
+        keyHeader,
+        'SyntheticAlpha',
+        keyHeader,
+        'SyntheticBeta',
+        keyFooter,
+        'SyntheticGamma',
+        keyFooter,
+      ].join('\n'),
+      privateParts: ['SyntheticAlpha', 'SyntheticBeta', 'SyntheticGamma'],
+    },
+    {
+      id: 'unclosed-key-block',
+      input: `HTTP 503: ${keyHeader}\n${opaque}`,
+      privateParts: [opaque],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'quoted-then-unquoted-path',
+      input: '"/home/Synthetic Owner/first.txt" /Users/PrivateOwner/PrivateLedger.docx',
+      privateParts: ['Synthetic Owner', 'PrivateOwner', 'PrivateLedger'],
+    },
+    { id: 'cookie-name', input: `Cookie: ${opaque}`, names: ['Cookie'], privateParts: [opaque] },
+    { id: 'cookie-literal', input: `Cookie: ${opaque}`, secrets: ['Cook'], privateParts: [opaque] },
+    { id: 'json-payload-name', input: payload, names: ['payload'], privateParts: [opaque] },
+    {
+      id: 'object-payload-name',
+      input: { payload: opaque },
+      names: ['payload'],
+      privateParts: [opaque],
+    },
+    { id: 'query-control', input: `?access_token=${opaque}`, privateParts: [opaque] },
+    {
+      id: 'query-literal',
+      input: `?access_token=${opaque}`,
+      secrets: ['access'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'token-control',
+      input: 'sk-proj-PrivateSyntheticTokenAB',
+      privateParts: ['PrivateSyntheticTokenAB'],
+    },
+    {
+      id: 'token-literal',
+      input: 'sk-proj-PrivateSyntheticTokenAB',
+      secrets: ['sk-'],
+      privateParts: ['PrivateSyntheticTokenAB'],
+    },
+    {
+      id: 'binary-control',
+      input: { type: 'image', data: opaque },
+      secrets: ['image'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'technical-control',
+      input: { status: 503, version: '0.8.0', count: 7, message: 'Engine request failed' },
+      privateParts: [],
+    },
+    {
+      id: 'reason-outside-private-span',
+      input: `HTTP 503 for ${email}; attempt 2`,
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+      kept: ['HTTP 503', 'attempt 2'],
+    },
+    {
+      id: 'encoded-email-percent-secret',
+      input: encodeURIComponent(email),
+      secrets: ['%'],
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'encoded-payload',
+      input: encodeURIComponent(payload),
+      privateParts: [opaque],
+    },
+    {
+      id: 'nested-encoded-payload',
+      input: encodeURIComponent(encodeURIComponent(payload)),
+      secrets: ['%'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'invalid-encoded-carrier',
+      input: `${opaque}%41%ZZ`,
+      privateParts: [opaque],
+    },
+    {
+      id: 'percentage-keeps-technical-text',
+      input: 'Upload 45% done; HTTP 503',
+      privateParts: [],
+      kept: ['Upload 45% done; HTTP 503'],
+    },
+    {
+      id: 'encoded-depth-limit',
+      input: Array.from({ length: 5 }).reduce<string>((value) => encodeURIComponent(value), email),
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'decode-count-limit',
+      input: '%41 '.repeat(130) + encodeURIComponent(email),
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'sensitive-relative-route',
+      input: `/api/${opaque}`,
+      secrets: ['api'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-literal-across-key-value',
+      input: JSON.stringify({ field: opaque }),
+      secrets: [`field":"${opaque}`],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-literal-within-value-keeps-reason',
+      input: JSON.stringify({ message: `HTTP 503 for ${opaque}` }),
+      secrets: [opaque],
+      privateParts: [opaque],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'literal-across-embedded-json',
+      input: `failed: ${JSON.stringify({ field: opaque })}`,
+      secrets: [`failed: {"field":"${opaque}`],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-boolean-literal',
+      input: '{"allowed":false}',
+      secrets: ['false'],
+      privateParts: ['false'],
+    },
+    {
+      id: 'literal-overlap-unicode',
+      input: '😀BridgeΩ',
+      secrets: ['😀Bridge', 'BridgeΩ'],
+      privateParts: ['Bridge', 'Ω'],
+    },
+    {
+      id: 'stack-technical-frame',
+      input: {
+        stack:
+          'Error: HTTP 503\n    at operation (/Users/Synthetic Owner/nod/src/server/worker.ts:12:4)',
+      },
+      privateParts: ['Synthetic Owner', '/Users/'],
+      kept: ['HTTP 503', 'src/server/worker.ts:12:4'],
+    },
+    {
+      id: 'stack-private-frame',
+      input: {
+        stack:
+          'Error: HTTP 503\n    at operation (/Users/Synthetic Owner/nod/src/server/worker.ts:12:4)',
+      },
+      secrets: ['worker'],
+      privateParts: ['Synthetic Owner', '/Users/', 'worker'],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'stack-normalized-private-frame',
+      input: {
+        stack:
+          'Error: HTTP 503\n    at operation (C:\\Synthetic Owner\\nod\\src\\server\\worker.ts:12:4)',
+      },
+      secrets: ['src/server'],
+      privateParts: ['Synthetic Owner', 'src/server'],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'string-limit',
+      input: 'x'.repeat(32_000) + opaque,
+      privateParts: [opaque],
+    },
+    {
+      id: 'match-limit',
+      input: 'x'.repeat(5000) + opaque,
+      secrets: ['x'],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'fragment-limit',
+      input: '{} '.repeat(33) + opaque,
+      privateParts: [opaque],
+    },
+    {
+      id: 'incomplete-structure',
+      input: `failed: {"payload":"${opaque}"`,
+      privateParts: [opaque],
+    },
+  ];
+
+  for (const probe of cases) {
+    await t.test(probe.id, () => {
+      const redactor = createFeedbackRedactor({
+        secrets: probe.secrets ?? [],
+        profile: { names: probe.names ?? [] },
+      });
+      assert.equal(redactor.isReady(), true);
+      const output = redactor.value(probe.input);
+      const encoded = JSON.stringify(output);
+      assert.deepEqual(
+        probe.privateParts.filter((part) => encoded.includes(part)),
+        [],
+        'A private value remained after feedback redaction.',
+      );
+      for (const kept of probe.kept ?? []) assert.ok(encoded.includes(kept), kept);
+      if (probe.omitted) assert.equal(output, '[unreadable data omitted]');
+      else assert.notEqual(output, '[unreadable data omitted]');
+      if (probe.id === 'technical-control') assert.deepEqual(JSON.parse(encoded), probe.input);
+    });
+  }
+});
+
+test('feedback redaction advances Unicode overlaps and resets recursive checks between calls', async () => {
+  const { execFileSync } = await import('node:child_process');
+  execFileSync(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      `import assert from 'node:assert/strict';
+    import { createFeedbackRedactor } from ${JSON.stringify(new URL('../src/server/feedback-redaction.ts', import.meta.url).href)};
+    const redactor = createFeedbackRedactor({ secrets: [], profile: { names: ['😀😀😀'] } });
+    assert.equal(redactor.text('😀'.repeat(6)), '[owner]');`,
+    ],
+    { timeout: 3000, maxBuffer: 16_000 },
+  );
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const redactor = createFeedbackRedactor({ secrets: ['/', '@'], profile: { names: [] } });
+  const encoded = Array.from({ length: 4 }).reduce<string>(
+    (value) => encodeURIComponent(value),
+    '/Users/Synthetic Owner/PrivateLedger.docx',
+  );
+  const input = {
+    status: 503,
+    message: 'HTTP 503 for PrivateMailbox%40synthetic.invalid',
+    detail: encoded,
+    headers: ['Authoriz%61tion', 'PrivateRecursiveCredential'],
+  };
+  const expected = JSON.stringify(redactor.value(input));
+  assert.ok(expected.includes('HTTP 503'));
+  for (const privateValue of [
+    'PrivateMailbox',
+    'synthetic.invalid',
+    'Synthetic Owner',
+    'PrivateLedger',
+    'PrivateRecursiveCredential',
+  ])
+    assert.ok(!expected.includes(privateValue), privateValue);
+  for (let index = 0; index < 8; index++) {
+    redactor.text('%41 '.repeat(130) + encoded);
+    assert.equal(JSON.stringify(redactor.value(input)), expected);
+  }
+});
+
+test('feedback redaction omits a value when personal matching reaches its bound', async () => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const { createPersonalDataRedactor } = await import('../src/server/personal-data.ts');
+  const profile = { names: ['aaa'] };
+  const input = 'aaa '.repeat(5000) + 'Technical tail';
+  const redactor = createFeedbackRedactor({ secrets: [], profile });
+  let output = '';
+  assert.doesNotThrow(() => {
+    output = redactor.text(input);
+  });
+  assert.equal(output, '[unreadable data omitted]');
+  assert.ok(createPersonalDataRedactor(profile)(input).endsWith('Technical tail'));
+});
+
+test('feedback redaction omits values when classification metadata is a getter', async () => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const redactor = createFeedbackRedactor({ secrets: [], profile: { names: [] } });
+  let invoked = 0;
+  const named = { value: 'PrivateNamedValue' };
+  const media = { data: 'PrivateBinaryValue', bytes: 'PrivateBytesValue' };
+  const tuple = ['Authorization', 'PrivateTupleValue', 'PrivateTupleTail'];
+  for (const [target, key] of [
+    [named, 'name'],
+    [media, 'type'],
+    [tuple, '0'],
+  ] as const)
+    Object.defineProperty(target, key, {
+      enumerable: true,
+      get() {
+        invoked++;
+        throw new Error('Classification must not call a getter.');
+      },
+    });
+  const output = JSON.stringify(redactor.value({ named, media, tuple, status: 503 }));
+  assert.equal(invoked, 0);
+  for (const privateValue of [
+    'PrivateNamedValue',
+    'PrivateBinaryValue',
+    'PrivateBytesValue',
+    'PrivateTupleValue',
+    'PrivateTupleTail',
+  ])
+    assert.ok(!output.includes(privateValue), privateValue);
+  assert.ok(output.includes('503'));
+});
+
 test('rich feedback redaction handles embedded JSON, identifying addresses, encoded secrets and binary', async () => {
   const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
   const redactor = createFeedbackRedactor({
@@ -2818,6 +3946,16 @@ test('rich feedback redaction handles embedded JSON, identifying addresses, enco
     'Open "https://tenant.example.test/Personal%20Notes/log.txt" failed with HTTP 412.',
     'Rejected fixture%2fsecret-token and marta.vidal%40example.test.',
     'External record 00000000-1111-4222-8333-444444444444 was not found.',
+    '/media/private-owner/BACKUP/Medical Notes/scan.pdf does not exist.',
+    '/run/media/private-owner/USB/Tax Return/form.pdf does not exist.',
+    'Book a slot at calendly.com/synthetic-booker/30min please.',
+    'Profile www.example.com/in/synthetic-profile?ref=private-ref#private-anchor failed.',
+    'Redirect via unlisted.notatld/next?to=example.com/synthetic-hidden failed.',
+    'Mirror downloads.example.com:8443/synthetic-mirror?key=synthetic-query failed.',
+    'Open example.com/Private%20Records/Tax%20Return.pdf failed with HTTP 413.',
+    'Open example%2Ecom%2FReport%09synthetic-tab-record.pdf failed with HTTP 414.',
+    'Open example.com:8443/private?label=Case%20synthetic-query-record failed with HTTP 415.',
+    'Open example.com./private#Case%0Asynthetic-fragment-record failed with HTTP 416.',
     { type: 'image', data: 'synthetic-private-image' },
     {
       content: [
@@ -2864,6 +4002,20 @@ test('rich feedback redaction handles embedded JSON, identifying addresses, enco
     'Client Records',
     'Design Review',
     'Private Files',
+    'Medical Notes',
+    'Tax Return',
+    'BACKUP',
+    'synthetic-booker',
+    '30min',
+    'synthetic-profile',
+    'private-ref',
+    'private-anchor',
+    'synthetic-hidden',
+    'synthetic-mirror',
+    'synthetic-query',
+    'synthetic-tab-record',
+    'synthetic-query-record',
+    'synthetic-fragment-record',
     'fixture',
     'marta.vidal',
     '00000000-1111',
@@ -2895,8 +4047,24 @@ test('rich feedback redaction handles embedded JSON, identifying addresses, enco
     'HTTP 410',
     'HTTP 411',
     'HTTP 412',
+    'HTTP 413',
+    'HTTP 414',
+    'HTTP 415',
+    'HTTP 416',
+    'Book a slot at [url] please',
   ])
     assert.ok(encoded.includes(useful), useful);
+  const { timeZoneRegion } = await import('../src/shared/date-locale.ts');
+  const local = createFeedbackRedactor({
+    secrets: [],
+    profile: { names: [], region: timeZoneRegion('America/Los_Angeles') ?? undefined },
+  }).text('Call the clinic at (415) 555-0134 today.');
+  assert.ok(!local.includes('555-0134'), local);
+  assert.ok(local.includes('Call the clinic'), local);
+  const chained = createFeedbackRedactor({ secrets: [], profile: { names: [] } }).text(
+    `${'a.zz/'.repeat(6000)} then example.com:8443 and example.com./synthetic-chained?q=1 at example.com.`,
+  );
+  assert.ok(chained.endsWith(' then [host] and [url] at [host].'), chained.slice(-60));
   const concealedType = createFeedbackRedactor({ secrets: ['image'], profile: { names: [] } });
   assert.ok(
     !JSON.stringify(concealedType.value({ type: 'image', data: 'c3ludGhldGljIGltYWdl' })).includes(
@@ -2991,6 +4159,99 @@ test('rich feedback redaction bounds traversal and preserves sanitized Error dia
   assert.ok(!boundary.includes('bounded-private-secret'));
 });
 
+test('rich feedback redaction keeps error classes, frame files, sizes and model names without identity claims', async () => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const redactor = createFeedbackRedactor({ secrets: [], profile: { names: [] } });
+  const flattened = Object.assign(Object.create(null), {
+    name: 'JWTExpired',
+    message: 'Context of 200000 tokens exceeds the 131072-token limit after 1048576 bytes.',
+    stack: [
+      'JWTExpired: expired',
+      '    at rpc (file:///Users/private-owner/git/nod/src/server/thread.ts:281:13)',
+      '    at query (/home/private-owner/nod/node_modules/@fixture/pg/lib/client.js:10:2)',
+      '    at main (C:\\Users\\private-owner\\AppData\\nod\\dist\\server\\index.js:7:9)',
+      '    at /home/private-owner/private-project/worker.ts:18:4',
+      '    at C:\\Users\\private-owner\\scripts\\run.js:3:1',
+      '    at job (/home/private-owner/src/Private-Project/job.ts:5:1)',
+    ].join('\n'),
+    payload: { ok: true },
+    cause: {
+      name: 'Private Person',
+      message: 'claims rejected',
+      payload: { sub: 'payload-subject' },
+      claims: { email: 'claims-value' },
+      id_token: 'id-token-value',
+      nested: { JWT: 'jwt-value', accessToken: 'access-value', refresh_token: 'refresh-value' },
+      sub: 'subject-value',
+      sid: 'session-value',
+      jti: 'token-id-value',
+      nonce: 'nonce-value',
+      aud: ['audience-value'],
+    },
+  });
+  const safe = redactor.value({
+    error: flattened,
+    tool: { name: 'PrivateName' },
+    entry: { name: 'Alice', message: 'hello', stack: 'at home' },
+    record: 'Record 12345678 returned HTTP 1234567 for 2500000 items.',
+    relative: 'Read project/data/private-owner/file',
+  }) as any;
+  const encoded = JSON.stringify(safe);
+  assert.equal(safe.error.name, 'JWTExpired');
+  assert.equal(safe.error.cause.name, '[personal]');
+  assert.equal(safe.tool.name, '[personal]');
+  assert.equal(safe.entry.name, '[personal]');
+  assert.ok(safe.error.stack.includes('([path]:5:1)'));
+  for (const frame of [
+    '(src/server/thread.ts:281:13)',
+    '(dist/server/index.js:7:9)',
+    'at [path]:18:4',
+    'at [path]:3:1',
+  ])
+    assert.ok(safe.error.stack.includes(frame), frame);
+  assert.ok(safe.error.stack.includes(':10:2'));
+  assert.ok(!safe.error.stack.includes('@fixture'));
+  for (const sensitive of [
+    'private-owner',
+    'private-project',
+    'Private-Project',
+    'worker.ts',
+    'run.js',
+    'job.ts',
+    'Users',
+    'AppData',
+    'C:',
+    'payload-subject',
+    'claims-value',
+    'id-token-value',
+    'jwt-value',
+    'access-value',
+    'refresh-value',
+    'subject-value',
+    'session-value',
+    'token-id-value',
+    'nonce-value',
+    'audience-value',
+    '12345678',
+    '1234567',
+  ])
+    assert.ok(!encoded.includes(sensitive), sensitive);
+  assert.equal(safe.error.payload, '[redacted]');
+  assert.equal(
+    safe.error.message,
+    'Context of 200000 tokens exceeds the 131072-token limit after 1048576 bytes.',
+  );
+  assert.equal(safe.record, 'Record [identifier] returned HTTP [identifier] for 2500000 items.');
+  assert.equal(redactor.text('Model: compatible/qwen2.5:3b.'), 'Model: compatible/qwen2.5:3b.');
+  assert.equal(
+    redactor.text('model openrouter/meta-llama/llama-3.3-70b-instruct failed'),
+    'model openrouter/meta-llama/llama-3.3-70b-instruct failed',
+  );
+  assert.equal(redactor.text('Open /data/private-owner/a.txt'), 'Open [path]');
+  assert.equal(redactor.text('Open ~/private-owner/a.txt'), 'Open [path]');
+  assert.equal(redactor.text('Open D:\\private-owner\\a.txt'), 'Open [path]');
+});
+
 test('browser handoff preserves platform editing chords, text input and paste', async () => {
   const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
     timeoutMs: 20_000,
@@ -3064,9 +4325,26 @@ test('browser handoff preserves platform editing chords, text input and paste', 
         await act(async () => root.render(createElement(BrowserHandoff, { turnId: 'synthetic-turn' })));
         const frame = document.querySelector('.browser-handoff-screen img');
         assert.equal(frame.src, 'blob:synthetic-browser-frame');
+        Object.defineProperty(frame, 'naturalWidth', { value: 100 });
+        Object.defineProperty(frame, 'naturalHeight', { value: 100 });
+        frame.getBoundingClientRect = () => ({ left: 0, top: 0, width: 100, height: 100 });
         await act(async () => frame.dispatchEvent(new Event('load')));
         let screen = document.querySelector('.browser-handoff-screen');
         assert.equal(screen.getAttribute('aria-disabled'), 'false');
+        const press = async (type, button) => act(async () => frame.dispatchEvent(
+          new dom.window.MouseEvent(type, { button, clientX: 50, clientY: 50, bubbles: true }),
+        ));
+        for (const button of [3, 4]) {
+          await press('mousedown', button);
+          await press('mouseup', button);
+        }
+        assert.deepEqual(received, []);
+        await press('mousedown', 0);
+        await press('mouseup', 0);
+        assert.deepEqual(received, [
+          { type: 'mouse', event: 'down', x: 0.5, y: 0.5, button: 'left' },
+          { type: 'mouse', event: 'up', x: 0.5, y: 0.5, button: 'left' },
+        ]);
         let dispatchingKey = false;
         const key = async (key, options = {}) => {
           const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...options });
@@ -3738,7 +5016,12 @@ test('UI analytics keep answer choices, the survey card and survey flag requests
         disconnect() { this.disconnected = true; }
         intersect(...values) { this.callback(values.map(value => ({ target: this.element, isIntersecting: value }))); }
       };
-      globalThis.fetch = async () => { throw new Error('This fixture cannot use the network.'); };
+      const seenRequests = [];
+      globalThis.fetch = async (path, options) => {
+        if (path !== '/api/account/survey-seen') throw new Error('This fixture cannot use the network.');
+        seenRequests.push(JSON.parse(options.body).survey);
+        return new Response('{"ok":true}', { headers: { 'content-type': 'application/json' } });
+      };
       const sent = [], requests = [];
       const client = {
         init(key, options) { this.token = key; this.options = options; },
@@ -4018,6 +5301,7 @@ test('UI analytics keep answer choices, the survey card and survey flag requests
       assert.equal(sent.length, beforeCard + 1);
       assert.equal(sent.at(-1).event, 'survey shown');
       assert.ok(localStorage.getItem('lastSeenSurveyDate'));
+      assert.deepEqual(seenRequests, [survey]);
       await visible(false);
       await visible(true);
       assert.equal(sent.length, beforeCard + 1);
@@ -4085,6 +5369,27 @@ test('UI analytics keep answer choices, the survey card and survey flag requests
       assert.equal(sent.at(-1).properties.$survey_submission_id, intermediate.properties.$survey_submission_id);
       assert.ok(!JSON.stringify(sent.slice(beforeNext)).includes('PRIVATE_'));
       await act(() => root.render(null));
+      client.surveys = [{ id: survey, type: 'api', current_iteration: null, questions }];
+      await act(() => configureAnalytics({ ...configuration, surveys: true, seenSurveys: [survey] }, 'web'));
+      await act(() => root.render(createElement(SurveyCard)));
+      assert.equal(card(), null);
+      await act(() => root.render(null));
+      client.surveys = [{ id: survey, type: 'api', current_iteration: 2, questions }];
+      await act(() => root.render(createElement(SurveyCard)));
+      assert.ok(card());
+      assert.equal(seenRequests.at(-1), survey + '_2');
+      await act(() => root.render(null));
+      await act(() => root.render(createElement(SurveyCard)));
+      assert.equal(card(), null);
+      await act(() => root.render(null));
+      client.surveys = [{ id: survey, type: 'api', current_iteration: 3, questions }];
+      await act(() => root.render(createElement(SurveyCard)));
+      await act(() => card().querySelector('.survey-card-close').click());
+      client.surveys = [{ id: survey, type: 'api', current_iteration: 4, questions }];
+      await act(() => configureAnalytics({ ...configuration, surveys: true, seenSurveys: [survey, survey + '_2', survey + '_3'] }, 'web'));
+      assert.ok(card());
+      await act(() => root.render(null));
+      consent(true);
       client.deferSurveys = true;
       await act(() => root.render(createElement(SurveyCard)));
       assert.equal(card(), null);
@@ -4521,6 +5826,74 @@ test('composer preserves keyboard shortcuts, upload retries, previews and failed
         assert.equal(sends.at(-1).text, '**bold\\*star** next *literal*');
         const richVisible = await assertVisiblePaste(sends.at(-1), 'bold*star next *literal*');
         assert.equal(richVisible.querySelector('strong')?.textContent, 'bold*star');
+        for (const draft of [
+          'See \\![docs](https://example.test/docs)',
+          'See \\\\[docs](https://example.test/docs)',
+          'See \\\\**docs**',
+          'See \\\\<u>docs</u>',
+          'a\\~~~x~~ ~~y~~\\~b',
+          'a\\**x* *y*\\*b',
+          'a\\***x**\\*b',
+          '\\*\\**x*',
+          '\\*!\\**x*',
+          '\\~a\nb *x*\\~',
+          '\\*Y\\* \\**Y*\\*',
+          'y'.repeat(5000) + '\n\\\u0060a \u0060x\u0060',
+          '\\\u0060a \u0060x\u0060',
+          'a\\\u0060\u0060x\u0060\\\u0060b',
+          '| a          |\n| ---------- |\n| b\\\\\\\\<br>c |',
+          '&#x61;~~<u>x</u>~~&#x61;',
+          '\\<!a **Q1**',
+        ]) {
+          await act(async () => replaceText(draft));
+          await submit();
+          assert.deepEqual(parseComposerMarkdown(sends.at(-1).text), parseComposerMarkdown(draft));
+        }
+        for (const [draft, sent] of [
+          ['# \u0060\u0060\u0060a *x* *', '# \u0060\u0060\u0060a *x* *'],
+          ['**Note:**&#x73;ee_it', '**Note:**&#x73;ee_it'],
+          ['\\#tag a*b\nc **Q1**\n========', '#tag a*b\nc **Q1**\n========'],
+        ]) {
+          await act(async () => replaceText(draft));
+          await submit();
+          assert.equal(sends.at(-1).text.trimEnd(), sent);
+        }
+        const { Editor } = await import('@tiptap/core');
+        const { createComposerExtensions } = await import('./src/web/lib/composer-editor.ts');
+        const { composerMarkdown } = await import('./src/web/lib/composer-markdown.ts');
+        const serializer = new Editor({ extensions: createComposerExtensions({ submit() {}, upload() {} }) });
+        for (const [address, href] of [
+          ['https://example.test', 'https://example.test'],
+          ['ada@example.test', 'mailto:ada@example.test'],
+          ['www.example.test', 'http://www.example.test'],
+        ]) {
+          serializer.commands.setContent({
+            type: 'doc',
+            content: [{ type: 'paragraph', content: [
+              { type: 'text', text: 'see ' + address },
+              { type: 'text', text: '(x)', marks: [{ type: 'strike' }] },
+            ] }],
+          });
+          const nodes = parseComposerMarkdown(composerMarkdown(serializer.state.doc)).content[0].content;
+          assert.deepEqual(
+            nodes.map((node) => [node.text, node.marks?.map((mark) => mark.attrs?.href ?? mark.type)]),
+            [['see ', undefined], [address, [href]], ['(x)', ['strike']]],
+          );
+        }
+        serializer.commands.setContent({
+          type: 'doc',
+          content: [{ type: 'paragraph', content: [
+            { type: 'text', text: 'see \\https://example.test' },
+            { type: 'text', text: '(x)', marks: [{ type: 'strike' }] },
+          ] }],
+        });
+        assert.deepEqual(
+          parseComposerMarkdown(composerMarkdown(serializer.state.doc)).content[0].content.map((node) => [
+            node.text,
+            node.marks?.map((mark) => mark.attrs?.href ?? mark.type),
+          ]),
+          [['see \\', undefined], ['https://example.test', ['https://example.test']], ['(x)', ['strike']]],
+        );
         await act(async () => replaceText('| label | value |\n| --- | --- |\n| first | second |'));
         await pasteAtEnd('table tr:last-child td:first-child p', 'A|B\\|C\nD');
         await submit();
@@ -5800,12 +7173,15 @@ test('failed private entry holds every Pi action until the filled document chang
   const directory = await mkdtemp(join(tmpdir(), 'nod-private-cleanup-'));
   const fixture = stagedLoginBrowser();
   let failSubmit = true;
+  let failedSubmissions = 0;
   const computer = createBrowserFixture({
     dataRoot: directory,
     run: async (...args) => {
       const command = args[1].slice(args[1].indexOf('--idle-timeout') + 2);
-      if (command[0] === 'click' && failSubmit)
+      if (command[0] === 'click' && failSubmit) {
+        failedSubmissions++;
         return { stdout: '{"success":false}', stderr: '', exitCode: 1 };
+      }
       return fixture.run(...args);
     },
   });
@@ -5821,6 +7197,7 @@ test('failed private entry holds every Pi action until the filled document chang
         submitSelector: 'button',
       }),
     );
+    assert.equal(failedSubmissions, 1);
     const before = fixture.pages.get('private')!.entered.length;
     for (const input of [
       { action: 'snapshot' as const },
@@ -6095,10 +7472,33 @@ test(
         to: `${origin}/reserve`,
       });
       await computer.act('submits', { action: 'fill', selector: 'input[name=q]', text: 'tables' });
-      assert.deepEqual(await submits({ action: 'press', key: 'Enter' }), {
-        method: 'GET',
-        to: `${origin}/search`,
-      });
+      for (const key of [
+        'Enter',
+        'Return',
+        'Shift+Enter',
+        'Enter+Shift',
+        'Ctrl+Enter+Meta',
+        'NumpadEnter',
+        '\r',
+        '\n',
+      ]) {
+        assert.deepEqual(
+          await submits({ action: 'press', key }),
+          {
+            method: 'GET',
+            to: `${origin}/search`,
+          },
+          key,
+        );
+      }
+      for (const key of [
+        'Enter+Unknown',
+        ' Enter ',
+        'ControlOrMeta+Enter',
+        'Enter\n',
+        'ShiftLeft+Enter',
+      ])
+        assert.equal(await submits({ action: 'press', key }), undefined, key);
       await computer.act('submits', {
         action: 'evaluate',
         script: "document.querySelector('form button').focus()",
@@ -6297,6 +7697,29 @@ test('chat retires reply targets without losing drafts or duplicating ambiguous 
         assert.equal(requests[3].text, draft);
         assert.ok(document.querySelector('[data-message-id="' + committed.clientMessageId + '"]'));
         assert.equal(document.querySelector('[role="alert"]'), null);
+        await act(async () => root.unmount());
+        committed = null;
+        saveDraft(null);
+        state = { ...state, hiddenMessageIds: [], messages };
+        root = createRoot(document.getElementById('root'));
+        await render();
+        await settle(hasDraft);
+        await reply(ids[0]);
+        await submit();
+        await settle(() => requests.length === 5);
+        await act(async () => releases.at(-1).reject(new TypeError('Synthetic ordinary reply response lost')));
+        await settle(() => hasDraft() && document.querySelector('.composer-reply'));
+        state = { ...state, messages: [], chatClearedAt: '2026-10-26T12:02:00.000000Z' };
+        await render();
+        await settle(() => hasDraft() && !document.querySelector('.composer-reply'));
+        await submit();
+        await settle(() => requests.length === 6);
+        assert.equal(requests[5].replyToMessageId, undefined);
+        assert.notEqual(requests[5].clientMessageId, requests[4].clientMessageId);
+        assert.equal(requests[5].chatClearedAt, state.chatClearedAt);
+        await act(async () => releases.at(-1).resolve(Response.json({
+          messageId: requests[5].clientMessageId, turnId: 'synthetic-fresh-chat-turn',
+        })));
       } finally {
         await act(async () => root.unmount());
         dom.window.close();
@@ -6487,7 +7910,8 @@ test('chat reloads older history after hidden confirmations exceed the ID window
         await settle(() => hasDraft() && !document.querySelector('.composer-reply'));
         assert.equal(JSON.parse(localStorage.getItem(draftKey)).reply, null);
         await submit();
-        await settle(() => document.querySelector('[role="alert"]')?.textContent.includes('may have been sent'));
+        await settle(() => hasDraft() &&
+          document.querySelector('[role="alert"]')?.textContent.includes('may have been sent'));
         assert.equal(sends.length, 2);
         assert.ok(hasDraft());
         await submit();
@@ -6769,6 +8193,193 @@ test('chat resumes history after a failed focus check and cancels pending focus 
   assert.equal(result.exitCode, 0, result.stdout + result.stderr);
 });
 
+test('chat state reads make progress during refresh events and reject late replies after reset', async () => {
+  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+    timeoutMs: 20_000,
+    input: String.raw`
+      import assert from 'node:assert/strict';
+      import { JSDOM } from 'jsdom';
+      const dom = new JSDOM('<!doctype html><div id="root"></div>', {
+        url: 'https://nod.fixture.invalid', pretendToBeVisual: true,
+      });
+      Object.assign(globalThis, {
+        window: dom.window, document: dom.window.document,
+        IS_REACT_ACT_ENVIRONMENT: true, localStorage: dom.window.localStorage,
+        getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+        requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
+        cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),
+      });
+      for (const name of ['Node', 'NodeFilter', 'Element', 'HTMLElement', 'HTMLInputElement',
+        'HTMLButtonElement', 'MutationObserver', 'Event', 'KeyboardEvent', 'CustomEvent', 'DOMParser'])
+        globalThis[name] = dom.window[name];
+      Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
+      window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+      HTMLElement.prototype.scrollTo = () => {};
+      HTMLElement.prototype.scrollIntoView = () => {};
+      const sources = [];
+      globalThis.EventSource = class {
+        static CLOSED = 2;
+        readyState = 1;
+        constructor() { sources.push(this); }
+        close() { this.readyState = 2; }
+      };
+      const reads = [];
+      let ownerId = 'synthetic-owner';
+      let expireRead = false;
+      const deadlines = [];
+      AbortSignal.timeout = () => {
+        const controller = new AbortController();
+        deadlines.push(controller);
+        return controller.signal;
+      };
+      const threadId = '00000000-0000-4000-8000-000000000901';
+      const nextThreadId = '00000000-0000-4000-8000-000000000902';
+      const message = (id, text) => ({ id, role: 'assistant', text, attachments: [],
+        turnId: null, createdAt: '2026-11-19T12:00:00Z' });
+      const state = (messages, current = threadId) => ({
+        threadId: current, turns: [], activity: [], tasks: [],
+        verificationRequests: [], configuration: { llmReady: true }, messages,
+      });
+      globalThis.fetch = async (path, options = {}) => {
+        if (path === '/api/session') return Response.json({
+          user: { id: ownerId, name: 'Synthetic', email: null, avatarUrl: null },
+          settings: { theme: 'system', onboardingCompleted: true, usageData: false, traces: false },
+          capabilities: { developer: false, traces: false },
+        });
+        if (path === '/api/state') return new Promise((resolve, reject) => {
+          reads.push({ resolve, signal: options.signal });
+          if (expireRead) options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+        });
+        if (path === '/api/conversation/reset') return Response.json({ ok: true, threadId: nextThreadId });
+        if (path === '/api/apps') return Response.json([]);
+        if (path === '/api/trust') return Response.json({});
+        if (path === '/api/speech') return Response.json({ transcription: true });
+        if (path === '/api/onboarding/introduction') return Response.json({ messageId: null });
+        throw new Error('Unexpected request: ' + path);
+      };
+      const { createElement, act, StrictMode } = await import('react');
+      const { createRoot } = await import('react-dom/client');
+      const { sessionStore } = await import('./src/web/lib/session.ts');
+      const { useAppState } = await import('./src/web/hooks/use-app-state.ts');
+      const { Chat } = await import('./src/web/pages/chat.tsx');
+      await sessionStore.refresh();
+      let app;
+      function Screen() {
+        app = useAppState(ownerId);
+        return app.state ? createElement(Chat, {
+          ownerId, state: app.state, streams: app.streams,
+          refresh: app.refresh, resetConversation: app.resetConversation,
+        }) : createElement('p', null, 'Loading');
+      }
+      let root = createRoot(document.getElementById('root'));
+      const event = data => sources.at(-1).onmessage({ data: JSON.stringify(data) });
+      const complete = (read, value) => act(async () => read.resolve(Response.json(value)));
+      try {
+        await act(async () => root.render(createElement(Screen)));
+        const first = reads[0];
+        await act(async () => sources[0].onopen());
+        for (let index = 0; index < 20; index++)
+          await act(async () => event({ type: 'refresh' }));
+        const saved = message('saved-reply', 'Synthetic saved reply');
+        await complete(first, state([saved]));
+        assert.ok(document.querySelector('[data-message-id="saved-reply"]'),
+          'The completed state read must show its saved reply during repeated updates.');
+        assert.equal(first.signal.aborted, false);
+        assert.equal(reads.length, 2);
+        let refreshed = false;
+        const awaitedRefresh = app.refresh().then(() => { refreshed = true; });
+        assert.equal(refreshed, false);
+        const activity = [{ turnId: 'synthetic-work', taskId: null, title: null,
+          step: null, site: null, since: '2026-11-19T12:00:00Z' }];
+        await act(async () => event({ type: 'activity', items: activity }));
+        const approval = { ...message('pending-approval', 'Synthetic pending change'),
+          approval: { id: 'synthetic-approval', state: 'pending', title: 'Save change', app: 'Nod', slug: 'nod' } };
+        await complete(reads[1], state([saved, message('newer-reply', 'Synthetic newer reply'), approval]));
+        assert.ok(document.querySelector('[data-message-id="newer-reply"]'));
+        assert.ok(document.querySelector('[data-message-id="pending-approval"] button'));
+        assert.deepEqual(app.state.activity, activity);
+        assert.equal(refreshed, false);
+        await complete(reads.at(-1), state([saved, message('awaited-reply', 'Synthetic awaited reply'), approval]));
+        await awaitedRefresh;
+        assert.equal(refreshed, true);
+        assert.ok(document.querySelector('[data-message-id="awaited-reply"]'));
+        await act(async () => event({ type: 'refresh' }));
+        const failed = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => failed.resolve(Response.json({ error: 'Synthetic state read failed' }, { status: 503 })));
+        assert.match(app.error, /Synthetic state read failed/);
+        assert.ok(document.querySelector('[data-message-id="pending-approval"] button'));
+        await complete(reads.at(-1), state([saved, message('recovered-reply', 'Synthetic recovered reply')]));
+        assert.equal(app.error, '');
+        assert.ok(document.querySelector('[data-message-id="recovered-reply"]'));
+        expireRead = true;
+        await act(async () => event({ type: 'refresh' }));
+        expireRead = false;
+        const timedOut = reads.at(-1);
+        const deadline = deadlines.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        const beforeTimeout = reads.length;
+        await act(async () => deadline.abort(new DOMException('Synthetic deadline', 'TimeoutError')));
+        assert.equal(timedOut.signal.aborted, true);
+        assert.match(app.error, /did not finish within 15 seconds/);
+        assert.equal(reads.length, beforeTimeout + 1);
+        assert.equal(reads.at(-1).signal.aborted, false);
+        await complete(reads.at(-1), state([message('after-timeout', 'Synthetic reply after timeout')]));
+        assert.equal(app.error, '');
+        assert.ok(document.querySelector('[data-message-id="after-timeout"]'));
+        await complete(timedOut, state([message('timed-out-reply', 'Synthetic expired reply')]));
+        assert.equal(document.querySelector('[data-message-id="timed-out-reply"]'), null);
+        await act(async () => event({ type: 'refresh' }));
+        const old = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => app.resetConversation(threadId));
+        assert.equal(app.state.threadId, nextThreadId);
+        assert.equal(app.error, '');
+        assert.equal(document.querySelector('[data-message-id="saved-reply"]'), null);
+        await act(async () => event({ type: 'refresh' }));
+        assert.equal(old.signal.aborted, true);
+        assert.notEqual(reads.at(-1), old);
+        await complete(reads.at(-1), state([message('new-thread-reply', 'Synthetic new conversation')], nextThreadId));
+        assert.ok(document.querySelector('[data-message-id="new-thread-reply"]'));
+        const resetReads = reads.length;
+        await complete(old, state([message('late-reply', 'Synthetic late reply')]));
+        assert.equal(app.state.threadId, nextThreadId);
+        assert.equal(document.querySelector('[data-message-id="late-reply"]'), null);
+        assert.equal(reads.length, resetReads);
+        await act(async () => event({ type: 'refresh' }));
+        const unmounted = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => root.unmount());
+        assert.equal(unmounted.signal.aborted, true);
+        const count = reads.length;
+        const retiredSource = sources[0];
+        sessionStore.invalidate();
+        ownerId = 'other-synthetic-owner';
+        await sessionStore.refresh();
+        root = createRoot(document.getElementById('root'));
+        await act(async () => root.render(createElement(StrictMode, null, createElement(Screen, { key: ownerId }))));
+        assert.equal(reads.length, count + 2);
+        const abandoned = reads.at(-2);
+        assert.equal(abandoned.signal.aborted, true);
+        await act(async () => retiredSource.onmessage({ data: JSON.stringify({ type: 'refresh' }) }));
+        await complete(unmounted, state([message('unmounted-reply', 'Synthetic unmounted reply')]));
+        assert.equal(reads.length, count + 2);
+        await complete(reads.at(-1), state([message('other-owner-reply', 'Synthetic other owner reply')]));
+        assert.ok(document.querySelector('[data-message-id="other-owner-reply"]'));
+        await complete(abandoned, state([message('abandoned-reply', 'Synthetic abandoned reply')]));
+        assert.equal(reads.length, count + 2);
+        assert.equal(document.querySelector('[data-message-id="abandoned-reply"]'), null);
+        assert.equal(document.querySelector('[data-message-id="unmounted-reply"]'), null);
+        assert.equal(document.querySelector('[data-message-id="saved-reply"]'), null);
+      } finally {
+        await act(async () => root.unmount());
+        dom.window.close();
+      }
+    `,
+  });
+  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+});
+
 test('chat shows pending sends and active work before a model step', async () => {
   const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
     timeoutMs: 20_000,
@@ -6878,17 +8489,31 @@ test('chat shows pending sends and active work before a model step', async () =>
         await render();
         assert.equal(Boolean(document.querySelector('.thinking')), false);
         assert.equal(Boolean(document.querySelector('[aria-label="Stop all work"]')), false);
-        state = { ...state, activity: [{ ...activity, step: 'Comparing **flight prices**' }, task] };
+        const recent = [{ id: 'synthetic-completed', summary: 'Read the synthetic report', site: null }];
+        state = { ...state, activity: [{ ...activity, step: 'Comparing **flight prices**', recent }, task] };
         await render();
         assert.equal(document.querySelectorAll('.thinking .working-text').length, 1);
         assert.match(document.querySelector('.thinking').textContent, /Comparing flight prices/);
         assert.ok(!document.querySelector('.thinking').textContent.includes('**'));
         assert.ok(!document.querySelector('.thinking').textContent.includes('hotel'));
+        const history = document.querySelector('.thinking details');
+        assert.equal(history.open, false);
+        assert.deepEqual(Array.from(history.querySelectorAll('ol > li'), entry => entry.textContent), ['Read the synthetic report']);
+        assert.equal(document.querySelector('[role="status"] [role="status"]'), null);
+        await act(async () => history.querySelector('summary').click());
+        await settle(() => history.open);
         await render({ streams: { 'synthetic-stream': 'Synthetic partial result' } });
-        assert.equal(Boolean(document.querySelector('.thinking')), false);
-        state = { ...state, activity: [{ ...activity, step: 'Checking the return journey' }] };
+        assert.equal(document.querySelector('.thinking').hidden, true);
+        assert.equal(document.querySelector('.thinking details'), history);
+        state = { ...state, activity: [{ ...activity, step: 'Checking the return journey', recent }] };
         await render();
-        assert.equal(document.querySelector('.thinking').textContent, 'Checking the return journey');
+        assert.equal(document.querySelector('.thinking').hidden, false);
+        assert.equal(document.querySelector('.thinking details'), history);
+        assert.equal(history.open, true);
+        assert.equal(document.querySelector('.thinking .live-line-current').textContent, 'Checking the return journey');
+        state = { ...state, activity: [{ ...activity, turnId: 'synthetic-next-turn', recent }] };
+        await render();
+        assert.equal(document.querySelector('.thinking details').open, false);
         state = { ...state, activity: [] };
         await render();
         assert.equal(Boolean(document.querySelector('.thinking')), false);
@@ -6998,7 +8623,7 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
       const events = event => sent.filter(item => item.event === event);
       const settings = () => events('settings_viewed').map(item => item.properties.tab);
       const tabs = () => events('tab_viewed').map(item => [item.properties.page, item.properties.tab]);
-      const sectionLabels = ['General', 'Notifications', 'Models', 'Voice & audio', 'Memory', 'Privacy & data'];
+      const sectionLabels = ['General', 'Notifications', 'Models', 'Voice & audio', 'Memory', 'Computer use', 'Privacy & data'];
       try {
         await act(async () => root.render(createElement(AccountSettings, {
           account, open: true, initialTab: 'General', openRequest: 0, onOpenChange() {},
@@ -7008,9 +8633,9 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
         const navigation = [...document.querySelectorAll('.settings-nav-item')];
         assert.deepEqual(navigation.map(item => item.textContent), sectionLabels);
         for (const item of navigation.slice(1)) await act(async () => item.click());
-        assert.deepEqual(settings(), ['general', 'notifications', 'models', 'voice', 'memory', 'privacy']);
+        assert.deepEqual(settings(), ['general', 'notifications', 'models', 'voice', 'memory', 'computer', 'privacy']);
         await act(async () => navigation.at(-1).click());
-        assert.equal(settings().length, 6);
+        assert.equal(settings().length, 7);
         const scroller = document.querySelector('.settings-scroll');
         Object.defineProperties(scroller, { scrollHeight: { value: 2000 }, clientHeight: { value: 400 } });
         document.querySelectorAll('.settings-category > h2').forEach((heading, index) => {
@@ -7028,7 +8653,7 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
         consent(true);
         await act(async () => navigation[3].click());
         assert.equal(settings().at(-1), 'voice');
-        for (const path of ['/settings', '/settings/notifications', '/settings/models', '/settings/voice', '/settings/memory', '/settings/privacy']) {
+        for (const path of ['/settings', '/settings/notifications', '/settings/models', '/settings/voice', '/settings/memory', '/settings/computer-use', '/settings/privacy']) {
           window.history.replaceState(null, '', path);
           capturePageview(path);
           assert.equal(events('$pageview').at(-1).properties.route, '/settings');
@@ -7064,6 +8689,120 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
         pageDataCache.clear();
         dom.window.close();
       }
+    `,
+  });
+  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+});
+
+test('a verified app connection opens chat only on request and keeps private details out of analytics', async () => {
+  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+    timeoutMs: 20_000,
+    input: String.raw`
+      import assert from 'node:assert/strict';
+      import { JSDOM } from 'jsdom';
+      const dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://nod.fixture.invalid/apps', pretendToBeVisual: true });
+      Object.assign(globalThis, { window: dom.window, document: dom.window.document, localStorage: dom.window.localStorage,
+        IS_REACT_ACT_ENVIRONMENT: true, getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+        requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window), cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window) });
+      for (const name of ['Node', 'Element', 'HTMLElement', 'HTMLInputElement', 'HTMLTextAreaElement', 'HTMLButtonElement', 'Event', 'CustomEvent', 'MutationObserver', 'NodeFilter', 'DocumentFragment']) globalThis[name] = dom.window[name];
+      Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
+      window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+      window.HTMLElement.prototype.scrollTo = function() {};
+      const channels = [];
+      globalThis.BroadcastChannel = class { constructor() { channels.push(this); } close() {} };
+      window.open = () => ({ closed: false, location: { href: '' }, document: { title: '', body: { textContent: '' } }, close() { this.closed = true; } });
+      const { createElement, act } = await import('react');
+      const { createRoot } = await import('react-dom/client');
+      const { Apps } = await import('./src/web/pages/apps.tsx');
+      const { pageDataCache } = await import('./src/web/lib/page-data-cache.ts');
+      const { setRequestAccount } = await import('./src/web/lib/api.ts');
+      const { setupLinkHash } = await import('./src/web/lib/connection-url.ts');
+      const { configureAnalytics, setAnalyticsClient } = await import('./src/web/lib/analytics.ts');
+      const privateName = 'PRIVATE_CONNECTION_NAME';
+      const url = 'https://example.test/sign-in';
+      const hash = await setupLinkHash(url);
+      const attempt = 'A'.repeat(43);
+      let connected = false, statusReads = 0, failure;
+      const requests = [], captured = [];
+      const app = { slug: 'gmail', name: privateName, status: 'disconnected', triggersEnabled: false, direct: true };
+      globalThis.fetch = async (path, options = {}) => {
+        requests.push([path, options.method ?? 'GET']);
+        if (path === '/api/apps') return Response.json(connected ? [{ ...app, status: 'connected', connectionId: 'private-connection' }] : []);
+        if (path === '/api/apps/catalog') return Response.json([app]);
+        if (path === '/api/apps/gmail/connect') return Response.json({ url, attempt });
+        if (path === '/api/apps/setup-status') { statusReads++; return Response.json({ completed: connected ? [hash] : [], apps: [{ hash, slug: 'gmail', name: privateName, available: !failure, ...(failure ? { error: failure } : {}) }] }); }
+        throw new Error('Unexpected fixture request: ' + path);
+      };
+      setRequestAccount('synthetic-owner');
+      setAnalyticsClient({ init(_key, options) { this.options = options; }, capture(event, properties = {}) {
+        const value = this.options.before_send({ event, properties }); if (value) captured.push(value); return value;
+      }, _send_request() {}, set_config(options) { this.options = { ...this.options, ...options }; }, reset() {} });
+      configureAnalytics({ enabled: true, distinctId: 'synthetic-installation', environment: 'development' }, 'web');
+      const root = createRoot(document.querySelector('#root'));
+      const settle = async check => { for (let i = 0; i < 50; i++) { await act(async () => new Promise(resolve => setTimeout(resolve, 5))); if (check()) return; } assert.fail('The app state did not settle.'); };
+      try {
+        await act(async () => root.render(createElement(Apps, { onAsk() { assert.fail('Navigation must not send a request.'); } })));
+        await settle(() => document.querySelector('[data-connect-service="gmail"]'));
+        await act(async () => document.querySelector('[data-connect-service="gmail"]').click());
+        await settle(() => statusReads > 0 && channels.length > 0);
+        await act(async () => channels.at(-1).onmessage({ data: { service: 'gmail', attempt, connection: 'connected' } }));
+        await settle(() => statusReads > 1);
+        const handoff = () => document.querySelector('.notice-success .notice-actions button');
+        assert.equal(handoff(), null);
+        connected = true;
+        await act(async () => window.dispatchEvent(new Event('focus')));
+        await settle(() => captured.some(item => item.event === 'app_connection_completed'));
+        await settle(() => handoff());
+        assert.equal(window.location.pathname, '/apps');
+        assert.equal(requests.filter(([path]) => path === '/api/messages').length, 0);
+        await act(async () => handoff().click());
+        assert.equal(window.location.pathname, '/');
+        assert.equal(requests.filter(([path]) => path === '/api/messages').length, 0);
+        const clicks = captured.filter(item => item.event === 'app_connection_chat_requested');
+        assert.equal(clicks.length, 1);
+        assert.equal(JSON.stringify(captured).includes(privateName), false);
+        assert.equal(JSON.stringify(captured).includes(url), false);
+        assert.equal(JSON.stringify(captured).includes(hash), false);
+        configureAnalytics(undefined);
+        await act(async () => root.render(null));
+        pageDataCache.clear();
+        setRequestAccount('synthetic-owner-two');
+        connected = false;
+        statusReads = 0;
+        window.history.replaceState(null, '', '/apps');
+        await act(async () => root.render(createElement(Apps, { key: 'synthetic-owner-two', onAsk() { assert.fail('Navigation must not send a request.'); } })));
+        await settle(() => document.querySelector('[data-connect-service="gmail"]'));
+        assert.equal(handoff(), null);
+        await act(async () => document.querySelector('[data-connect-service="gmail"]').click());
+        await settle(() => statusReads > 0);
+        connected = true;
+        await act(async () => window.dispatchEvent(new Event('focus')));
+        await settle(() => handoff());
+        await act(async () => handoff().click());
+        assert.equal(window.location.pathname, '/');
+        assert.equal(captured.filter(item => item.event === 'app_connection_chat_requested').length, 1);
+        assert.equal(requests.filter(([path]) => path === '/api/messages').length, 0);
+        await act(async () => root.render(null));
+        pageDataCache.clear();
+        connected = false;
+        statusReads = 0;
+        window.history.replaceState(null, '', '/apps');
+        await act(async () => root.render(createElement(Apps, { key: 'failed-sign-in', onAsk() {} })));
+        await settle(() => document.querySelector('[data-connect-service="gmail"]'));
+        await act(async () => document.querySelector('[data-connect-service="gmail"]').click());
+        await settle(() => statusReads > 0);
+        failure = 'Sign-in could not finish: invalid_request: Synthetic refusal';
+        await act(async () => channels.at(-1).onmessage({ data: { service: 'gmail', attempt, connection: 'failed' } }));
+        await settle(() => document.body.textContent.includes(failure));
+        await act(async () => root.render(null));
+        pageDataCache.clear();
+        statusReads = 0;
+        failure = 'Sign-in could not finish: Synthetic polled refusal';
+        await act(async () => root.render(createElement(Apps, { key: 'polled-failure', onAsk() {} })));
+        await settle(() => document.querySelector('[data-connect-service="gmail"]'));
+        await act(async () => document.querySelector('[data-connect-service="gmail"]').click());
+        await settle(() => document.body.textContent.includes(failure));
+      } finally { await act(async () => root.unmount()); dom.window.close(); }
     `,
   });
   assert.equal(result.exitCode, 0, result.stdout + result.stderr);

@@ -54,7 +54,7 @@ jobs:
 
           If main changes before merge, run Release desktop again to update this PR.
 
-          Review the public highlights below before merge. Keep them short, specific, and playful. Follow https://nod.n8n.io/docs/contribute/desktop-releases/#write-release-highlights. The publisher uses this copy and puts the full changelog and build details in a collapsed section.
+          Review the public highlights below before merge. Keep them short, specific, and in plain words. A fix release gets bullets, not sections. For a minor version, ask product marketing to review them. Follow https://nod.n8n.io/docs/contribute/desktop-releases/#write-release-highlights. The publisher uses this copy and puts the full changelog and build details in a collapsed section.
 
           TEXT
           cat "$RUNNER_TEMP/release-notes.md" >> "$RUNNER_TEMP/release-pr.md"

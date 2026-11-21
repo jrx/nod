@@ -1,4 +1,6 @@
 import { parseFragment, type DefaultTreeAdapterMap } from 'parse5';
+import { createHash } from 'node:crypto';
+import { z } from 'zod';
 
 const apps: Record<string, string> = {
   GMAIL: 'Gmail',
@@ -9,6 +11,7 @@ const apps: Record<string, string> = {
   SLACK: 'Slack',
   NOTION: 'Notion',
   LINEAR: 'Linear',
+  COMPUTER: 'Computer use',
 };
 
 export function actionTitle(action: string) {
@@ -32,6 +35,7 @@ const nodActions: Array<[string, string]> = [
   ['NOD_browser', 'Continue in the browser'],
   ['NOD_vault_allow', 'Use a saved sign-in'],
   ['NOD_limits_update', 'Change spending limits'],
+  ['NOD_bug_report_send', 'Send a bug report to the Nod team'],
   ['NOD_model_select', 'Change the model'],
   ['NOD_notification_preferences_update', 'Change Nod settings'],
   ['NOD_schedule_pause', 'Pause a schedule'],
@@ -131,6 +135,150 @@ export function gmailDraftTarget(result: unknown, expectedId: string) {
   return target && (target.subject || target.to || target.cc || target.bcc)
     ? { draftId: expectedId, ...target }
     : undefined;
+}
+
+export function isCalendarEventChange(action: string) {
+  return [
+    'GOOGLECALENDAR_PATCH_EVENT',
+    'GOOGLECALENDAR_UPDATE_EVENT',
+    'GOOGLECALENDAR_DELETE_EVENT',
+    'GOOGLECALENDAR_REMOVE_ATTENDEE',
+    'GOOGLECALENDAR_EVENTS_MOVE',
+  ].includes(action);
+}
+
+export function calendarEventTarget(result: unknown, expectedId: string) {
+  const object = (value: unknown): Record<string, unknown> | undefined =>
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  const outer = object(result);
+  if (!outer || outer.successful === false || !expectedId.trim() || expectedId.length > 1024)
+    return;
+  const event = object(outer.data) ?? outer;
+  if (event.id !== expectedId || event.status === 'cancelled') return;
+  if (typeof event.etag !== 'string' || !event.etag.trim() || event.etag.length > 1024) return;
+  if (event.endTimeUnspecified !== undefined && event.endTimeUnspecified !== false) return;
+  if (event.summary != null && typeof event.summary !== 'string') return;
+  const start = object(event.start);
+  const allDay = start?.dateTime === undefined;
+  const when = (part: Record<string, unknown> | undefined) => {
+    if (allDay) {
+      const date = z.iso.date().safeParse(part?.date);
+      return date.success && part?.dateTime === undefined ? { value: date.data } : undefined;
+    }
+    if (part?.date !== undefined) return;
+    const date = z.iso.datetime({ offset: true, local: true }).max(64).safeParse(part?.dateTime);
+    if (!date.success) return;
+    const timeZone = part?.timeZone;
+    if (
+      timeZone !== undefined &&
+      (typeof timeZone !== 'string' || !timeZone || timeZone.length > 100)
+    )
+      return;
+    let format: Intl.DateTimeFormat | undefined;
+    if (typeof timeZone === 'string') {
+      try {
+        format = new Intl.DateTimeFormat('en-GB', {
+          timeZone,
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hourCycle: 'h23',
+        });
+      } catch {
+        return;
+      }
+    }
+    if (z.iso.datetime({ offset: true }).safeParse(date.data).success)
+      return { value: date.data, ...(typeof timeZone === 'string' ? { timeZone } : {}) };
+    if (!format) return;
+    const wall = Date.parse(`${date.data}Z`);
+    const localAt = (instant: number) => {
+      const parts = Object.fromEntries(
+        format.formatToParts(instant).map(({ type, value }) => [type, value]),
+      );
+      return Date.parse(
+        `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}Z`,
+      );
+    };
+    const second = (instant: number) => Math.floor(instant / 1000) * 1000;
+    const offsets = new Set(
+      [-86_400_000, 0, 86_400_000].map((delta) => localAt(wall + delta) - second(wall + delta)),
+    );
+    const matches = [...offsets]
+      .map((offset) => wall - offset)
+      .filter((instant) => localAt(instant) === second(wall));
+    return matches.length === 1
+      ? { value: new Date(matches[0]!).toISOString(), timeZone: timeZone as string }
+      : undefined;
+  };
+  const startsAt = when(start);
+  const end = object(event.end);
+  const endsAt = when(end);
+  if (
+    !startsAt ||
+    !endsAt ||
+    Date.parse(endsAt.value) < Date.parse(startsAt.value) ||
+    (allDay && startsAt.value === endsAt.value)
+  )
+    return;
+  if (
+    (event.recurringEventId !== undefined &&
+      (typeof event.recurringEventId !== 'string' ||
+        !event.recurringEventId.trim() ||
+        event.recurringEventId.length > 1024)) ||
+    (event.recurrence !== undefined &&
+      (!Array.isArray(event.recurrence) ||
+        event.recurrence.some((rule) => typeof rule !== 'string' || !rule.trim())))
+  )
+    return;
+  const occurrence = typeof event.recurringEventId === 'string';
+  const series = Array.isArray(event.recurrence) && event.recurrence.length > 0;
+  const originalStartsAt = when(object(event.originalStartTime));
+  if (
+    (occurrence && (series || !originalStartsAt)) ||
+    (!occurrence && event.originalStartTime !== undefined)
+  )
+    return;
+  const title = typeof event.summary === 'string' ? event.summary.trim() : '';
+  const self = Array.isArray(event.attendees)
+    ? event.attendees.map(object).find((attendee) => attendee?.self === true)
+    : undefined;
+  const response = z
+    .enum(['accepted', 'declined', 'tentative', 'needsAction'])
+    .safeParse(self?.responseStatus);
+  const target = {
+    eventId: expectedId,
+    title:
+      title.length > 300
+        ? `${title.slice(0, 288).replace(/[\uD800-\uDBFF]$/, '')} [truncated]`
+        : title || 'Untitled event',
+    startsAt: startsAt.value,
+    endsAt: endsAt.value,
+    endExclusive: true,
+    allDay,
+    ...(startsAt.timeZone ? { timeZone: startsAt.timeZone } : {}),
+    ...(endsAt.timeZone ? { endTimeZone: endsAt.timeZone } : {}),
+    scope: occurrence ? 'occurrence' : series ? 'series' : 'event',
+    ...(occurrence && originalStartsAt
+      ? {
+          seriesId: event.recurringEventId,
+          originalStartsAt: originalStartsAt.value,
+          ...(originalStartsAt.timeZone ? { originalTimeZone: originalStartsAt.timeZone } : {}),
+        }
+      : {}),
+    ...(response.success ? { currentResponse: response.data } : {}),
+  };
+  return {
+    target,
+    revision: createHash('sha256')
+      .update(JSON.stringify([event.etag, event.summary ?? null, event.recurrence ?? []]))
+      .digest('hex'),
+  };
 }
 
 const fieldKeys: Array<[string, string[]]> = [
@@ -238,6 +386,7 @@ export function approvalContent(
 }
 
 const tools: Record<string, string> = {
+  codemode: 'Ran code',
   bash: 'Ran a command',
   read: 'Read a file',
   write: 'Wrote a file',
@@ -249,12 +398,14 @@ const tools: Record<string, string> = {
   'get search content': 'Read search results',
   'source check': 'Checked a source',
   'read source': 'Read a source',
+  flights: 'Searched flights',
   browser: 'Used the browser',
   'sign in': 'Signed in',
   pay: 'Entered a card',
   'browser session': 'Opened a saved session',
   apps: 'Used a connected app',
   files: 'Handled local files',
+  computer: 'Used an app',
   'manage apps': 'Checked connected apps',
   'manage personal context': 'Checked schedules or memory',
   skills: 'Used a skill',
@@ -268,10 +419,27 @@ const tools: Record<string, string> = {
   'create audio': 'Made audio',
 };
 
+const computerSteps: Record<string, string> = {
+  apps: 'Checked open apps',
+  open: 'Opened the app',
+  snapshot: 'Read the window',
+  find: 'Looked for a control',
+  screenshot: 'Looked at the window',
+  press: 'Pressed a control',
+  set_value: 'Filled in a field',
+  type: 'Typed text',
+  select: 'Chose an option',
+  focus: 'Selected a field',
+  key: 'Used a shortcut',
+  keep_out: 'Kept an app out',
+};
+
 export function toolTitle(summary: string) {
   if (tools[summary]) return tools[summary];
   const browser = /^browser ([a-z_]+)$/.exec(summary)?.[1];
   if (browser) return `Browser: ${browser.replaceAll('_', ' ')}`;
+  const computer = /^computer ([a-z_]+)$/.exec(summary)?.[1];
+  if (computer) return computerSteps[computer] ?? 'Used an app';
   const server = /^mcp {2}(.+?) {2}.+$/.exec(summary)?.[1];
   return server ? `Used ${server}` : (tools[summary] ?? summary);
 }
@@ -311,6 +479,7 @@ const dollarsOrNone = (value: unknown, label: string) =>
 
 export function recordedTitle(action: string) {
   if (action === 'NOD_browser') return 'Browser';
+  if (action === 'NOD_workspace_command') return 'Run a workspace command';
   if (action === 'NOD_notification_preferences_update') return 'Change settings';
   if (action.startsWith('NOD_') && action !== 'NOD_read_source') return approvalTitle(action).title;
   const { app, label } = actionTitle(action);
@@ -328,6 +497,8 @@ export function actionTarget(
   details?: Record<string, unknown>,
 ) {
   const target = (() => {
+    if (action === 'NOD_bug_report_send')
+      return args.includeReport === true ? 'with a diagnostic report' : 'summary only';
     if (action === 'NOD_browser') {
       const step = String(args.step ?? '');
       const control = Array.isArray(args.control)
@@ -365,6 +536,25 @@ export function actionTarget(
         .join(', ');
     if (action === 'NOD_notification_preferences_update')
       return [...new Set(Object.keys(args).map((key) => settingNames[key] ?? key))].join(', ');
+    if (action.startsWith('COMPUTER_')) {
+      const app = (args.app as { name?: unknown } | undefined)?.name;
+      const control = args.control as { role?: unknown; name?: unknown } | undefined;
+      const what =
+        typeof args.keys === 'string'
+          ? args.keys
+          : typeof control?.name === 'string' && control.name
+            ? quoted(control.name)
+            : typeof control?.role === 'string'
+              ? control.role
+              : '';
+      return [
+        what,
+        typeof args.option === 'string' && `→ ${quoted(args.option)}`,
+        typeof app === 'string' && `in ${app}`,
+      ]
+        .filter(Boolean)
+        .join(' ');
+    }
     if (action.startsWith('LOCAL_FILES_'))
       return listed([
         ...words(args.path),

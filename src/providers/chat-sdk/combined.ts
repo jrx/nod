@@ -15,9 +15,9 @@ export function combineMessagingTransports(
         ).values(),
       ];
     },
-    async poll(accept, pair, react) {
+    async poll(accept, pair, react, approve) {
       const results = await Promise.allSettled(
-        transports.map((transport) => transport.poll?.(accept, pair, react)),
+        transports.map((transport) => transport.poll?.(accept, pair, react, approve)),
       );
       const failed = results.find((result) => result.status === 'rejected');
       if (failed?.status === 'rejected') throw failed.reason;
@@ -34,6 +34,9 @@ export function combineMessagingTransports(
       const transport = forChannel(input.channelId);
       if (!transport) throw new Error('Channel is not configured.');
       return transport.post(input);
+    },
+    canDeliverLiteral(input) {
+      return forChannel(input.channelId)?.canDeliverLiteral?.(input) ?? false;
     },
     async react(input) {
       return (await forChannel(input.channelId)?.react?.(input)) ?? 'unsupported';

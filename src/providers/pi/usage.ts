@@ -74,7 +74,11 @@ export function piUsageMetrics(usage?: Usage): Partial<ProviderUsageEvent> {
     )
       ? null
       : estimate;
+  const longWrite = usage.cacheWrite1h;
   return {
+    ...(tokenCount(longWrite) && longWrite > 0 && longWrite <= usage.cacheWrite
+      ? { cacheWrite1hTokens: longWrite }
+      : {}),
     ...(tokenCount(usage.input) ? { inputTokens: usage.input } : {}),
     ...(tokenCount(usage.output) ? { outputTokens: usage.output } : {}),
     ...(tokenCount(usage.cacheRead) ? { cacheReadTokens: usage.cacheRead } : {}),
@@ -99,7 +103,8 @@ export function createPiUsageTracker(options: {
     const values = [usage?.input, usage?.output, usage?.cacheRead, usage?.cacheWrite];
     const tokens = values.map((value) => (tokenCount(value) ? value : 0));
     const sum = tokens.reduce((result, value) => result + value, 0);
-    const costUsd = piUsageMetrics(usage).costUsd ?? null;
+    const metrics = piUsageMetrics(usage);
+    const costUsd = metrics.costUsd ?? null;
     seen.add(key);
     const timestamp =
       typeof message.timestamp === 'number' &&
@@ -121,6 +126,7 @@ export function createPiUsageTracker(options: {
       outputTokens: tokens[1],
       cacheReadTokens: tokens[2],
       cacheWriteTokens: tokens[3],
+      ...(metrics.cacheWrite1hTokens ? { cacheWrite1hTokens: metrics.cacheWrite1hTokens } : {}),
       totalTokens: tokenCount(usage?.totalTokens)
         ? usage.totalTokens
         : Number.isSafeInteger(sum)

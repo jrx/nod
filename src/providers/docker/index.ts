@@ -287,13 +287,24 @@ export function createCommandWorkspace(options: {
         path: `/workspace/${id}`,
         instructions: options.instructions,
         async exec(script, { input: stdin, signal, timeoutMs = 600_000, onData, notices } = {}) {
-          const result = await command(id, ['bash', '-c', script], {
-            input: stdin,
-            signal: signal ? AbortSignal.any([signal, input.signal]) : input.signal,
-            timeoutMs: Math.max(1000, timeoutMs),
-            onData: onData ?? (() => {}),
-            session: notices,
-          });
+          const result = await command(
+            id,
+            [
+              '/bin/bash',
+              '--noprofile',
+              '--norc',
+              '-p',
+              '-c',
+              `nod_workspace_path=$PATH\nexport PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'\n${script}`,
+            ],
+            {
+              input: stdin,
+              signal: signal ? AbortSignal.any([signal, input.signal]) : input.signal,
+              timeoutMs: Math.max(1000, timeoutMs),
+              onData: onData ?? (() => {}),
+              session: notices,
+            },
+          );
           return { exitCode: result.exitCode };
         },
         ...(connected
@@ -317,6 +328,8 @@ export function createCommandWorkspace(options: {
                 return {
                   exitCode: result.exitCode,
                   output: Buffer.concat([result.stdout, result.stderr]).toString('utf8'),
+                  stdout: result.stdout.toString('utf8'),
+                  stderr: result.stderr.toString('utf8'),
                 };
               },
             }

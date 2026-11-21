@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash, X509Certificate } from 'node:crypto';
-import { mkdtemp, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -25,6 +25,36 @@ export async function hardenElectron(application) {
 }
 
 const directory = dirname(fileURLToPath(import.meta.url));
+
+export async function copyAgentDesktop(application, platform = 'darwin', arch = process.arch) {
+  const bin = join(directory, '..', 'node_modules', 'agent-desktop', 'bin');
+  const mac = platform === 'darwin';
+  const resources = mac
+    ? join(application, 'Contents', 'Resources')
+    : join(application, 'resources');
+  const target = mac ? join(application, 'Contents', 'Helpers') : join(resources, 'agent-desktop');
+  const files = mac
+    ? [
+        [`agent-desktop-darwin-${arch}`, 'agent-desktop'],
+        [`agent-desktop-macos-helper-darwin-${arch}`, 'agent-desktop-macos-helper'],
+      ]
+    : platform === 'win32'
+      ? [[`agent-desktop-win32-${arch}.exe`, 'agent-desktop.exe']]
+      : [
+          [`agent-desktop-linux-${arch}`, 'agent-desktop'],
+          [
+            `agent-desktop-linux-clipboard-owner-linux-${arch}`,
+            'agent-desktop-linux-clipboard-owner',
+          ],
+        ];
+  await mkdir(target, { recursive: true });
+  for (const [source, name] of files) await cp(join(bin, source), join(target, name));
+  await mkdir(join(resources, 'licenses'), { recursive: true });
+  await cp(
+    join(directory, '..', 'licenses', 'agent-desktop.md'),
+    join(resources, 'licenses', 'agent-desktop.md'),
+  );
+}
 export function desktopBuildOptions(env = process.env) {
   const tracesToken = env.NOD_TRACES_TOKEN;
   if (tracesToken && !/^[A-Za-z0-9_-]{32,128}$/.test(tracesToken))
@@ -350,7 +380,7 @@ export async function signApplication(application, electronVersion, configuratio
           configuration.mode === 'developer-id' ? 'http://timestamp.apple.com/ts01' : 'none',
         ...(path.endsWith('/limactl')
           ? { entitlements: join(directory, 'lima-entitlements.plist') }
-          : path.endsWith('/docker')
+          : path.endsWith('/docker') || path.includes('/Contents/Helpers/agent-desktop')
             ? { entitlements: join(directory, 'empty-entitlements.plist') }
             : configuration.mode === 'self-signed'
               ? {

@@ -18,8 +18,10 @@
     "desktop:windows:build": "node desktop/scripts/build-windows.mjs",
     "desktop:test": "pnpm --dir desktop test",
     "build": "pnpm run typecheck && vite build && node desktop/scripts/build-ui.mjs",
-    "check": "pnpm run typecheck && pnpm run lint && pnpm run format:check",
+    "check": "pnpm run check:apps && pnpm run typecheck && pnpm run lint && pnpm run format:check",
     "lint": "oxlint && node scripts/check-architecture.mjs",
+    "create:app": "tsx scripts/create-app.ts",
+    "check:apps": "tsx scripts/check-apps.ts",
     "test": "tsx --test tests/*.test.ts",
     "start": "node scripts/start.mjs --production",
     "test:integration": "node scripts/test-integration.mjs",
@@ -27,7 +29,8 @@
     "format:check": "prettier --check .",
     "eval:voice": "tsx scripts/voice-eval.ts",
     "eval:capability": "tsx evals/src/cli.ts",
-    "typecheck": "bun check --no-script"
+    "typecheck": "bun check --no-script",
+    "generate:app-schemas": "tsx scripts/app-schemas.ts"
   },
   "dependencies": {
     "@1password/sdk": "0.5.0",
@@ -129,7 +132,7 @@
     "tailwindcss": "^4.3.5",
     "typescript": "^6.0.3",
     "unist-util-visit": "^5.2.0",
-    "vite": "^8.3.5",
+    "vite": "8.3.7",
     "vitest": "5.1.0",
     "yaml": "2.9.1"
   },

@@ -285,7 +285,7 @@ export function VaultItemForm({
     } catch (error) {
       if (current())
         setError(
-          error instanceof ApiError && error.status === 400
+          error instanceof ApiError
             ? error.message
             : kind === 'card'
               ? 'This card could not be saved. Try again.'

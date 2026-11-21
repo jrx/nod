@@ -37,6 +37,7 @@ import {
   verifyIdentity,
   verifyRuntimeRelease,
   verifySignature,
+  copyAgentDesktop,
 } from './release-tools.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -217,6 +218,7 @@ const licenses = join(application, 'Contents', 'Resources', 'licenses');
 await mkdir(licenses, { recursive: true });
 for (const name of ['LICENSE', 'LICENSES.chromium.html'])
   await copy(join(paths[0], name), join(licenses, name));
+await copyAgentDesktop(application);
 let nativeBinaries;
 let applicationNotarization;
 await hardenElectron(application);

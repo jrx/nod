@@ -1,5 +1,9 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { posix } from 'node:path';
+import { bundledApps, appAccessPath, type BundledApp } from './app-catalog.ts';
+import { appRequestUrl, appRequestHeaders } from './app-requests.ts';
+import { appEnvironmentNameSchema, appDefinitionSchema } from '../shared/app-definitions.ts';
+import { appAccessSchema } from './app-access.ts';
+import { isDeepStrictEqual } from 'node:util';
 import type { FastifyInstance } from 'fastify';
 import type { Pool, PoolClient } from 'pg';
 import { z } from 'zod';
@@ -11,13 +15,15 @@ import {
   type DiscoveredOAuthState,
   type DiscoveredTransport,
 } from '../ports/discovered.ts';
-import type { ConnectedCli } from '../ports/computer.ts';
+import type { ConnectedCli, ConnectedCliResult } from '../ports/computer.ts';
 import type { ConnectedMcpServer } from '../ports/agent.ts';
 import type { Connection } from '../shared/contracts.ts';
 import { transaction } from './transaction.ts';
+import { logFailure } from './failure-log.ts';
 import type { createAppGrantVault } from './vault-app-grants.ts';
 import type { TurnRef } from './thread.ts';
 import { isIntegrationFile } from './integration-files.ts';
+import { redactSecretText } from './redaction.ts';
 import type { AnalyticsEvent, CaptureAnalytics } from './analytics.ts';
 import {
   captureConnection,
@@ -26,93 +32,28 @@ import {
   type AnalyticsConnection,
 } from './analytics-connections.ts';
 
-const remoteSpec = String.raw`(?:https|git\+https):\/\/[^\s]+`;
-const cliSourceSchema = z.union([
-  z
-    .object({
-      npm: z
-        .string()
-        .max(512)
-        .regex(
-          new RegExp(
-            String.raw`^(?:(?:@[A-Za-z0-9][\w.~-]*\/)?[A-Za-z0-9][\w.~-]*(?:@(?!(?:file|link|git\+file):|\.{0,2}\/|~)[^@\s](?:[^@\x00-\x1f]*[^@\s])?)?|[A-Za-z0-9][\w.-]*\/[\w.-]+(?:#[^\s#]+)?|(?:github|gitlab|bitbucket):[^\s]+|${remoteSpec})$`,
-          ),
-        ),
-    })
-    .strict(),
-  z
-    .object({
-      pypi: z
-        .string()
-        .max(512)
-        .regex(
-          new RegExp(
-            String.raw`^(?:[A-Za-z0-9](?:[\w.-]*[A-Za-z0-9])?(?:\[[\w., -]+\])?(?:\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[\w.*+!-]+(?:\s*,\s*(?:===|==|!=|~=|>=|<=|>|<)\s*[\w.*+!-]+)*)?|${remoteSpec})$`,
-          ),
-        ),
-    })
-    .strict(),
-  z
-    .object({
-      url: z.url({ protocol: /^https$/, normalize: true }).max(2048),
-      sha256: z
-        .string()
-        .toLowerCase()
-        .regex(/^[a-f0-9]{64}$/)
-        .optional(),
-    })
-    .strict(),
-]);
-const envName = z.string().regex(/^[A-Z][A-Z0-9_]{0,63}(?:TOKEN|KEY|SECRET|PASSWORD|_ID|_SID)$/);
-const pathSchema = z.discriminatedUnion('kind', [
-  z.object({
-    kind: z.literal('http'),
-    endpoint: z.url().max(2048),
-    auth: z.enum(['bearer', 'x-api-key']).default('bearer'),
-    testPath: z.string().min(1).max(500),
-    scope: z.never().optional(),
-    clientIdRequired: z.never().optional(),
-  }),
-  z.object({
-    kind: z.literal('mcp'),
-    endpoint: z.url().max(2048),
-    auth: z.enum(['bearer', 'x-api-key', 'oauth']).default('bearer'),
-    testPath: z.string().max(500).optional(),
-    scope: z.string().trim().min(1).max(500).optional(),
-    clientIdRequired: z.boolean().optional(),
-  }),
-  z.object({
-    kind: z.literal('cli'),
-    command: z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/),
-    auth: z.literal('env').default('env'),
-    env: z
-      .array(envName)
-      .min(1)
-      .refine((names) => new Set(names).size === names.length),
-    source: cliSourceSchema,
-  }),
-]);
+const envName = appEnvironmentNameSchema;
+const manualMcpService = /^mcp-[0-9a-f]{24}$/;
+
 const proposalSchema = z.object({
   service: z
     .string()
     .trim()
     .toLowerCase()
     .regex(/^[a-z][a-z0-9-]{1,39}$/),
-  name: z
-    .string()
-    .trim()
-    .regex(/^[A-Za-z0-9][A-Za-z0-9 .&'_-]{1,79}$/),
-  paths: z.array(pathSchema).min(1).max(4),
+  name: z.string().trim().pipe(appDefinitionSchema.shape.displayName),
+  paths: z.array(appAccessSchema).min(1).max(4),
   setupUrl: z.url().max(2048).optional(),
   setupText: z.string().trim().min(1).max(500).optional(),
   connectionId: z.uuid().optional(),
 });
-type AccessPath = z.infer<typeof pathSchema> & { id: string; local?: boolean };
+type AccessPath = z.infer<typeof appAccessSchema> & { id: string; local?: boolean };
 type AccountRow = {
   id: string;
   owner_id: string;
   service: string;
   name: string;
+  display_name: string | null;
   account_name: string;
   account_id: string;
   paths: AccessPath[];
@@ -124,11 +65,13 @@ type ProposalRow = {
   service: string;
   name: string;
   paths: AccessPath[];
+  display_name?: string | null;
   setup_url: string | null;
   setup_text: string | null;
   account_name: string | null;
   oauth_state_hash: string | null;
   oauth_status: 'pending' | 'completing' | 'connected' | 'cancelled' | 'failed' | null;
+  oauth_error: string | null;
   callback_return_to: ReturnTarget | null;
   connection_id: string | null;
   turn_id: string | null;
@@ -138,14 +81,19 @@ type ReturnTarget = 'apps' | 'onboarding' | 'window' | 'desktop';
 
 const catalogMs = 10 * 60_000;
 
-export const officialMcp = new Map<
-  string,
-  { name: string; endpoint?: string; scope?: string; instancePath?: string; local?: string }
->([
-  ['notion', { name: 'Notion', endpoint: 'https://mcp.notion.com/mcp' }],
-  ['linear', { name: 'Linear', endpoint: 'https://mcp.linear.app/mcp', scope: 'read write' }],
-  ['n8n', { name: 'n8n', instancePath: '/mcp-server/http', local: 'http://localhost:5678' }],
-]);
+const oauthErrors = [
+  'access_denied',
+  'invalid_request',
+  'unauthorized_client',
+  'unsupported_response_type',
+  'invalid_scope',
+  'server_error',
+  'temporarily_unavailable',
+  'interaction_required',
+  'login_required',
+  'consent_required',
+  'account_selection_required',
+];
 
 export class DiscoveredConnectionError extends Error {
   constructor(
@@ -164,7 +112,7 @@ function headers(
   path: Extract<AccessPath, { kind: 'http' | 'mcp' }>,
   token: string,
 ): Record<string, string> {
-  return path.auth === 'x-api-key' ? { 'X-API-Key': token } : { Authorization: `Bearer ${token}` };
+  return appRequestHeaders(path, token);
 }
 
 function credentialVariants(token: string) {
@@ -230,23 +178,10 @@ function redact(
 }
 
 function target(path: Extract<AccessPath, { kind: 'http' }>, relative: string) {
-  if (!relative || relative.length > 2048 || relative.startsWith('//') || relative.includes('\\'))
-    throw error('Use a path in the saved API address.');
   try {
-    const base = new URL(path.endpoint);
-    const url = new URL(
-      relative.startsWith('/') ? relative.slice(1) : relative,
-      base.href.endsWith('/') ? base : `${base.href}/`,
-    );
-    if (/%(?:2e|2f|5c|25)/i.test(url.pathname) || /%(?:2e|2f|5c|25)/i.test(base.pathname))
-      throw new Error();
-    const saved = posix.normalize(decodeURIComponent(base.pathname));
-    const requested = posix.normalize(decodeURIComponent(url.pathname));
-    const prefix = saved.endsWith('/') ? saved : `${saved}/`;
-    if (url.origin !== base.origin || !requested.startsWith(prefix)) throw new Error();
-    return url.href;
-  } catch {
-    throw error('The request must stay in the saved API address.');
+    return appRequestUrl(path.endpoint, relative);
+  } catch (cause) {
+    throw error(cause instanceof Error ? cause.message : String(cause));
   }
 }
 
@@ -254,6 +189,7 @@ export async function createDiscoveredConnections(
   pool: Pool,
   options: {
     ownerId: string;
+    apps?: ReadonlyMap<string, BundledApp>;
     analytics?: CaptureAnalytics;
     analyticsConsent?: () => { enabled: boolean; revision?: string };
     baseUrl: string;
@@ -267,13 +203,21 @@ export async function createDiscoveredConnections(
       environment: Record<string, string>,
       timeoutSeconds?: number,
       signal?: AbortSignal,
-    ) => Promise<{ exitCode: number; output: string }>;
+    ) => Promise<ConnectedCliResult>;
+    verifyCli?: (
+      cli: ConnectedCli,
+      args: string[],
+      environment: Record<string, string>,
+      timeoutSeconds: number,
+      signal?: AbortSignal,
+    ) => Promise<ConnectedCliResult>;
     resumeConnection?: (turnId: string, service: string) => Promise<boolean>;
     local?: (origin: string) => { transport: DiscoveredTransport; oauth: DiscoveredOAuth };
     refresh?: () => void;
   },
 ) {
   const owner = options.ownerId;
+  const apps = options.apps ?? bundledApps;
   function connection(path: AccessPath): AnalyticsConnection {
     return {
       connection_method: path.kind,
@@ -290,9 +234,26 @@ export async function createDiscoveredConnections(
       AnalyticsEvent,
       { event: 'connection_changed' }
     >['properties']['failure_reason'],
+    failure?: { step: string; error?: unknown; path?: AccessPath },
   ) {
     for (const path of row.paths)
       captureConnection(options.analytics, connection(path), status, failureReason);
+    const path = failure?.path ?? row.paths[0];
+    if (status === 'failed')
+      logFailure(
+        'connection_setup_failed',
+        { name: 'ConnectionSetupError' },
+        {
+          method: path?.kind,
+          transport: path?.kind === 'mcp' ? 'streamable-http' : undefined,
+          authMode: path?.auth,
+          step: failure?.step,
+          status: [Object(failure?.error).status, Object(failure?.error).code].find(
+            (value) => Number.isInteger(value) && value >= 400 && value < 600,
+          ),
+          reason: failureReason,
+        },
+      );
   }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS discovered_connections (
@@ -309,10 +270,12 @@ export async function createDiscoveredConnections(
     );
     ALTER TABLE discovered_connections ADD COLUMN IF NOT EXISTS account_id uuid NOT NULL DEFAULT gen_random_uuid(),
       ADD COLUMN IF NOT EXISTS reconnect_required boolean NOT NULL DEFAULT false,
-      ADD COLUMN IF NOT EXISTS replaced_at timestamptz;
+      ADD COLUMN IF NOT EXISTS replaced_at timestamptz,
+      ADD COLUMN IF NOT EXISTS display_name text;
     ALTER TABLE discovered_connection_proposals ADD COLUMN IF NOT EXISTS oauth_status text,
       ADD COLUMN IF NOT EXISTS link_hash text,
       ADD COLUMN IF NOT EXISTS callback_return_to text,
+      ADD COLUMN IF NOT EXISTS oauth_error text,
       ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
   `);
   const interrupted = await transaction(async (recovery) => {
@@ -324,7 +287,7 @@ export async function createDiscoveredConnections(
     for (const row of interrupted.rows) await options.grantVault.remove(row.id, recovery);
     return interrupted.rows;
   }, pool);
-  for (const row of interrupted) track(row, 'failed', 'unavailable');
+  for (const row of interrupted) track(row, 'failed', 'unavailable', { step: 'restart' });
   async function account(id: string) {
     const result = await pool.query<AccountRow>(
       'SELECT * FROM discovered_connections WHERE owner_id=$1 AND id=$2',
@@ -332,6 +295,12 @@ export async function createDiscoveredConnections(
     );
     if (!result.rows[0]) throw error('This connected account is unavailable.', 404);
     return result.rows[0];
+  }
+  async function lockDisplayName(client: PoolClient, service: string) {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2))', [
+      `discovered-mcp-name:${owner}`,
+      service,
+    ]);
   }
   async function list(client?: PoolClient): Promise<Connection[]> {
     const rows = (
@@ -342,7 +311,12 @@ export async function createDiscoveredConnections(
     ).rows;
     return rows.map((row) => ({
       slug: row.service,
-      name: row.name,
+      name: row.display_name ?? row.name,
+      ...(manualMcpService.test(row.service) &&
+      !apps.has(row.service) &&
+      row.paths.some((path) => path.kind === 'mcp')
+        ? { canRename: true }
+        : {}),
       status: row.reconnect_required ? 'disconnected' : 'connected',
       ...(row.reconnect_required ? { canReconnect: true } : {}),
       connectionId: row.id,
@@ -369,33 +343,50 @@ export async function createDiscoveredConnections(
       expired: boolean;
       link_hash: string | null;
       oauth_status: ProposalRow['oauth_status'];
+      oauth_error: string | null;
     }>(
-      `SELECT id,service AS slug,name,oauth_status IS NOT DISTINCT FROM 'connected' AS completed,
-       expires_at<=now() AS expired,link_hash,oauth_status
-       FROM discovered_connection_proposals WHERE owner_id=$1
+      `SELECT id,service AS slug,
+       COALESCE((SELECT min(display_name) FROM discovered_connections
+                 WHERE owner_id=p.owner_id AND service=p.service),name) AS name,
+       oauth_status IS NOT DISTINCT FROM 'connected' AS completed,
+       expires_at<=now() AS expired,link_hash,oauth_status,oauth_error
+       FROM discovered_connection_proposals p WHERE owner_id=$1
        AND (id=ANY($2::uuid[]) OR link_hash=ANY($3::text[]))`,
       [owner, requested, hashes],
     );
-    return result.rows.map(({ oauth_status, ...row }) => ({
+    return result.rows.map(({ oauth_status, oauth_error, ...row }) => ({
       ...row,
       ...(row.link_hash && hashes.includes(row.link_hash)
         ? {
             available:
               !row.expired && (oauth_status === 'pending' || oauth_status === 'completing'),
+            ...(oauth_status === 'failed' && oauth_error ? { error: oauth_error } : {}),
           }
         : {}),
     }));
   }
-  async function create(input: unknown, turn?: TurnRef, returnTo?: ReturnTarget) {
+  async function create(
+    input: unknown,
+    turn?: TurnRef,
+    returnTo?: ReturnTarget,
+    localOrigin?: string,
+  ) {
     const parsed = proposalSchema.parse(input);
+    const reviewed = apps.get(parsed.service);
+    if (
+      reviewed &&
+      !reviewed.instancePath &&
+      !isDeepStrictEqual(parsed.paths, [appAccessSchema.parse(appAccessPath(reviewed))])
+    )
+      throw error('Use the reviewed connection definition for this app.', 409);
     let name = parsed.name;
     if (parsed.paths.some((path) => path.auth === 'oauth')) {
-      if (parsed.paths.length !== 1 || parsed.paths[0].kind !== 'mcp')
-        throw error('OAuth needs one MCP access path.');
+      if (parsed.paths.length !== 1 || parsed.paths[0].kind === 'cli')
+        throw error('OAuth needs one app access path.');
     }
     if (
       parsed.paths.some(
-        (path) => path.kind === 'mcp' && path.clientIdRequired && path.auth !== 'oauth',
+        (path) => path.kind !== 'cli' && path.clientIdRequired && path.auth !== 'oauth',
       )
     )
       throw error('A client ID needs an OAuth access path.');
@@ -427,10 +418,17 @@ export async function createDiscoveredConnections(
         paths.push({ ...path, id: pathId });
         continue;
       }
+      const local =
+        localOrigin !== undefined &&
+        options.local !== undefined &&
+        new URL(path.endpoint).origin === localOrigin;
       const checked = {
         ...path,
-        endpoint: await options.transport.validateEndpoint(path.endpoint),
+        endpoint: local
+          ? await options.local!(localOrigin!).transport.validateEndpoint(path.endpoint)
+          : await options.transport.validateEndpoint(path.endpoint),
         id: pathId,
+        ...(local ? { local: true } : {}),
       };
       if (checked.kind === 'http') target(checked, checked.testPath);
       paths.push(checked);
@@ -469,12 +467,13 @@ export async function createDiscoveredConnections(
     return bound;
   }
   async function nearby(service: string) {
-    const server = officialMcp.get(service);
-    if (!server?.local || !options.local) return undefined;
+    const server = apps.get(service);
+    const local = service === 'n8n' ? 'http://localhost:5678' : undefined;
+    if (!server?.instancePath || !local || !options.local) return undefined;
     const answer = await options
-      .local(server.local)
+      .local(local)
       .transport.http(
-        `${server.local}/.well-known/oauth-protected-resource${server.instancePath}`,
+        `${local}/.well-known/oauth-protected-resource${server.instancePath}`,
         {},
         'GET',
         undefined,
@@ -482,7 +481,7 @@ export async function createDiscoveredConnections(
       )
       .catch(() => undefined);
     const body = answer && 'body' in answer ? (answer.body as { resource?: unknown }) : null;
-    return typeof body?.resource === 'string' ? server.local : undefined;
+    return typeof body?.resource === 'string' ? local : undefined;
   }
   async function addressProposal(
     service: string,
@@ -490,7 +489,7 @@ export async function createDiscoveredConnections(
     connectionId?: string,
     returnTo?: ReturnTarget,
   ) {
-    const server = officialMcp.get(service)!;
+    const server = apps.get(service)!;
     let name = server.name;
     if (connectionId) {
       const existing = await account(connectionId);
@@ -515,7 +514,7 @@ export async function createDiscoveredConnections(
       .strict()
       .parse(input);
     const pending = await proposal(id);
-    const server = officialMcp.get(pending.service);
+    const server = apps.get(pending.service);
     if (!server?.instancePath || pending.paths.length)
       throw error('This connection does not take an address.');
     if (
@@ -536,7 +535,8 @@ export async function createDiscoveredConnections(
     let endpoint = `${url.origin}${servicePath}`;
     let local = false;
     await options.transport.validateEndpoint(endpoint).catch(async () => {
-      if (!options.local) throw error(`Use a public HTTPS address for ${server.name}.`);
+      if (pending.service !== 'n8n' || !options.local)
+        throw error(`Use a public HTTPS address for ${server.name}.`);
       if (schemeless) url.protocol = 'http:';
       endpoint = `${url.origin}${servicePath}`;
       await options
@@ -593,16 +593,19 @@ export async function createDiscoveredConnections(
       [id, owner, JSON.stringify([path]), url.host, same ?? null],
     );
     if (!updated.rowCount) throw error('This connection request expired.', 409);
-    const unreachable = parsed.token
-      ? `Nod could not use this token at ${url.host}. Check the address and the token in ${server.name} under Settings, Instance-level MCP.`
-      : `${server.name} did not answer at ${url.host}. Check the address, and turn on MCP access in ${server.name} under Settings, Instance-level MCP.`;
+    const unreachable =
+      pending.service !== 'n8n'
+        ? `${server.name} MCP setup failed.`
+        : parsed.token
+          ? `Nod could not use this token at ${url.host}. Check the address and the token in ${server.name} under Settings, Instance-level MCP.`
+          : `${server.name} did not answer at ${url.host}. Check the address, and turn on MCP access in ${server.name} under Settings, Instance-level MCP.`;
     try {
       return parsed.token
         ? await complete(id, { token: parsed.token, accountName: url.host })
         : await beginOAuth(id, { returnTo: parsed.returnTo });
     } catch (cause) {
       await pool.query(
-        `UPDATE discovered_connection_proposals SET paths='[]'::jsonb,oauth_status=NULL,oauth_state_hash=NULL
+        `UPDATE discovered_connection_proposals SET paths='[]'::jsonb,oauth_status=NULL,oauth_error=NULL,oauth_state_hash=NULL
          WHERE id=$1 AND owner_id=$2 AND (oauth_status IS NULL OR oauth_status IN ('pending','failed'))`,
         [id, owner],
       );
@@ -612,28 +615,30 @@ export async function createDiscoveredConnections(
         cause.statusCode !== 409
       )
         throw cause;
-      throw error(unreachable, 502);
+      const detail = cause instanceof Error ? cause.message : 'The MCP setup failed.';
+      throw error(
+        `${unreachable} ${parsed.token ? String(redact(detail, parsed.token)) : detail}`,
+        502,
+      );
     }
   }
   function official(service: string, connectionId?: string) {
-    const server = officialMcp.get(service);
-    if (!server?.endpoint) throw error('This service is unavailable.', 404);
+    const server = apps.get(service);
+    if (!server) throw error('This service is unavailable.', 404);
+    if (server.kind === 'cli' && !options.verifyCli)
+      throw error(
+        'This app cannot check its connection because connected command tools are unavailable.',
+        503,
+      );
     return {
       service,
       name: server.name,
-      paths: [
-        {
-          kind: 'mcp',
-          endpoint: server.endpoint,
-          auth: 'oauth',
-          ...(server.scope ? { scope: server.scope } : {}),
-        },
-      ],
+      paths: [appAccessPath(server)],
       ...(connectionId ? { connectionId } : {}),
     };
   }
   async function signIn(service: string, turn?: TurnRef, connectionId?: string) {
-    if (officialMcp.get(service)?.instancePath) return addressProposal(service, turn, connectionId);
+    if (apps.get(service)?.instancePath) return addressProposal(service, turn, connectionId);
     return propose(official(service, connectionId), turn);
   }
   async function authorize(
@@ -658,10 +663,17 @@ export async function createDiscoveredConnections(
         ...(await beginOAuth(pending.id, { restart: true, returnTo }, hash)),
       };
     }
-    if (officialMcp.get(service)?.instancePath)
+    if (apps.get(service)?.instancePath)
       return addressProposal(service, undefined, connectionId, returnTo);
     const { id, name } = await create(official(service, connectionId), undefined, returnTo);
-    return { name, ...(await beginOAuth(id, { returnTo })) };
+    const server = apps.get(service)!;
+    const access = appAccessPath(server);
+    return {
+      name,
+      ...(server.auth === 'oauth' && !('clientIdRequired' in access && access.clientIdRequired)
+        ? await beginOAuth(id, { returnTo })
+        : { url: `/apps?connect=${id}` }),
+    };
   }
   async function abandonSetup(linkHash: string, reason: 'cancelled' | 'unavailable' | 'unknown') {
     const abandoned = await transaction(async (client) => {
@@ -673,14 +685,15 @@ export async function createDiscoveredConnections(
       for (const row of rows) await options.grantVault.remove(row.id, client);
       return rows;
     }, pool);
-    for (const row of abandoned) track(row, 'failed', reason);
+    for (const row of abandoned) track(row, 'failed', reason, { step: 'authorize' });
     return abandoned.length > 0;
   }
   async function proposal(id: string, client: Pool | PoolClient = pool, lock = false) {
     const row = (
       await client.query<ProposalRow>(
-        `SELECT id,owner_id,service,name,paths,connection_id,turn_id,setup_url,setup_text,account_name,oauth_state_hash,oauth_status,callback_return_to,created_at
-       FROM discovered_connection_proposals
+        `SELECT id,owner_id,service,name,paths,connection_id,turn_id,setup_url,setup_text,account_name,oauth_state_hash,oauth_status,oauth_error,callback_return_to,created_at,
+       (SELECT min(display_name) FROM discovered_connections WHERE owner_id=p.owner_id AND service=p.service) AS display_name
+       FROM discovered_connection_proposals p
        WHERE id=$1 AND owner_id=$2 AND expires_at>now()${lock ? ' FOR UPDATE' : ''}`,
         [z.uuid().parse(id), owner],
       )
@@ -732,9 +745,16 @@ export async function createDiscoveredConnections(
           ],
         );
       } else {
+        const sharesName =
+          manualMcpService.test(pending.service) &&
+          pending.paths.some((path) => path.kind === 'mcp');
+        if (sharesName) await lockDisplayName(client, pending.service);
         await client.query(
-          `INSERT INTO discovered_connections
-           (id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)`,
+          `INSERT INTO discovered_connections (id,owner_id,service,name,account_name,paths,display_name)
+           VALUES($1,$2,$3,$4,$5,$6,
+             CASE WHEN $7 THEN
+               (SELECT min(display_name) FROM discovered_connections WHERE owner_id=$2 AND service=$3)
+             END)`,
           [
             idToSave,
             owner,
@@ -742,6 +762,7 @@ export async function createDiscoveredConnections(
             pending.name,
             accountName,
             JSON.stringify(pending.paths),
+            sharesName,
           ],
         );
       }
@@ -755,10 +776,29 @@ export async function createDiscoveredConnections(
       : false;
     return { ok: true, continued: Boolean(continued) };
   }
+  async function verifyHttp(path: Extract<AccessPath, { kind: 'http' }>, token: string) {
+    if (!path.testPath) throw error('The API path needs a read test.');
+    const response = await via(path).transport.http(
+      target(path, path.testPath),
+      headers(path, token),
+      path.testMethod ?? 'GET',
+      path.testBody,
+    );
+    if (response.status < 200 || response.status >= 300)
+      throw Object.assign(
+        new Error(
+          `The service answered ${response.status}: ${JSON.stringify('body' in response ? response.body : null).slice(0, 4000)}`,
+        ),
+        { status: response.status },
+      );
+  }
   async function complete(id: string, input: unknown) {
     const { token: entered, accountName } = z
       .object({
-        token: z.union([z.string().trim().min(8), z.record(envName, z.string().trim().min(8))]),
+        token: z.union([
+          z.string().trim().min(1).max(8192),
+          z.record(envName, z.string().trim().min(1).max(8192)),
+        ]),
         accountName: z.string().trim().min(1).max(200),
       })
       .strict()
@@ -786,32 +826,62 @@ export async function createDiscoveredConnections(
             path.endpoint,
             headers(path, token),
           );
-          if (!tools.length) throw new Error();
+          if (!tools.length) throw new Error('The server listed no tools.');
         } else if (path.kind === 'http') {
-          if (!path.testPath) throw error('The API path needs a read test.');
-          const response = await via(path).transport.http(
-            target(path, path.testPath),
-            headers(path, token),
-            'GET',
+          await verifyHttp(path, token);
+        } else if (path.testArgv) {
+          if (!options.verifyCli) throw error('The app connection check is unavailable.', 503);
+          const environment =
+            path.env.length > 1
+              ? z.record(envName, z.string()).parse(JSON.parse(token))
+              : { [path.env[0]]: token };
+          const result = await options.verifyCli(
+            { id: path.id, command: path.command, source: path.source },
+            path.testArgv,
+            environment,
+            path.testTimeoutSeconds ?? 30,
           );
-          if (response.status < 200 || response.status >= 300)
-            throw Object.assign(new Error(), { status: response.status });
+          if (result.exitCode !== 0)
+            throw new Error(
+              `The app read check exited with status ${result.exitCode}: ${result.output.slice(0, 4000)}`,
+            );
+          const output = result.stdout ?? result.output;
+          if (!output.trim()) throw new Error('The app read check returned no data.');
+          if (path.testFormat !== 'text') {
+            try {
+              JSON.parse(output);
+            } catch {
+              throw new Error('The app read check did not return valid JSON.');
+            }
+          }
         }
       } catch (cause) {
-        track(pending, 'failed', 'verification_failed');
         const status = [Object(cause).status, Object(cause).code].find(
           (value) => Number.isInteger(value) && value >= 400 && value < 600,
         );
-        throw error(
-          `The ${path.kind.toUpperCase()} access path could not be verified${status ? `: the service answered ${status}` : ''}.`,
-          409,
+        track(pending, 'failed', 'verification_failed', {
+          step: path.kind === 'mcp' ? 'list_tools' : 'read_test',
+          error: cause,
+          path,
+        });
+        const values = typeof entered === 'string' ? [entered] : Object.values(entered);
+        const reason =
+          cause instanceof Error && cause.message
+            ? cause.message
+            : status
+              ? `The service answered ${status}.`
+              : 'The service did not confirm access.';
+        const safe = [token, ...values].reduce(
+          (value, secret) => String(redact(value, secret)),
+          reason,
         );
+        throw error(`The connection could not be verified: ${safe}`, 409);
       }
     }
     try {
       return await save(pending, accountName, token);
     } catch (error) {
-      track(pending, 'failed', 'unknown');
+      track(pending, 'failed', 'unknown', { step: 'save', error });
       throw error;
     }
   }
@@ -839,6 +909,7 @@ export async function createDiscoveredConnections(
       : restartAttempt;
     let attempt: ProposalRow | undefined;
     let authorizationFailed = false;
+    let authorizationError: unknown;
     try {
       const result = await transaction(async (client) => {
         const pending = await proposal(id, client, true);
@@ -848,7 +919,7 @@ export async function createDiscoveredConnections(
         )
           throw error('This sign-in changed. Use the newest window or try again.', 409);
         const path = pending.paths[0];
-        if (path?.kind !== 'mcp' || path.auth !== 'oauth')
+        if (!path || path.kind === 'cli' || path.auth !== 'oauth')
           throw error('This connection uses a token.');
         if (pending.oauth_status === 'connected')
           throw error('This app is already connected.', 409);
@@ -887,14 +958,21 @@ export async function createDiscoveredConnections(
             state,
             path.scope,
             selectedClientId,
+            path.kind === 'http' ? path.oauth : undefined,
           );
-        } catch {
+        } catch (cause) {
           authorizationFailed = true;
-          throw error('The service sign-in could not start. Check its access method.', 502);
+          authorizationError = cause;
+          const reason =
+            (cause instanceof Error && (cause.message || Object(cause).errorCode)) || String(cause);
+          throw error(
+            `The service sign-in could not start: ${redactSecretText(String(reason)).slice(0, 500)}`,
+            502,
+          );
         }
         const updated = await client.query(
           `UPDATE discovered_connection_proposals
-         SET account_name=$3,oauth_state_hash=$4,oauth_status='pending',link_hash=$5,callback_return_to=$6
+         SET account_name=$3,oauth_state_hash=$4,oauth_status='pending',oauth_error=NULL,link_hash=$5,callback_return_to=$6
          WHERE id=$1 AND owner_id=$2 AND expires_at>now()`,
           [
             pending.id,
@@ -924,7 +1002,16 @@ export async function createDiscoveredConnections(
     } catch (error) {
       if (attempt) {
         track(attempt, 'started');
-        track(attempt, 'failed', authorizationFailed ? 'authorization_failed' : 'unknown');
+        track(attempt, 'failed', authorizationFailed ? 'authorization_failed' : 'unknown', {
+          step: authorizationFailed ? 'authorize' : 'save',
+          error: authorizationFailed ? authorizationError : error,
+        });
+        await pool
+          .query(
+            'UPDATE discovered_connection_proposals SET oauth_error=NULL WHERE id=$1 AND owner_id=$2',
+            [attempt.id, owner],
+          )
+          .catch((cause: unknown) => logFailure('connection_reason_clear_failed', cause));
       }
       throw error;
     }
@@ -935,6 +1022,7 @@ export async function createDiscoveredConnections(
         state: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
         code: z.string().min(1).optional(),
         error: z.string().optional(),
+        error_description: z.string().optional().catch(undefined),
         iss: z.string().optional(),
       })
       .parse(input);
@@ -955,17 +1043,30 @@ export async function createDiscoveredConnections(
         | 'verification_failed'
         | 'invalid_configuration'
         | 'unknown' = 'authorization_failed',
+      failure: { step: string; error?: unknown } = { step: 'callback' },
+      message?: string,
     ) {
       const changed = await transaction(async (client) => {
         const changed = await client.query(
-          `UPDATE discovered_connection_proposals SET oauth_status=$4,oauth_state_hash=NULL
+          `UPDATE discovered_connection_proposals SET oauth_status=$4,oauth_error=$5,oauth_state_hash=NULL
            WHERE id=$1 AND owner_id=$2 AND oauth_state_hash=$3 AND oauth_status='completing' RETURNING id`,
-          [pending.id, owner, hash, outcome],
+          [
+            pending.id,
+            owner,
+            hash,
+            outcome,
+            message &&
+              `Sign-in could not finish: ${redactSecretText(message.replaceAll('\0', ''))}`.slice(
+                0,
+                500,
+              ),
+          ],
         );
         if (changed.rowCount) await options.grantVault.remove(pending.id, client);
         return Boolean(changed.rowCount);
       }, pool);
-      if (changed) track(pending, 'failed', outcome === 'cancelled' ? 'cancelled' : reason);
+      if (changed)
+        track(pending, 'failed', outcome === 'cancelled' ? 'cancelled' : reason, failure);
       return {
         outcome,
         service: pending.service,
@@ -974,32 +1075,60 @@ export async function createDiscoveredConnections(
           pending.callback_return_to ?? (pending.turn_id ? ('chat' as const) : ('apps' as const)),
       };
     }
-    if (parsed.error || !parsed.code) return failed('cancelled');
+    if (parsed.error || !parsed.code)
+      return failed(
+        parsed.error === 'access_denied' ? 'cancelled' : 'failed',
+        undefined,
+        {
+          step: 'callback',
+          error: {
+            code: !parsed.error
+              ? 'missing_code'
+              : oauthErrors.includes(parsed.error)
+                ? parsed.error
+                : 'other',
+          },
+        },
+        parsed.error === 'access_denied'
+          ? undefined
+          : [parsed.error || 'no authorization code', parsed.error_description]
+              .filter(Boolean)
+              .join(': '),
+      );
     const path = pending.paths[0];
-    if (path?.kind !== 'mcp' || path.auth !== 'oauth')
+    if (!path || path.kind === 'cli' || path.auth !== 'oauth')
       return failed('failed', 'invalid_configuration');
     let failureReason: 'authorization_failed' | 'verification_failed' | 'unknown' =
       'authorization_failed';
+    let step = 'callback';
+    const secrets: string[] = [];
     try {
       const grant = JSON.parse((await options.grantVault.read(pending.id)).value);
       const saved = (grant.state ?? grant) as DiscoveredOAuthState;
       const metadata = saved.discovery?.authorizationServerMetadata;
       const issuer = metadata?.issuer;
-      if (parsed.iss && parsed.iss !== issuer) throw new Error();
+      if (parsed.iss && parsed.iss !== issuer) throw new Error('The issuer does not match.');
       if (
         metadata &&
         'authorization_response_iss_parameter_supported' in metadata &&
         metadata.authorization_response_iss_parameter_supported === true &&
         parsed.iss !== issuer
       )
-        throw new Error();
+        throw new Error('The issuer does not match.');
+      step = 'token';
       const connected = await via(path).oauth.finish(path.endpoint, saved, parsed.code);
       const token = connected.tokens?.access_token;
-      if (!token) throw new Error();
+      secrets.push(token ?? '', connected.tokens?.refresh_token ?? '');
+      if (!token) throw new Error('The service returned no access token.');
       failureReason = 'verification_failed';
-      if (!(await via(path).transport.listTools(path.endpoint, headers(path, token))).tools.length)
-        throw new Error();
+      step = path.kind === 'http' ? 'read_test' : 'list_tools';
+      if (path.kind === 'http') await verifyHttp(path, token);
+      else if (
+        !(await via(path).transport.listTools(path.endpoint, headers(path, token))).tools.length
+      )
+        throw new Error('The server listed no tools.');
       failureReason = 'unknown';
+      step = 'save';
       const result = await save(
         pending,
         pending.account_name ?? 'Account',
@@ -1012,8 +1141,17 @@ export async function createDiscoveredConnections(
         returnTo:
           pending.callback_return_to ?? (pending.turn_id ? ('chat' as const) : ('apps' as const)),
       };
-    } catch {
-      return failed('failed', failureReason);
+    } catch (error) {
+      const message = (error instanceof Error && error.message) || String(error);
+      return failed(
+        'failed',
+        failureReason,
+        {
+          step,
+          error,
+        },
+        secrets.reduce((text, secret) => (secret ? String(redact(text, secret)) : text), message),
+      );
     }
   }
   const refreshes = new Map<
@@ -1025,10 +1163,10 @@ export async function createDiscoveredConnections(
       settled: boolean;
     }
   >();
-  async function signInRequired(id: string, required: boolean) {
+  async function signInRequired(row: AccountRow, required: boolean) {
     const changed = await pool.query(
-      'UPDATE discovered_connections SET reconnect_required=$3 WHERE id=$1 AND owner_id=$2 AND reconnect_required<>$3',
-      [id, owner, required],
+      'UPDATE discovered_connections SET reconnect_required=$3 WHERE id=$1 AND owner_id=$2 AND reconnect_required<>$3 AND account_id=$4 AND paths=$5::jsonb',
+      [row.id, owner, required, row.account_id, JSON.stringify(row.paths)],
     );
     if (changed.rowCount) options.refresh?.();
   }
@@ -1043,17 +1181,48 @@ export async function createDiscoveredConnections(
     allowStale = false,
   ): Promise<DiscoveredCatalog> {
     signal?.throwIfAborted();
-    const key = `${row.id}:${path.id}:${row.account_id}`;
+    const key = JSON.stringify([row.id, row.account_id, path]);
     const cached = catalogs.get(key);
     if (cached && Date.now() - cached.at < catalogMs)
       return allowStale && cached.ready ? cached.ready : cached.value;
     const value = (async () => {
+      await assertBinding(row);
+      signal?.throwIfAborted();
       const token = await tokenFor(row, path, signal);
-      const { tools, instructions } = await via(path).transport.listTools(
-        path.endpoint,
-        headers(path, token),
-        signal,
-      );
+      await assertBinding(row);
+      signal?.throwIfAborted();
+      const { tools, instructions } = await via(path)
+        .transport.listTools(path.endpoint, headers(path, token), signal)
+        .catch((cause: unknown) => {
+          signal?.throwIfAborted();
+          const fields =
+            cause && typeof cause === 'object' ? (cause as Record<string, unknown>) : {};
+          const status = [fields.status, fields.statusCode].find(
+            (value) =>
+              typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599,
+          );
+          const code =
+            (typeof fields.code === 'number' && Number.isFinite(fields.code)) ||
+            typeof fields.code === 'string'
+              ? String(redact(String(fields.code), token)).slice(0, 100)
+              : undefined;
+          const detail = [
+            status === undefined ? undefined : `status ${status}`,
+            code === undefined ? undefined : `code ${code}`,
+          ]
+            .filter(Boolean)
+            .join('; ');
+          throw Object.assign(
+            error(
+              `The connected MCP tool list failed${detail ? ` (${detail})` : ''}: ${String(redact(cause instanceof Error ? cause.message : String(cause), token)).slice(0, 4000)}`,
+              502,
+            ),
+            { notRun: true, ...(status === undefined ? {} : { upstreamStatus: status }) },
+          );
+        });
+      signal?.throwIfAborted();
+      await assertBinding(row);
+      signal?.throwIfAborted();
       return {
         tools: tools.map((tool) => redact(tool, token) as DiscoveredTool),
         ...(instructions
@@ -1069,12 +1238,12 @@ export async function createDiscoveredConnections(
       },
       () => {
         if (catalogs.get(key) !== entry) return;
-        if (cached) catalogs.set(key, { ...cached, at: Date.now() });
+        if (cached) catalogs.set(key, cached);
         else catalogs.delete(key);
       },
     );
     if (allowStale && entry.ready) return entry.ready;
-    return cached ? value.catch(() => cached.value) : value;
+    return cached && allowStale ? value.catch(() => cached.value) : value;
   }
   async function tokenFor(
     row: AccountRow,
@@ -1082,50 +1251,69 @@ export async function createDiscoveredConnections(
     signal?: AbortSignal,
   ): Promise<string> {
     signal?.throwIfAborted();
-    const grant = await options.grantVault.read(row.id);
+    const readGrant = () =>
+      transaction(
+        async (client) => {
+          await assertBinding(row, undefined, client);
+          return options.grantVault.read(row.id, client);
+        },
+        pool,
+        signal,
+      );
+    const grant = await readGrant();
     signal?.throwIfAborted();
     const secret = grant.value;
     if (path.auth !== 'oauth') return secret;
     const saved = JSON.parse(secret) as DiscoveredOAuthState;
     if (!saved.tokens?.access_token) {
-      await signInRequired(row.id, true);
+      await signInRequired(row, true);
       throw Object.assign(error('Connect this account again.', 409), { reason: 'authentication' });
     }
     if (!saved.expiresAt || saved.expiresAt > Date.now() + 60_000) return saved.tokens.access_token;
-    let current = refreshes.get(row.id);
+    const refreshKey = JSON.stringify([row.id, row.account_id, row.paths]);
+    let current = refreshes.get(refreshKey);
     if (!current || current.controller.signal.aborted) {
       const controller = new AbortController();
       const pending = (async () => {
+        await assertBinding(row);
+        controller.signal.throwIfAborted();
         const next = await via(path)
           .oauth.refresh(path.endpoint, saved, controller.signal)
           .catch(async (cause: unknown) => {
-            if (cause instanceof DiscoveredSignInRequired) await signInRequired(row.id, true);
+            if (cause instanceof DiscoveredSignInRequired) await signInRequired(row, true);
             throw cause;
           });
         if (!next.tokens?.access_token) throw new Error();
-        const changed = await options.grantVault.replace(
-          row.id,
-          grant.version,
-          JSON.stringify(next),
+        const token = await transaction(
+          async (client) => {
+            await assertBinding(row, undefined, client);
+            const changed = await options.grantVault.replace(
+              row.id,
+              grant.version,
+              JSON.stringify(next),
+              client,
+            );
+            if (changed) return next.tokens!.access_token!;
+            const latest = JSON.parse(
+              (await options.grantVault.read(row.id, client)).value,
+            ) as DiscoveredOAuthState;
+            if (!latest.tokens?.access_token || (latest.expiresAt ?? 0) <= Date.now())
+              throw new Error();
+            return latest.tokens.access_token;
+          },
+          pool,
+          controller.signal,
         );
-        let token = next.tokens.access_token;
-        if (!changed) {
-          const latest = JSON.parse(
-            (await options.grantVault.read(row.id)).value,
-          ) as DiscoveredOAuthState;
-          if (!latest.tokens?.access_token || (latest.expiresAt ?? 0) <= Date.now())
-            throw new Error();
-          token = latest.tokens.access_token;
-        }
-        await signInRequired(row.id, false);
+        await assertBinding(row);
+        await signInRequired(row, false);
         return token;
       })();
       const created = { promise: pending, controller, waiters: 0, settled: false };
-      refreshes.set(row.id, created);
+      refreshes.set(refreshKey, created);
       void pending
         .finally(() => {
           created.settled = true;
-          if (refreshes.get(row.id) === created) refreshes.delete(row.id);
+          if (refreshes.get(refreshKey) === created) refreshes.delete(refreshKey);
         })
         .catch(() => {});
       current = created;
@@ -1149,12 +1337,14 @@ export async function createDiscoveredConnections(
         (cause: unknown) =>
           finish(() =>
             reject(
-              Object.assign(error('Connect this account again.', 409), {
-                reason:
-                  cause instanceof DiscoveredSignInRequired
-                    ? 'authentication'
-                    : serviceFailureReason(cause),
-              }),
+              cause instanceof DiscoveredConnectionError && 'notRun' in cause
+                ? cause
+                : Object.assign(error('Connect this account again.', 409), {
+                    reason:
+                      cause instanceof DiscoveredSignInRequired
+                        ? 'authentication'
+                        : serviceFailureReason(cause),
+                  }),
             ),
           ),
       );
@@ -1188,7 +1378,19 @@ export async function createDiscoveredConnections(
     );
     const row = rows.rows[0];
     if (!row) throw error('This service is unavailable.', 404);
-    return propose(
+    const reviewed = apps.get(service);
+    if (reviewed && !reviewed.instancePath) {
+      const { id, name } = await create(
+        official(service, row.reconnect_required && !newAccount ? row.id : undefined),
+        undefined,
+        returnTo,
+      );
+      return { name, url: `/apps?connect=${id}` };
+    }
+    const localOrigin = row.paths.flatMap((path) =>
+      path.kind !== 'cli' && path.local ? [new URL(path.endpoint).origin] : [],
+    )[0];
+    const { id, name } = await create(
       {
         service,
         name: row.name,
@@ -1202,6 +1404,13 @@ export async function createDiscoveredConnections(
               auth: path.auth,
               env: path.env,
               source: path.source,
+              ...(path.testArgv
+                ? {
+                    testArgv: path.testArgv,
+                    testTimeoutSeconds: path.testTimeoutSeconds,
+                    testFormat: path.testFormat,
+                  }
+                : {}),
             };
           }
           return {
@@ -1209,6 +1418,14 @@ export async function createDiscoveredConnections(
             endpoint: path.endpoint,
             auth: path.auth,
             ...(path.testPath ? { testPath: path.testPath } : {}),
+            ...(path.kind === 'http'
+              ? {
+                  apiKeyHeader: path.apiKeyHeader,
+                  testMethod: path.testMethod,
+                  testBody: path.testBody,
+                  oauth: path.oauth,
+                }
+              : {}),
             ...(path.scope ? { scope: path.scope } : {}),
             ...(path.clientIdRequired ? { clientIdRequired: path.clientIdRequired } : {}),
           };
@@ -1216,7 +1433,9 @@ export async function createDiscoveredConnections(
       },
       undefined,
       returnTo,
+      localOrigin,
     );
+    return { name: row.display_name ?? name, url: `/apps?connect=${id}` };
   }
   async function search(query: string, connectionId?: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
@@ -1244,10 +1463,22 @@ export async function createDiscoveredConnections(
                 id: path.id,
                 kind: path.kind,
                 endpoint: path.kind === 'cli' ? path.command : path.endpoint,
+                ...(path.kind === 'http'
+                  ? {
+                      readCheck: {
+                        method: path.testMethod ?? 'GET',
+                        path: path.testPath,
+                        ...(path.testBody !== undefined ? { body: path.testBody } : {}),
+                      },
+                    }
+                  : path.testArgv
+                    ? { readCheck: { argv: path.testArgv } }
+                    : {}),
               };
             try {
               const { tools: available, instructions } = await catalog(row, path, signal);
-              const accountMatch = score(row.service) || score(row.name);
+              const accountMatch =
+                score(row.service) || score(row.name) || score(row.display_name ?? '');
               const matching = available
                 .map((tool) => ({ tool, score: score(`${tool.name} ${tool.description ?? ''}`) }))
                 .filter((entry) => entry.score)
@@ -1278,7 +1509,15 @@ export async function createDiscoveredConnections(
             }
           }),
         );
-        return { connectionId: row.id, service: row.service, accountName: row.account_name, paths };
+        const app = apps.get(row.service);
+        return {
+          connectionId: row.id,
+          service: row.service,
+          ...(row.display_name ? { name: row.display_name } : {}),
+          accountName: row.account_name,
+          ...(app ? { description: app.description, documentation: app.contract.source } : {}),
+          paths,
+        };
       }),
     );
     return { accounts };
@@ -1300,7 +1539,7 @@ export async function createDiscoveredConnections(
                     connectionId: row.id,
                     pathId: path.id,
                     service: row.service,
-                    name: row.name,
+                    name: row.display_name ?? row.name,
                     accountName: row.account_name,
                     ...(instructions ? { instructions } : {}),
                     tools,
@@ -1341,7 +1580,15 @@ export async function createDiscoveredConnections(
       if (path.kind !== 'cli') throw error('Choose a CLI access path.');
       if (!path.source || !path.env)
         throw error('Propose this CLI again with its install source and connectionId.', 409);
-      const argv = z.array(z.string().min(1)).min(1).parse(args.argv);
+      const argv = z
+        .array(
+          z
+            .string()
+            .min(1)
+            .refine((value) => !value.includes('\0')),
+        )
+        .min(1)
+        .parse(args.argv);
       const timeoutSeconds = z.number().int().min(1).optional().parse(args.timeoutSeconds);
       return { row, call: { kind: 'cli' as const, path, argv, timeoutSeconds } };
     }
@@ -1360,6 +1607,54 @@ export async function createDiscoveredConnections(
     ).rows[0];
     return row ? JSON.stringify([row.account_id, row.paths]) : undefined;
   }
+  async function assertBinding(
+    row: AccountRow,
+    expectedBinding = JSON.stringify([row.account_id, row.paths]),
+    client?: PoolClient,
+  ) {
+    const current = await binding(row.id, client);
+    if (current !== JSON.stringify([row.account_id, row.paths]) || current !== expectedBinding)
+      throw Object.assign(error('This connected account changed.', 409), { notRun: true });
+  }
+  async function approvalDetails(
+    action: 'CONNECTED_HTTP' | 'CONNECTED_MCP_CALL',
+    args: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) {
+    args = structuredClone(args);
+    signal?.throwIfAborted();
+    const { row, call } = await selected(action, args);
+    const verifiedBinding = JSON.stringify([row.account_id, row.paths]);
+    await assertBinding(row);
+    signal?.throwIfAborted();
+    const account = { name: row.display_name ?? row.name, identity: row.account_name };
+    if (call.kind === 'http')
+      return {
+        account,
+        request: {
+          method: call.method,
+          url: call.url,
+          ...(call.method !== 'GET' && args.body !== undefined ? { body: args.body } : {}),
+        },
+        verifiedBinding,
+      };
+    if (call.kind !== 'mcp') throw error('Choose an MCP access path.');
+    const { tools } = await catalog(row, call.path, signal);
+    await assertBinding(row);
+    signal?.throwIfAborted();
+    const matches = tools.filter((tool) => tool.name === call.tool);
+    if (matches.length !== 1)
+      throw error('The selected MCP tool is unavailable in this connection’s tool list.', 409);
+    return {
+      account: {
+        ...account,
+        method: call.path.kind,
+        endpoint: call.path.endpoint,
+      },
+      tool: matches[0]!,
+      verifiedBinding,
+    };
+  }
   async function execute(
     action: string,
     args: Record<string, unknown>,
@@ -1367,7 +1662,11 @@ export async function createDiscoveredConnections(
     signal?: AbortSignal,
     expectedBinding?: string,
   ) {
-    const { row, call } = await selected(action, args);
+    const { row, call } = await selected(action, args).catch((cause: unknown) => {
+      throw Object.assign(cause instanceof Error ? cause : new Error(String(cause)), {
+        notRun: true,
+      });
+    });
     const { path } = call;
     let token: string | undefined;
     const secrets: string[] = [];
@@ -1386,13 +1685,9 @@ export async function createDiscoveredConnections(
         connection(path),
         async () => {
           signal?.throwIfAborted();
+          await assertBinding(row, expectedBinding);
           token = await tokenFor(row, path, signal);
-          const currentBinding = await binding(row.id);
-          if (
-            currentBinding !== JSON.stringify([row.account_id, row.paths]) ||
-            (expectedBinding !== undefined && currentBinding !== expectedBinding)
-          )
-            throw error('This connected account changed.', 409);
+          await assertBinding(row, expectedBinding);
           signal?.throwIfAborted();
           secrets.push(token);
           const environment =
@@ -1429,6 +1724,10 @@ export async function createDiscoveredConnections(
               call.input,
               signal,
             );
+          if (call.kind === 'cli') {
+            const { stdout: _stdout, stderr: _stderr, ...value } = result as ConnectedCliResult;
+            return hide(value);
+          }
           return hide(result);
         },
         signal,
@@ -1458,22 +1757,72 @@ export async function createDiscoveredConnections(
     return rows.rows.flatMap((row) => row.paths.map(connection));
   }
   function registerRoutes(app: FastifyInstance) {
+    app.patch<{ Params: { service: string } }>('/api/apps/mcp/:service', async (request) => {
+      const { service } = request.params;
+      if (!manualMcpService.test(service) || apps.has(service))
+        throw error('This custom MCP server is unavailable.', 404);
+      const input = z.object({ name: proposalSchema.shape.name }).strict().safeParse(request.body);
+      if (!input.success) throw error('To rename this server, enter a name of 1 to 80 characters.');
+
+      await transaction(async (client) => {
+        await lockDisplayName(client, service);
+        const result = await client.query(
+          `UPDATE discovered_connections SET display_name=$3
+           WHERE owner_id=$1 AND service=$2 AND paths @> '[{"kind":"mcp"}]'::jsonb`,
+          [owner, service, input.data.name],
+        );
+        if (!result.rowCount) throw error('This custom MCP server is unavailable.', 404);
+      }, pool);
+      options.refresh?.();
+      return { name: input.data.name };
+    });
     app.post('/api/apps/mcp', async (request, reply) => {
       const parsed = z
         .object({
           name: proposalSchema.shape.name,
-          endpoint: z.url().max(2048),
+          endpoint: z
+            .string()
+            .trim()
+            .transform((value) =>
+              /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`,
+            )
+            .pipe(z.url({ protocol: /^https?$/ }).max(2048)),
           auth: z.enum(['oauth', 'bearer', 'x-api-key']),
           clientIdRequired: z.boolean().optional(),
         })
         .strict()
         .refine((value) => !value.clientIdRequired || value.auth === 'oauth')
         .safeParse(request.body);
-      if (!parsed.success) throw error('Enter a name, server URL and authentication method.');
+      if (!parsed.success) {
+        const field = parsed.error.issues[0]?.path[0];
+        throw error(
+          field === 'name'
+            ? 'Enter a name of 1 to 80 characters.'
+            : field === 'endpoint'
+              ? 'Enter a valid server URL, such as https://example.com/mcp.'
+              : 'Enter a name, server URL and authentication method.',
+        );
+      }
       const { name, auth } = parsed.data;
-      const endpoint = await options.transport.validateEndpoint(parsed.data.endpoint).catch(() => {
-        throw error('Use a public HTTPS server address without a query or fragment.');
-      });
+      let localOrigin: string | undefined;
+      const endpoint = await options.transport
+        .validateEndpoint(parsed.data.endpoint)
+        .catch(async (cause: unknown) => {
+          const reason = cause instanceof Error ? cause.message : String(cause);
+          if (!options.local)
+            throw error(`Use a public HTTPS server address without a query or fragment. ${reason}`);
+          const origin = new URL(parsed.data.endpoint).origin;
+          const checked = await options
+            .local(origin)
+            .transport.validateEndpoint(parsed.data.endpoint)
+            .catch((local: unknown) => {
+              throw error(
+                `Nod could not use ${origin}: ${local instanceof Error ? local.message : String(local)}`,
+              );
+            });
+          localOrigin = origin;
+          return checked;
+        });
       const service = `mcp-${createHash('sha256').update(endpoint).digest('hex').slice(0, 24)}`;
       const result = await create(
         {
@@ -1490,6 +1839,7 @@ export async function createDiscoveredConnections(
         },
         undefined,
         'apps',
+        localOrigin,
       );
       return reply.header('Cache-Control', 'no-store').send(result);
     });
@@ -1512,16 +1862,33 @@ export async function createDiscoveredConnections(
         typeof saved?.url === 'string' && (saved.attempt === undefined || attempt)
           ? saved.url
           : undefined;
-      const address = officialMcp.get(row.service)?.instancePath && !row.paths.length;
+      const address = apps.get(row.service)?.instancePath && !row.paths.length;
       const localAddress = address ? await nearby(row.service) : undefined;
+      const catalogApp = Boolean(
+        apps.get(row.service) &&
+        (address ||
+          row.paths.every((path) => {
+            const app = apps.get(row.service)!;
+            if (app.instancePath) return path.kind === 'mcp';
+            const { id: _id, local: _local, ...saved } = path;
+            return isDeepStrictEqual(saved, appAccessPath(app));
+          })),
+      );
       return reply.header('Cache-Control', 'no-store').send({
         service: row.service,
-        name: row.name,
+        name: row.display_name ?? row.name,
+        catalogApp,
+        hints: catalogApp ? apps.get(row.service)?.hints : undefined,
+        credentialLabels:
+          apps.get(row.service)?.kind === 'cli'
+            ? (apps.get(row.service) as Extract<BundledApp, { kind: 'cli' }>).environment
+            : undefined,
         ...(address ? { needsAddress: true, localAddress } : {}),
         oauthStatus: row.oauth_status === 'completing' ? 'pending' : row.oauth_status,
+        oauthError: row.oauth_error ?? undefined,
         authorizationUrl,
         attempt,
-        callbackUrl: row.paths.some((path) => path.kind === 'mcp' && path.clientIdRequired)
+        callbackUrl: row.paths.some((path) => path.kind !== 'cli' && path.clientIdRequired)
           ? callbackUrl()
           : undefined,
         setupUrl: row.setup_url,
@@ -1534,12 +1901,20 @@ export async function createDiscoveredConnections(
                 auth: path.auth,
                 env: path.env,
                 source: path.source,
+                ...(path.testArgv ? { testArgv: path.testArgv } : {}),
               }
             : {
                 kind: path.kind,
                 endpoint: path.endpoint,
                 auth: path.auth,
                 ...(path.testPath ? { testPath: path.testPath } : {}),
+                ...(path.kind === 'http'
+                  ? {
+                      apiKeyHeader: path.apiKeyHeader,
+                      testMethod: path.testMethod,
+                      testBody: path.testBody,
+                    }
+                  : {}),
                 ...(path.scope ? { scope: path.scope } : {}),
                 ...(path.clientIdRequired ? { clientIdRequired: path.clientIdRequired } : {}),
               },
@@ -1569,7 +1944,9 @@ export async function createDiscoveredConnections(
     );
   }
   return {
+    apps,
     binding,
+    approvalDetails,
     analyticsConnections,
     list,
     setupServices,

@@ -80,7 +80,8 @@ export function checkTrace(input, project) {
     record(metadata) &&
     Object.keys(metadata).length <= 20 &&
     Object.entries(metadata).every(
-      ([key, value]) => /^[a-z_]{1,40}$/.test(key) && text(value, 200),
+      ([key, value]) =>
+        /^[a-z_]{1,40}$/.test(key) && (key === 'cost_usd' ? count(value) : text(value, 200)),
     ) &&
     bytes(JSON.stringify(data)) <= 8 * 1024 * 1024;
   if (!valid) return { ok: false };

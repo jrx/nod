@@ -1,6 +1,7 @@
 import type { ModelWorkspace } from '../../shared/models';
 import { feedbackActivity } from './feedback-activity';
-import { setFeedbackErrorOwner } from './feedback-errors';
+import { feedbackClient } from './feedback-client';
+import { recordFeedbackError, setFeedbackErrorOwner } from './feedback-errors';
 
 export class ApiError extends Error {
   constructor(
@@ -13,6 +14,12 @@ export class ApiError extends Error {
     this.name = 'ApiError';
   }
 }
+
+const routeWords = new Set(
+  'accounts activity archive around audio authorize azure catalog commands complete connect connections context details disconnect discovery done endpoints entries export forget icon import instance introduction keep-out keys limit mcp model model-setup navigate notes oauth opened pairing prepare preview profile reaction reconnect refresh renew report reset restore retry routes schedule-draft screen search selection sessions setup-cancel setup-return setup-status skills status steps stop stream suggestions survey-seen telegram updates-email voices welcome whatsapp work'.split(
+    ' ',
+  ),
+);
 
 let requestAccount: string | null = null;
 let accountGeneration = 0;
@@ -53,8 +60,19 @@ async function request<T>(
       : controller.signal
     : (options.signal ?? undefined);
   let status = 0;
+  const method = options.method?.toUpperCase() ?? 'GET';
+  const failed = (detail: string) => {
+    if (generation !== accountGeneration) return;
+    const route = path
+      .split('?')[0]
+      .split('/')
+      .map((segment, index) => (index < 3 || routeWords.has(segment) ? segment : ':id'))
+      .join('/');
+    recordFeedbackError('error', `api ${method} ${route} ${detail}`);
+  };
   const failure = (reason: string) => {
     if (generation !== accountGeneration) return;
+    if (reason !== 'http') failed(status ? `${status} ${reason}` : reason);
     const segment = path.split(/[/?]/)[2];
     const area =
       (
@@ -88,7 +106,7 @@ async function request<T>(
       )[segment] ?? 'other';
     feedbackActivity.record('request_failed', {
       area,
-      method: options.method?.toUpperCase() ?? 'GET',
+      method,
       status,
       reason,
     });
@@ -107,7 +125,22 @@ async function request<T>(
     )
       throw new DOMException('The account changed.', 'AbortError');
     status = response.status;
-    if (!response.ok) failure('http');
+    const date = Date.parse(response.headers.get('Date') ?? '');
+    if (Number.isFinite(date)) feedbackClient.clockOffsetMs = date - Date.now();
+    if (!response.ok) {
+      failure('http');
+      void response
+        .clone()
+        .json()
+        .catch(() => null)
+        .then((body: { error?: unknown; message?: unknown; code?: unknown } | null) => {
+          const message = [body?.message, body?.error].find((value) => typeof value === 'string');
+          const code = typeof body?.code === 'string' ? ` (${body.code})` : '';
+          failed(
+            `${response.status}${message || code ? `: ${message ?? ''}${code}` : ''}`.slice(0, 500),
+          );
+        });
+    }
     if (
       expectedAccount &&
       response.status === 401 &&
@@ -134,8 +167,7 @@ async function request<T>(
   }
 }
 
-async function requireOk(response: Response, signal?: AbortSignal) {
-  if (response.ok) return;
+export async function responseError(response: Response, signal?: AbortSignal) {
   const body = (await response.json().catch(() => null)) as {
     error?: unknown;
     step?: unknown;
@@ -155,12 +187,16 @@ async function requireOk(response: Response, signal?: AbortSignal) {
     )
       ? body.workspaces.map(({ id, name }) => ({ id, name }))
       : undefined;
-  throw new ApiError(
+  return new ApiError(
     typeof body?.error === 'string' ? body.error : 'The request could not be completed. Try again.',
     response.status,
     typeof body?.step === 'string' ? body.step : undefined,
     workspaces,
   );
+}
+
+async function requireOk(response: Response, signal?: AbortSignal) {
+  if (!response.ok) throw await responseError(response, signal);
 }
 
 export function api<T>(path: string, options: RequestInit = {}): Promise<T> {

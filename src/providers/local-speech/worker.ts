@@ -105,7 +105,7 @@ async function prepare(id: number, transcription: boolean) {
         );
         if (!response.ok || !response.body) {
           await response.body?.cancel().catch(() => {});
-          throw new Error('download');
+          throw new Error(`download ${model.name}/${file.path}: HTTP ${response.status}`);
         }
         const handle = await open(temporary, 'w', 0o600);
         const reader = response.body.getReader();
@@ -116,12 +116,13 @@ async function prepare(id: number, transcription: boolean) {
             const next = await reader.read();
             if (next.done) break;
             size += next.value.length;
-            if (size > file.size) throw new Error('download');
+            if (size > file.size) throw new Error(`download ${model.name}/${file.path}: too large`);
             hash.update(next.value);
             await handle.writeFile(next.value);
             progress(size);
           }
-          if (size !== file.size || hash.digest('hex') !== file.sha256) throw new Error('download');
+          if (size !== file.size || hash.digest('hex') !== file.sha256)
+            throw new Error(`download ${model.name}/${file.path}: size or checksum mismatch`);
         } finally {
           await handle.close();
           await reader.cancel().catch(() => {});
@@ -148,7 +149,7 @@ async function generate(text: string, voice: LocalVoice) {
   const phonemes = language === 'pt-br' ? phonemize(text) : await phonemizeSpeech(text, language);
   const { input_ids } = synthesizer!.tokenizer(phonemes, { truncation: false });
   const length = input_ids.dims.at(-1)!;
-  if (length > 512) throw new Error('length');
+  if (length > 512) throw new Error('tokens');
   let styles = voiceStyles.get(voice);
   if (!styles) {
     const bytes = await readFile(join(cacheDir, 'kokoro', 'voices', `${voice}.bin`));
@@ -279,9 +280,17 @@ process.on('message', async (raw: unknown) => {
       id: message.id,
       type: 'failed',
       reason:
-        error instanceof Error && ['format', 'length', 'silence'].includes(error.message)
+        error instanceof Error && ['format', 'length', 'silence', 'tokens'].includes(error.message)
           ? error.message
           : 'failed',
+      ...(message.method === 'prepare'
+        ? {
+            detail: (error instanceof Error
+              ? `${error.name}: ${error.message} ${Object(error.cause).code ?? ''}`
+              : String(error)
+            ).slice(0, 500),
+          }
+        : {}),
     });
   } finally {
     busy = false;

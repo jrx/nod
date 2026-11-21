@@ -352,7 +352,7 @@ export function SetupActions({
         }
         const app = result.apps.get(href);
         if (!app || app.available === false) {
-          fail('This sign-in link is no longer available. Ask Nod to connect again.');
+          fail(app?.error ?? 'This sign-in link is no longer available. Ask Nod to connect again.');
           return;
         }
         if (app.pairingConfirmed === true) {
@@ -381,7 +381,11 @@ export function SetupActions({
         return;
       }
       const app = result.apps.get(href);
-      if (!app || app.available === false) throw new Error('The sign-in link is unavailable.');
+      if (!app || app.available === false) {
+        popup?.close();
+        fail(app?.error ?? 'This sign-in link could not be opened. Ask Nod to connect again.');
+        return;
+      }
       const pairingConfirmed = app.pairingConfirmed === true;
       if (pairingConfirmed) {
         popup?.close();

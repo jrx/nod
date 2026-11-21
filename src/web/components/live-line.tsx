@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import Markdown from 'react-markdown';
 import type { Activity } from '../../shared/contracts';
+import { Check, ChevronDown } from './icons';
 
 const quietMinutes = (since: string) => Math.floor((Date.now() - Date.parse(since)) / 60_000);
 
@@ -76,7 +77,16 @@ function useIdleWord(enabled: boolean) {
   return order[index]!;
 }
 
-export function LiveLine({ item, quiet = true }: { item?: Activity; quiet?: boolean }) {
+export function LiveLine({
+  item,
+  quiet = true,
+  history = true,
+}: {
+  item?: Activity;
+  quiet?: boolean;
+  history?: boolean;
+}) {
+  const labelId = useId();
   const step = item?.step?.trim();
   const site = item?.doing === 'tool' ? item.site : null;
   const minutes = useQuietMinutes(item?.quietSince ?? '', quiet && Boolean(item));
@@ -92,8 +102,8 @@ export function LiveLine({ item, quiet = true }: { item?: Activity; quiet?: bool
   const meta = [step ? site || work : null, minutes ? `${minutes} min` : null]
     .filter(Boolean)
     .join(' · ');
-  return (
-    <span>
+  const current = (
+    <span className="live-line-current" id={labelId} role="status">
       {described ? (
         <Markdown allowedElements={[]} unwrapDisallowed>
           {described}
@@ -108,5 +118,27 @@ export function LiveLine({ item, quiet = true }: { item?: Activity; quiet?: bool
       )}
       {meta && ` · ${meta}`}
     </span>
+  );
+  if (!history || !item?.recent?.length) return current;
+  return (
+    <details className="live-line" key={item.turnId}>
+      <summary aria-labelledby={labelId}>
+        {current}
+        <ChevronDown size={14} aria-hidden="true" />
+      </summary>
+      <ol aria-label="Recent completed activity">
+        {item.recent.map((entry) => (
+          <li key={entry.id}>
+            <Check size={12} aria-hidden="true" />
+            <span>
+              <Markdown allowedElements={[]} unwrapDisallowed>
+                {entry.summary}
+              </Markdown>
+              {entry.site && <span className="live-line-site"> · {entry.site}</span>}
+            </span>
+          </li>
+        ))}
+      </ol>
+    </details>
   );
 }

@@ -6,7 +6,7 @@ import { packager } from '@electron/packager';
 import { assetHash } from '../runtime/assets.mjs';
 import { copyBundleSource, copyEngineDependencies } from './engine-dependencies.mjs';
 import { buildDesktopUI } from './build-ui.mjs';
-import { desktopBuildOptions, hardenElectron, run } from './release-tools.mjs';
+import { copyAgentDesktop, desktopBuildOptions, hardenElectron, run } from './release-tools.mjs';
 import { signWindowsFiles, windowsCodeFiles } from './windows-signing.mjs';
 
 if (process.platform !== 'win32' || process.arch !== 'x64')
@@ -101,6 +101,7 @@ const [application] = await packager({
 console.log('Windows application packaged.');
 await rename(engine, join(application, 'resources/engine'));
 await hardenElectron(join(application, 'nod.exe'));
+await copyAgentDesktop(application, 'win32', 'x64');
 if (signed) await signWindowsFiles(await windowsCodeFiles(application));
 const installedRuntime = join(application, 'resources/engine/windows-runtime');
 manifest.transport = {

@@ -87,6 +87,9 @@ export function Join({ onNext, onBack, nextLabel, updatesEmail, usageShared }: S
               <>Join the Nod community on Discord or the forum.</>
             )}
           </Bubble>,
+          <Bubble>
+            Use Report bug at the top of the chat for problems, ideas and feature requests.
+          </Bubble>,
         ]}
       />
       {canSubscribe && (

@@ -40,7 +40,7 @@ export function connectionGroups(connections: Connection[], catalog: Connection[
       key,
       service: {
         ...primary,
-        name: details.name.replace(/\s+MCP$/i, ''),
+        name: primary.canRename ? primary.name : details.name.replace(/\s+MCP$/i, ''),
         description: details.description,
         logoUrl:
           metadata?.logoUrl ??
@@ -76,7 +76,10 @@ export function connectionIdentity(connection: Connection) {
     .replace(/^(?:\[?redacted\]?|<redacted>|\*{3,})$/i, '');
   const email = connection.accountEmail?.trim();
   return {
-    primary: name || email || `${connection.name.replace(/\s+MCP$/i, '')} account`,
+    primary:
+      name ||
+      email ||
+      `${connection.canRename ? connection.name : connection.name.replace(/\s+MCP$/i, '')} account`,
     secondary:
       name && email && name.toLocaleLowerCase() !== email.toLocaleLowerCase() ? email : null,
   };

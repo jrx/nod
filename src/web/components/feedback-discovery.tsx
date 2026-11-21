@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { MessageSquarePlus, X } from './icons';
+import { Bug, X } from './icons';
 import { BrandMark } from './brand';
 import { Button } from './ui';
 
@@ -85,8 +85,8 @@ export function FeedbackLauncher({
         data-discovery={shown || undefined}
         onClick={onFeedback}
       >
-        <MessageSquarePlus size={16} aria-hidden="true" />
-        Send feedback
+        <Bug size={16} aria-hidden="true" />
+        Report bug
       </Button>
       {onDismissDiscovery &&
         createPortal(

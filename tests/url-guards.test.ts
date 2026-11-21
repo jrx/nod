@@ -9,13 +9,14 @@ import {
 import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { createServer, request } from 'node:http';
+import type { LookupOptions } from 'node:dns';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { createBrowserProxy } from '../src/providers/agent-browser/network.ts';
+import { createBrowserProxy, publicLookup } from '../src/providers/agent-browser/network.ts';
 import {
   createPublicLinkPreviewProvider,
   requestPublicPreview,
@@ -24,7 +25,7 @@ import { previewableUrl, publicMediaUrl } from '../src/shared/link-preview.ts';
 import { MessageQuote, MessageText } from '../src/web/components/message.tsx';
 import { connectionUrl } from '../src/web/lib/connection-url.ts';
 import { messageSetupLinks } from '../src/web/lib/message-links.ts';
-import { ownerAddress } from '../src/providers/discovered/remote.ts';
+import { ownerAddress, publicHttps } from '../src/providers/discovered/remote.ts';
 import { paymentExplanation, paymentInvitation } from '../src/runtime/communication.ts';
 import {
   escapeForwarder,
@@ -277,7 +278,7 @@ test('every redirect checks DNS again and requests use the verified address', as
   }
 });
 
-test('pinned HTTP transport sends no cookies or authorization and stops after bounded metadata', async () => {
+test('pinned HTTP transport sends no cookies or authorization and stops reading at its byte limit', async () => {
   let seenHost = '';
   const server = createServer((request, reply) => {
     seenHost = request.headers.host!;
@@ -286,6 +287,15 @@ test('pinned HTTP transport sends no cookies or authorization and stops after bo
     assert.equal(request.headers.referer, undefined);
     assert.equal(request.headers['accept-encoding'], 'identity');
     assert.ok(!request.headers.accept?.includes('image/gif'));
+    if (request.url === '/endless') {
+      reply.writeHead(200);
+      const send = () => {
+        while (!reply.destroyed && reply.write('x'.repeat(16384)));
+        if (!reply.destroyed) reply.once('drain', send);
+      };
+      send();
+      return;
+    }
     const body = `<head><title>Bounded metadata</title></head>${'x'.repeat(400000)}`;
     reply.writeHead(200, {
       'content-type': 'text/html',
@@ -307,6 +317,16 @@ test('pinned HTTP transport sends no cookies or authorization and stops after bo
     assert.equal(seenHost, `unresolvable.example:${port}`);
     assert.ok(result.body.byteLength <= 256 * 1024);
     assert.match(Buffer.from(result.body).toString(), /Bounded metadata/);
+    await assert.rejects(
+      requestPublicPreview({
+        url: new URL(`http://unresolvable.example:${port}/endless`),
+        address: '127.0.0.1',
+        signal: AbortSignal.timeout(2000),
+        maxBytes: 1024,
+        metadata: false,
+      }),
+      /too large/,
+    );
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -370,6 +390,18 @@ test('an owner-entered address binds every request and consent page to that inst
   await assert.rejects(
     ownerAddress('http://93.184.216.34')('http://93.184.216.34/mcp-server/http'),
   );
+  const signIn = ownerAddress('http://100.100.1.1:8080', publicHttps);
+  assert.equal(
+    (await signIn('http://100.100.1.1:8080/.well-known/oauth-protected-resource')).address,
+    '100.100.1.1',
+  );
+  assert.equal((await signIn('https://93.184.216.34/oauth/token')).address, '93.184.216.34');
+  for (const value of [
+    'http://93.184.216.34/oauth/token',
+    'https://192.168.1.1/oauth/token',
+    'https://100.100.1.2/oauth/token',
+  ])
+    await assert.rejects(signIn(value));
   const origin = 'http://localhost:4320';
   assert.equal(
     connectionUrl('http://localhost:5678/mcp-oauth/authorize', origin, 'http://127.0.0.1:5678'),
@@ -511,6 +543,37 @@ test('the browser proxy refuses private network destinations, including names th
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test('connection lookups refuse a name with any private answer, whichever family is requested', async () => {
+  const lookup = (answers: Array<{ address: string; family: number }>, options: LookupOptions) =>
+    new Promise<{ error: Error | null; address: unknown; family: unknown }>((resolve) =>
+      publicLookup(async () => answers)('rebind.example', options, (error, address, family) =>
+        resolve({ error, address, family }),
+      ),
+    );
+  const publicV4 = { address: '93.184.216.34', family: 4 };
+  const publicV6 = { address: '2606:4700:4700::1111', family: 6 };
+  const privateV4 = { address: '10.0.0.5', family: 4 };
+  for (const [answers, options] of [
+    [[privateV4], {}],
+    [[publicV4, privateV4], {}],
+    [[publicV4, privateV4], { all: true }],
+    [[publicV6, privateV4], { family: 6 }],
+    [[{ address: '::1', family: 6 }], {}],
+  ] as const)
+    assert.match(
+      (await lookup([...answers], options)).error?.message ?? '',
+      /Private network/,
+      JSON.stringify([answers, options]),
+    );
+  const single = await lookup([publicV4], {});
+  assert.equal(single.error, null);
+  assert.deepEqual([single.address, single.family], [publicV4.address, 4]);
+  assert.deepEqual((await lookup([publicV4, publicV6], { all: true })).address, [
+    publicV4,
+    publicV6,
+  ]);
 });
 
 test('chat presentations reject unsafe URLs, executable shapes and inconsistent references', () => {

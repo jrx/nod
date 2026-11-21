@@ -7,6 +7,7 @@ import {
   Ellipsis,
   KeyRound,
   Mic,
+  Monitor,
   Settings,
   ShieldCheck,
 } from './icons';
@@ -22,6 +23,7 @@ import {
 } from './ui';
 import { DataSharing } from './data-sharing';
 import { LocalFilesSettings } from './local-files-settings';
+import { ComputerUseSettings } from './computer-use-settings';
 import { ModelSettings } from './models';
 import { VoiceSettings } from './voice-settings';
 import { Memory, type MemoryNavigationState } from '../pages/memory';
@@ -45,6 +47,12 @@ export const settingsSections = [
   { id: 'models', label: 'Models', path: '/settings/models', icon: KeyRound },
   { id: 'voice', label: 'Voice & audio', path: '/settings/voice', icon: Mic },
   { id: 'memory', label: 'Memory', path: '/settings/memory', icon: Brain },
+  {
+    id: 'computer',
+    label: 'Computer use',
+    path: '/settings/computer-use',
+    icon: Monitor,
+  },
   { id: 'privacy', label: 'Privacy & data', path: '/settings/privacy', icon: ShieldCheck },
 ] as const;
 
@@ -459,6 +467,12 @@ export function AccountSettings({
                           : undefined
                       }
                     />
+                  </section>
+                  <section className="settings-category" aria-labelledby={`${id}-computer`}>
+                    <h2 id={`${id}-computer`} tabIndex={-1}>
+                      Computer use
+                    </h2>
+                    <ComputerUseSettings />
                   </section>
                   <section
                     className="settings-category settings-privacy"

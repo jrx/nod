@@ -1,5 +1,6 @@
 import type { Schedule, Task } from '../../shared/contracts';
 import {
+  canReuseWorkCost,
   repriceUsd,
   routeModel,
   type ModelLane,
@@ -142,11 +143,11 @@ function estimate(
     if (!usage || spent <= 0) continue;
     recorded += spent;
     const choice = modelOf(data, model);
-    if (choice && usage.models.length === 1 && usage.models[0] === choice.id) {
+    if (choice && canReuseWorkCost(usage, choice.id, choice.pricing)) {
       projected += spent;
       continue;
     }
-    const value = choice && repriceUsd(usage, choice.pricing);
+    const value = choice && repriceUsd(usage, choice.pricing, choice.audio);
     if (value === null || value === undefined) unpriced.add(choice?.name ?? unavailableLabel);
     else projected += value;
   }

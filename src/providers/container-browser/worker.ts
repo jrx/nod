@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { BrowserDownload, Computer } from '../../ports/computer.ts';
 import { BrowserActionError } from '../../ports/computer.ts';
+import { browserSignInGuard } from '../../shared/browser-errors.ts';
 import { createAgentBrowserComputer } from '../agent-browser/index.ts';
 import { RuntimeTimeLimitError } from '../process.ts';
 import { containerBrowserOptions } from './config.ts';
@@ -88,9 +89,9 @@ async function dispatch(
       await computer.selectSignInMethod(request.threadId, request.input, signal);
       return null;
     case 'injectCredentials':
-      return computer.injectCredentials(request.input);
+      return computer.injectCredentials(request.input, signal);
     case 'fillCard':
-      await computer.fillCard(request.input);
+      await computer.fillCard(request.input, signal);
       return null;
     case 'cardDestinations':
       return computer.cardDestinations(request.threadId, request.fields);
@@ -297,6 +298,11 @@ export async function startContainerBrowserWorker(
         }
       } catch (error) {
         if (input.method === 'upload') await upload.catch(() => {});
+        const guard =
+          !controller.signal.aborted &&
+          (input.method === 'signInMethods' || input.method === 'selectSignInMethod')
+            ? browserSignInGuard((error as { signInGuard?: unknown })?.signInGuard)
+            : undefined;
         response = {
           id: input.id,
           ok: false,
@@ -312,6 +318,7 @@ export async function startContainerBrowserWorker(
             : error instanceof RuntimeTimeLimitError
               ? { detail: error.message }
               : {}),
+          ...(guard ? { signInGuard: guard } : {}),
           metadata: metadata(await entry?.computer.catch(() => undefined), input),
         };
       } finally {

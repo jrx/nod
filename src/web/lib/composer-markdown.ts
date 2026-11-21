@@ -1,7 +1,15 @@
 import type { JSONContent } from '@tiptap/core';
 import type { Node as ProseMirrorNode } from '@tiptap/pm/model';
 import type { Root as HtmlRoot } from 'hast';
-import type { BlockContent, PhrasingContent, Root, RootContent } from 'mdast';
+import type {
+  BlockContent,
+  Heading,
+  Html,
+  Paragraph,
+  PhrasingContent,
+  Root,
+  RootContent,
+} from 'mdast';
 import { LinkifyIt } from 'linkify-it';
 import { unified } from 'unified';
 import remarkParse from 'remark-parse';
@@ -23,6 +31,11 @@ const markdown = unified()
     listItemIndent: 'one',
   });
 const linkify = new LinkifyIt({ fuzzyLink: true });
+const formatted = ['delete', 'emphasis', 'inlineCode', 'link', 'strong'];
+let verdicts = new Map<string, boolean>();
+let previousVerdicts = verdicts;
+const entity = /&#x([0-9a-f]+);/iy;
+const linkedTails = new Map<string, string>();
 
 function literal(value: string): PhrasingContent[] {
   if (!value.startsWith('/') && safeMessageLink(value, window.location.origin))
@@ -183,7 +196,7 @@ function blocks(nodes: JSONContent[], display = false): RootContent[] {
                 type: 'tableCell',
                 children: tableInline(
                   (cell.content ?? []).flatMap((paragraph, index) => [
-                    ...(index ? [{ type: 'break' as const }] : []),
+                    ...(index ? [{ type: 'html' as const, value: '\n' }] : []),
                     ...inline(paragraph.content ?? [], false, !display, display),
                   ]),
                 ),
@@ -198,10 +211,16 @@ function blocks(nodes: JSONContent[], display = false): RootContent[] {
 }
 
 function tableInline(nodes: PhrasingContent[]): PhrasingContent[] {
-  return nodes.map((node) =>
-    node.type === 'break'
-      ? { type: 'html', value: '<br>' }
-      : node.type === 'html'
+  return nodes
+    .reduce<PhrasingContent[]>((merged, node) => {
+      const last = merged.at(-1);
+      if (node.type === 'html' && last?.type === 'html')
+        merged[merged.length - 1] = { ...last, value: last.value + node.value };
+      else merged.push(node);
+      return merged;
+    }, [])
+    .map((node) =>
+      node.type === 'html'
         ? {
             ...node,
             value: node.value
@@ -209,17 +228,172 @@ function tableInline(nodes: PhrasingContent[]): PhrasingContent[] {
                 /(\\*)\|/g,
                 (_, slashes: string) => `${'\\'.repeat(slashes.length * 2 + 1)}|`,
               )
-              .replaceAll('\n', '<br>'),
+              .replace(/(\\*)\n/g, (_, slashes: string) => `${slashes}${slashes}<br>`),
           }
         : 'children' in node
           ? { ...node, children: tableInline(node.children) }
           : node,
+    );
+}
+
+function phrasingMarkdown(children: PhrasingContent[]) {
+  return markdown
+    .stringify({ type: 'root', children: [{ type: 'paragraph', children }] })
+    .slice(0, -1);
+}
+
+function isFormatted(node: { type: string; value?: unknown }) {
+  return formatted.includes(node.type) || (node.type === 'html' && node.value === '<u>');
+}
+
+function isPlain(child: PhrasingContent): child is Html {
+  return child.type === 'html' && !isFormatted(child);
+}
+
+function nearFormatting(value: string, before: boolean, after: boolean) {
+  const lines = value.split('\n');
+  return lines
+    .flatMap((line, number) => {
+      const first = number === 0 && before;
+      const last = number === lines.length - 1 && after;
+      if (!line.trim() || /^ {0,3}(```|~~~|<)/.test(line) || (first && last && line.length <= 2000))
+        return [line];
+      if (first && last) return [`${line.slice(0, 1000)} ${line.slice(-1000)}`];
+      if (first) return [line.slice(0, 1000)];
+      if (last) return [line.slice(-1000)];
+      return [];
+    })
+    .join('\n');
+}
+
+function keepsFormatting(children: PhrasingContent[], heading?: Heading) {
+  if (!children.some((child) => child.type === 'html' && /[*_~`]|<!/.test(child.value)))
+    return true;
+  const large = children.reduce(
+    (size, child) => size + (isPlain(child) ? child.value.length : 0),
+    0,
+  );
+  const checked =
+    large > 5000
+      ? children.map((child, index) =>
+          isPlain(child)
+            ? {
+                ...child,
+                value: nearFormatting(child.value, index > 0, index < children.length - 1),
+              }
+            : child,
+        )
+      : children;
+  const key = `${heading?.depth ?? 0}${JSON.stringify(checked)}`;
+  const verdict = verdicts.get(key) ?? previousVerdicts.get(key) ?? parsesBack(checked, heading);
+  verdicts.set(key, verdict);
+  return verdict;
+}
+
+function parsesBack(checked: PhrasingContent[], heading?: Heading) {
+  const parts = checked.map((child, index) => {
+    const [previous, next] = [checked[index - 1], checked[index + 1]];
+    if (isPlain(child)) return child.value;
+    if (isFormatted(child) || previous?.type !== 'html' || next?.type !== 'html')
+      return phrasingMarkdown([child]);
+    return phrasingMarkdown([previous, child, next]).slice(
+      previous.value.length,
+      -next.value.length,
+    );
+  });
+  const source = markdown.stringify({
+    type: 'root',
+    children: [{ ...(heading ?? { type: 'paragraph' }), children: checked } as Heading | Paragraph],
+  });
+  const atx = heading && !source.slice(0, -1).includes('\n');
+  const prefix = atx ? `${'#'.repeat(heading.depth)} ` : '';
+  const joined = prefix + parts.join('');
+  const offsets: number[] = [];
+  let at = 0;
+  for (const char of joined) {
+    if (char === '\\' && !source.startsWith(char, at)) {
+      offsets.push(at);
+      continue;
+    }
+    if (char !== '\\' && source[at] === '\\' && source.startsWith(char, at + 1)) at++;
+    offsets.push(at, ...(char.length > 1 ? [at + 1] : []));
+    if (source.startsWith(char, at)) {
+      at += char.length;
+      continue;
+    }
+    entity.lastIndex = at;
+    const match = entity.exec(source);
+    if (!match || String.fromCodePoint(parseInt(match[1], 16)) !== char) return false;
+    at += match[0].length;
+  }
+  offsets.push(at);
+  const expected = new Set<string>();
+  let position = prefix.length;
+  parts.forEach((part, index) => {
+    const [from, to] = [offsets[position], offsets[position + part.length]];
+    if (isFormatted(checked[index])) expected.add(`${from}:${source.slice(from, to)}`);
+    position += part.length;
+  });
+  visit(markdown.parse(source), (node, _, parent) => {
+    const { start, end } = node.position ?? {};
+    if (isFormatted(node) && start && end && ['paragraph', 'heading'].includes(parent?.type ?? ''))
+      expected.delete(`${start.offset}:${source.slice(start.offset, end.offset)}`);
+  });
+  return !expected.size;
+}
+
+function closeAutolink(value: string) {
+  const tail = value.match(/\S*$/)![0];
+  if (tail.length > 2000 || !/:\/\/|www\.|@/i.test(tail)) return value;
+  if (!linkedTails.has(tail)) {
+    if (linkedTails.size > 5000) linkedTails.clear();
+    linkedTails.set(tail, linkTail(tail));
+  }
+  return value.slice(0, value.length - tail.length) + linkedTails.get(tail);
+}
+
+function linkTail(tail: string) {
+  const paragraph = markdown.parse(tail).children[0];
+  const link =
+    paragraph?.type === 'paragraph'
+      ? paragraph.children.findLast((child) => child.type === 'link')
+      : undefined;
+  const [from, to] = [link?.position?.start.offset, link?.position?.end.offset];
+  if (link?.type !== 'link' || from === undefined || link.children[0]?.type !== 'text') return tail;
+  const text = link.children[0].value;
+  if (tail.slice(from, to) !== text) return tail;
+  return (
+    tail.slice(0, from) +
+    (tail.slice(0, from).match(/\\*$/)![0].length % 2 ? '\\' : '') +
+    phrasingMarkdown([{ type: 'link', url: link.url, children: [{ type: 'text', value: text }] }]) +
+    tail.slice(from + text.length)
   );
 }
 
 function serializeComposerMarkdown(document: ProseMirrorNode, display = false) {
   const content: JSONContent[] = document.toJSON().content ?? [];
   const tree: Root = { type: 'root', children: blocks(content, display) };
+  if (!display) [previousVerdicts, verdicts] = [verdicts, new Map()];
+  const escape = (run: string) => run.replace(/./g, '\\$&');
+  visit(tree, (node) => {
+    if (display || !('children' in node) || !node.children.some((child) => child.type === 'html'))
+      return;
+    const children = node.children as PhrasingContent[];
+    children.forEach((child, index) => {
+      if (child.type !== 'html' || !children[index + 1]) return;
+      if (children[index + 1].type !== 'html') child.value = closeAutolink(child.value);
+      if (children[index + 1].type === 'link')
+        child.value = child.value.replace(
+          /(?<!\\)((?:\\\\)*)(!+)$/,
+          (_, slashes: string, run: string) => slashes + escape(run),
+        );
+      if (child.value.match(/\\*$/)![0].length % 2) child.value += '\\';
+    });
+    if (!keepsFormatting(children, node.type === 'heading' ? node : undefined))
+      for (const child of children)
+        if (child.type === 'html')
+          child.value = child.value.replace(/(?<!\\)((?:\\\\)*)([*_~`]|<(?=!))/g, '$1\\$2');
+  });
   const last = content.at(-1);
   const trailingBreak = last?.type === 'paragraph' && last.content?.at(-1)?.type === 'hardBreak';
   const value = markdown.stringify(tree);

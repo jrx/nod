@@ -103,6 +103,167 @@ test('managed connection observations require usable channel configuration', () 
   );
 });
 
+test('channel verification keeps service failures specific and removes submitted secrets', async () => {
+  const { modelServiceError } = await import('../src/providers/model-error.ts');
+  const modelError = await modelServiceError(
+    Response.json(
+      { error: { message: 'Synthetic model failure', description: 'private-extra-field' } },
+      { status: 503 },
+    ),
+    'Synthetic model service',
+  );
+  assert.ok(modelError.message.includes('Synthetic model failure'));
+  assert.ok(!modelError.message.includes('private-extra-field'));
+  for (const secrets of [
+    ['synthetic-key', 'synthetic-key-with-more-data'],
+    ['a', 'a+b[private]'],
+  ]) {
+    const overlapping = await modelServiceError(
+      Response.json({ error: { message: `secret: ${secrets[1]}` } }, { status: 403 }),
+      'Synthetic service',
+      secrets,
+    );
+    assert.equal(overlapping.reason, 'secret: [redacted]');
+    assert.ok(overlapping.message.endsWith('secret: [redacted]'));
+  }
+  const literal = await modelServiceError(
+    Response.json(
+      { error: { message: 'https://fixtureXexampleXtest/v1 | https://fixture.example.test/v1' } },
+      { status: 403 },
+    ),
+    'Synthetic service',
+    ['https://fixture.example.test/v1'],
+  );
+  assert.equal(literal.reason, 'https://fixtureXexampleXtest/v1 | [redacted]');
+  const whatsapp = {
+    accessToken: 'synthetic-meta-access-token',
+    appSecret: 'a'.repeat(32),
+    phoneNumberId: '12345678901234567890',
+    allowedNumber: '100000000000',
+    verifyToken: 'synthetic-meta-verify-token',
+    policyConfirmed: true,
+  };
+  for (const scenario of [
+    { status: 401, description: 'Unauthorized', code: 401 },
+    { status: 429, description: 'Too Many Requests: retry after 17', code: 429 },
+    { status: 503, description: 'Service unavailable', code: 503 },
+    { status: 200, description: 'Unauthorized', code: 401 },
+    { provider: 'whatsapp', status: 403, description: 'Access denied', code: 190 },
+    {
+      thrown: new TypeError(`fetch failed for bot${token}`, {
+        cause: Object.assign(new Error(`connect ECONNREFUSED bot${token}`), {
+          code: 'ECONNREFUSED',
+        }),
+      }),
+      error: 'Telegram getMe could not be reached: ECONNREFUSED.',
+    },
+    {
+      thrown: new DOMException('The operation was aborted due to timeout', 'TimeoutError'),
+      error: 'Telegram getMe could not be reached: timed out after 15 seconds.',
+    },
+    {
+      broken: new DOMException('The operation was aborted due to timeout', 'TimeoutError'),
+      error: 'Telegram getMe could not be reached: timed out after 15 seconds.',
+    },
+    {
+      provider: 'whatsapp',
+      thrown: new TypeError(`fetch failed ${whatsapp.accessToken}`, {
+        cause: Object.assign(new Error(`getaddrinfo ENOTFOUND ${whatsapp.accessToken}`), {
+          code: 'ENOTFOUND',
+        }),
+      }),
+      error: 'WhatsApp Cloud API could not be reached: ENOTFOUND.',
+    },
+  ]) {
+    const provider = scenario.provider ?? 'telegram';
+    const payload = provider === 'telegram' ? { botToken: token } : whatsapp;
+    const secrets = Object.values(payload).filter(
+      (item): item is string => typeof item === 'string',
+    );
+    const pool = {
+      async query(statement: string) {
+        assert.match(
+          statement,
+          /^(CREATE TABLE IF NOT EXISTS channel_settings|SELECT \* FROM channel_settings)/,
+        );
+        return { rows: [] };
+      },
+    } as unknown as pg.Pool;
+    const app = Fastify();
+    let calls = 0;
+    const settings = await createChannelSettings(pool, {
+      ownerId: 'synthetic-verification-owner',
+      keyStore: { id: 'fixture', configured: true, getKey: async () => Buffer.alloc(32) },
+      verifier: createChatSdkSetupVerifier({
+        fetch: async (url, init) => {
+          calls++;
+          if (provider === 'whatsapp') {
+            const target = new URL(String(url));
+            assert.equal(target.origin, 'https://graph.facebook.com');
+            assert.equal(target.pathname, `/v25.0/${whatsapp.phoneNumberId}`);
+            assert.equal(
+              new Headers(init?.headers).get('authorization'),
+              `Bearer ${whatsapp.accessToken}`,
+            );
+            const proof = target.searchParams.get('appsecret_proof')!;
+            assert.ok(proof);
+            secrets.push(proof);
+            if (scenario.thrown) throw scenario.thrown;
+            return Response.json(
+              {
+                error: {
+                  message: `${scenario.description}; ${secrets.join(' ')}`,
+                  code: scenario.code,
+                  type: 'OAuthException',
+                },
+              },
+              { status: scenario.status },
+            );
+          }
+          assert.equal(String(url), `https://api.telegram.org/bot${token}/getMe`);
+          if (scenario.thrown) throw scenario.thrown;
+          if (scenario.broken)
+            return new Response(
+              new ReadableStream({ start: (controller) => controller.error(scenario.broken) }),
+              { headers: { 'content-type': 'application/json' } },
+            );
+          return Response.json(
+            {
+              ok: false,
+              error_code: scenario.code,
+              description: `${scenario.description}; token ${token} ${encodeURIComponent(token)}`,
+            },
+            { status: scenario.status },
+          );
+        },
+      }),
+      apply: async () => assert.fail('Failed verification must not apply channel settings.'),
+    });
+    settings.registerRoutes(app);
+    try {
+      const response = await app.inject({
+        method: 'PUT',
+        url: `/api/channel-settings/${provider}`,
+        payload,
+      });
+      assert.equal(response.statusCode, 400);
+      if (scenario.error) assert.equal(response.json().error, scenario.error);
+      else {
+        assert.match(response.json().error, new RegExp(`HTTP ${scenario.status}`));
+        assert.ok(response.json().error.includes(scenario.description));
+        assert.ok(response.json().error.includes(String(scenario.code)));
+      }
+      for (const secret of secrets) {
+        assert.ok(!response.body.includes(secret));
+        assert.ok(!response.body.includes(encodeURIComponent(secret)));
+      }
+      assert.equal(calls, 1);
+    } finally {
+      await app.close();
+    }
+  }
+});
+
 test('a newer unchanged channel status suppresses an older observation that finishes later', async () => {
   const pool = {
     async query(statement: string) {
@@ -508,6 +669,7 @@ test(
     let applied: Record<string, string> = {};
     let failApply = false;
     let loseRegistrationResponse = false;
+    let rejectRegistration = false;
     let removals = 0;
     let settings: Awaited<ReturnType<typeof createChannelSettings>>;
     const options = {
@@ -536,6 +698,15 @@ test(
             /^(registration_pending|registered)$/,
           );
           registrations.push(body.secret_token);
+          if (rejectRegistration)
+            return Response.json(
+              {
+                ok: false,
+                error_code: 429,
+                description: `Retry after 17; ${token} ${body.secret_token} ${body.url}`,
+              },
+              { status: 429 },
+            );
           if (loseRegistrationResponse) throw new Error('fixture response lost after registration');
           return Response.json({ ok: true, result: true });
         },
@@ -799,6 +970,20 @@ test(
         (await pool.query('SELECT ciphertext FROM channel_settings')).rows[0].ciphertext,
         null,
       );
+      rejectRegistration = true;
+      const beforeRejected = registrations.length;
+      const rejectedRegistration = await save();
+      assert.equal(rejectedRegistration.statusCode, 503);
+      assert.match(rejectedRegistration.json().error, /HTTP 429/);
+      assert.match(rejectedRegistration.json().error, /Retry after 17/);
+      for (const secret of [
+        token,
+        registrations.at(-1)!,
+        'https://webhook.example.com/api/webhooks/telegram',
+      ])
+        assert.ok(!rejectedRegistration.body.includes(secret));
+      assert.equal(registrations.length, beforeRejected + 1);
+      assert.equal((await settings.status()).channels[0]?.webhookStatus, 'registration_pending');
     } finally {
       await app.close();
       await pool.end();
@@ -1509,6 +1694,206 @@ test(
       );
     } finally {
       await channels.close();
+    }
+  },
+);
+
+test(
+  'Telegram approval buttons are bound to the exact sent question and paired chat',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 15_000 },
+  async (t) => {
+    const { pool, threadId, receive, turnOf, reply, create, transport } = await outboxFixture(t);
+    const sent: Array<Parameters<MessagingTransport['post']>[0]> = [];
+    transport.post = async (input) => {
+      sent.push(input);
+      return {
+        id: `provider-${sent.length}`,
+        ...(input.approval ? { approvalButtons: true as const } : {}),
+      };
+    };
+    const edits: string[] = [];
+    let finishProgress = () => {};
+    const progressRound = new Promise<void>((resolve) => {
+      finishProgress = resolve;
+    });
+    transport.channels[0]!.presenceMs = 1000;
+    transport.progress = async (input) => {
+      if (input.status) edits.push(input.messageId);
+    };
+    transport.presence = async () => finishProgress();
+    const acknowledgements: string[] = [];
+    let senderId = '111';
+    let chat = 'approval-chat';
+    let target = 'provider-1';
+    let approved = true;
+    transport.receive = async () => ({
+      status: 200,
+      body: {},
+      approvals: [
+        {
+          channelId: 'telegram',
+          accountId: 'bot',
+          senderId,
+          threadId: chat,
+          messageId: target,
+          approved,
+          acknowledge: async (status) => {
+            acknowledgements.push(status);
+          },
+        },
+      ],
+    });
+    const accepted: Array<{
+      messageId: string;
+      approvalId: string;
+      approved: boolean;
+      label?: string;
+    }> = [];
+    const acceptedChannels: string[] = [];
+    let work: LiveWork[] = [];
+    let beforeCommit = async () => {};
+    const channels = await create({
+      activity: async () => work,
+      messageAccepted: () => (provider) => acceptedChannels.push(provider),
+      acceptApproval: async (client, input) => {
+        const { messageId, approvalId, approved, label } = input;
+        accepted.push({ messageId, approvalId, approved, label });
+        await client.query("UPDATE approvals SET status='confirmed' WHERE id=$1", [approvalId]);
+        await beforeCommit();
+      },
+    });
+    const app = Fastify();
+    channels.registerRoutes(app);
+    try {
+      receive('111', 'approval-request', 'approval-chat');
+      await channels.drain();
+      const { turn_id: turnId, channel } = await turnOf('approval-request');
+      const messageId = randomUUID();
+      const ordinaryId = randomUUID();
+      const approvalId = randomUUID();
+      const question = 'Can I submit the synthetic form? Some details are hidden.';
+      await reply(turnId, question, messageId, 0);
+      await reply(turnId, 'The synthetic form is still open.', ordinaryId, 1);
+      await pool.query("UPDATE turns SET status='running' WHERE id=$1", [turnId]);
+      await pool.query(`CREATE TABLE approvals(
+        id uuid PRIMARY KEY, owner_id text NOT NULL, turn_id uuid NOT NULL, thread_id uuid NOT NULL,
+        confirmation_message_id uuid NOT NULL, status text NOT NULL, action text NOT NULL,
+        title text, decline text
+      )`);
+      await pool.query(
+        `INSERT INTO approvals(id,owner_id,turn_id,thread_id,confirmation_message_id,status,action,title,decline)
+         VALUES($1,'local-development',$2,$3,$4,'pending','NOD_browser','Formular senden','Abbrechen')`,
+        [approvalId, turnId, threadId, messageId],
+      );
+      await channels.drain();
+      const now = new Date().toISOString();
+      work = [messageId, ordinaryId].map((id) => ({
+        messageId: id,
+        turnId,
+        channel,
+        taskId: null,
+        title: null,
+        step: 'Checking the form',
+        site: null,
+        since: now,
+        quietSince: now,
+        doing: 'model',
+      }));
+      await channels.drain();
+      await progressRound;
+      assert.deepEqual(edits, ['provider-2']);
+      work = [];
+      const tap = async () => {
+        const response = await app.inject({ method: 'POST', url: '/api/webhooks/telegram' });
+        assert.equal(response.statusCode, 200);
+      };
+      await pool.query("UPDATE channel_outbox SET state='sending' WHERE message_id=$1", [
+        messageId,
+      ]);
+      await tap();
+      await pool.query("UPDATE channel_outbox SET state='sent' WHERE message_id=$1", [messageId]);
+      await pool.query(
+        `INSERT INTO channel_inbox(source_id,provider,account_id,sender_id,thread_id,text,received_at,owner_id)
+         VALUES('synthetic-stop','telegram','bot','111','approval-chat','/stop',now(),'local-development')`,
+      );
+      await tap();
+      assert.deepEqual(accepted, []);
+      await pool.query(
+        "UPDATE channel_inbox SET state='submitted' WHERE source_id='synthetic-stop'",
+      );
+      senderId = '222';
+      await tap();
+      senderId = '111';
+      chat = 'another-chat';
+      await tap();
+      chat = 'approval-chat';
+      target = 'provider-2';
+      await pool.query(
+        `INSERT INTO approvals(id,owner_id,turn_id,thread_id,confirmation_message_id,status,action)
+         VALUES($1,'local-development',$2,$3,$4,'pending','NOD_browser')`,
+        [randomUUID(), turnId, threadId, ordinaryId],
+      );
+      await tap();
+      assert.deepEqual(accepted, []);
+      target = 'provider-1';
+      await tap();
+      approved = false;
+      await tap();
+      assert.deepEqual(accepted, [
+        { messageId, approvalId, approved: true, label: 'Formular senden' },
+      ]);
+      assert.deepEqual(acknowledgements, [
+        'retry',
+        'retry',
+        'unavailable',
+        'unavailable',
+        'unavailable',
+        'recorded',
+        'unavailable',
+      ]);
+      assert.equal(sent[0]?.text, question);
+      assert.deepEqual(sent[0]?.approval, { approve: 'Formular senden', decline: 'Abbrechen' });
+      assert.equal(sent[1]?.approval, undefined);
+
+      const nextMessage = randomUUID();
+      const nextApproval = randomUUID();
+      await reply(turnId, question, nextMessage, 2);
+      await pool.query(
+        `INSERT INTO approvals(id,owner_id,turn_id,thread_id,confirmation_message_id,status,action)
+         VALUES($1,'local-development',$2,$3,$4,'pending','NOD_browser')`,
+        [nextApproval, turnId, threadId, nextMessage],
+      );
+      await channels.drain();
+      let enterRecord = () => {};
+      let finishRecord = () => {};
+      const started = new Promise<void>((resolve) => {
+        enterRecord = resolve;
+      });
+      const release = new Promise<void>((resolve) => {
+        finishRecord = resolve;
+      });
+      beforeCommit = () => {
+        enterRecord();
+        return release;
+      };
+      target = 'provider-3';
+      const inFlight = tap();
+      try {
+        await started;
+        await channels.replaceTransport({ ...transport });
+      } finally {
+        finishRecord();
+      }
+      await inFlight;
+      assert.equal(
+        (await pool.query('SELECT status FROM approvals WHERE id=$1', [nextApproval])).rows[0]
+          ?.status,
+        'pending',
+      );
+      assert.equal(acknowledgements.at(-1), 'unavailable');
+      assert.deepEqual(acceptedChannels, ['telegram']);
+    } finally {
+      await app.close();
     }
   },
 );
@@ -2583,6 +2968,13 @@ for (const provider of ['telegram', 'whatsapp'])
         await channels.drain();
         assert.deepEqual(calls.at(-1), { command: 'tasks', target: undefined, hasReply: false });
         assert.equal((await pool.query('SELECT count(*)::int AS n FROM turns')).rows[0].n, 1);
+        receive('111', 'clear-chat', 'chat-a', '/clear@fixture_bot');
+        await channels.drain();
+        assert.deepEqual(calls.at(-1), { command: 'clear', target: undefined, hasReply: false });
+        assert.equal((await turnOf('clear-chat')).turn_id, null);
+        const clears = calls.filter(({ command }) => command === 'clear').length;
+        await channels.drain();
+        assert.equal(calls.filter(({ command }) => command === 'clear').length, clears);
         const beforeRetired = calls.length;
         await pool.query('UPDATE messages SET hidden_at=now() WHERE id=$1', [anchor]);
         receive('111', 'retired-stop', 'chat-a', '/stop', 'provider-1');
@@ -3354,6 +3746,7 @@ test(
     const texts: string[] = [];
     const native: { method: string; data: Record<string, unknown> }[] = [];
     let failDocument = false;
+    let refuseDocument = false;
     t.mock.method(
       globalThis,
       'fetch',
@@ -3394,6 +3787,11 @@ test(
           body.get('photo') ?? body.get('document') ?? body.get('video') ?? body.get('voice');
         assert.ok(media instanceof File);
         const method = target.split('/').at(-1)!;
+        if (method === 'sendDocument' && refuseDocument)
+          return Response.json(
+            { ok: false, error_code: 400, description: 'Bad Request: fixture refusal' },
+            { status: 400 },
+          );
         sent.push({
           method,
           file: new Uint8Array(await media.arrayBuffer()),
@@ -3725,6 +4123,14 @@ test(
       assert.deepEqual(await state(foreign), { state: 'sent', reason: null });
       assert.equal(sent.length, failedCount);
       await pool.query('UPDATE artifacts SET owner_id=$2 WHERE id=$1', [image.id, ownerId]);
+      refuseDocument = true;
+      const refused = await addReply(turnId, [document], 'Document result');
+      const beforeRefused = texts.length;
+      await channels.drain();
+      assert.deepEqual(await state(refused), { state: 'sent', reason: null });
+      assert.equal(texts.length, beforeRefused + 2);
+      assert.match(texts.at(-1)!, /\n\nresult\.txt: Bad Request: fixture refusal$/);
+      refuseDocument = false;
 
       const outside = join(dataRoot, `media-fixture-${randomUUID()}`);
       filePaths.push(outside);
@@ -4145,7 +4551,7 @@ test(
     const { createActivity } = await import('../src/server/activity.ts');
     const { pool, threadId, receive, turnOf, reply, create } = await outboxFixture(t);
     await pool.query(`CREATE TABLE tasks(id uuid,owner_id text,session_id uuid,title text,now_text text,message_id uuid,created_at timestamptz);
-      CREATE TABLE turn_events(id uuid DEFAULT gen_random_uuid(),turn_id uuid,type text,summary text,site text,call_id uuid,created_at timestamptz DEFAULT clock_timestamp());`);
+      CREATE TABLE turn_events(id uuid DEFAULT gen_random_uuid(),turn_id uuid,type text,summary text,site text,detail text,call_id uuid,run_id uuid,created_at timestamptz DEFAULT clock_timestamp());`);
     const channels = await create();
     const activity = createActivity({ pool, ownerId: 'local-development' });
     const emit = (turnId: string, type: string, summary = '') =>

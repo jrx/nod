@@ -202,7 +202,13 @@ export function createBrowserFixture(options: Options, preferRealSocket = false)
                                                               String(command.action),
                                                               String(command.selector),
                                                             ]
-                                                          : null;
+                                                          : command.action === 'isenabled'
+                                                            ? [
+                                                                'is',
+                                                                'enabled',
+                                                                String(command.selector),
+                                                              ]
+                                                            : null;
       if (!args) throw new Error('Unsupported synthetic browser action.');
       const result = await run(session.executable, [...session.args, ...args], {
         ...session.options,
@@ -254,8 +260,13 @@ export async function fakeDevtools(model: DevtoolsModel) {
     const send = (message: unknown) => {
       const data = Buffer.from(JSON.stringify(message));
       const header =
-        data.length < 126 ? Buffer.from([0x81, data.length]) : Buffer.from([0x81, 126, 0, 0]);
-      if (data.length >= 126) header.writeUInt16BE(data.length, 2);
+        data.length < 126
+          ? Buffer.from([0x81, data.length])
+          : data.length < 65_536
+            ? Buffer.from([0x81, 126, 0, 0])
+            : Buffer.from([0x81, 127, 0, 0, 0, 0, 0, 0, 0, 0]);
+      if (data.length >= 65_536) header.writeBigUInt64BE(BigInt(data.length), 2);
+      else if (data.length >= 126) header.writeUInt16BE(data.length, 2);
       socket.write(Buffer.concat([header, data]));
     };
     const evaluate = (frame: DevtoolsFrame, expression: string) => {

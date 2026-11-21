@@ -1,0 +1,30 @@
+{
+  "$schema": "https://nod.n8n.io/docs/schemas/apps/v1/contract.schema.json",
+  "source": "https://docs.n8n.io/advanced-ai/accessing-n8n-mcp-server/",
+  "tool": {
+    "name": "get_workflow_details",
+    "description": "Read a workflow by its ID.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workflowId": {
+          "type": "string"
+        }
+      },
+      "required": ["workflowId"]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  "input": {
+    "workflowId": "synthetic-workflow"
+  },
+  "output": {
+    "workflow": {
+      "id": "synthetic-workflow",
+      "name": "Sample workflow",
+      "active": false
+    }
+  }
+}

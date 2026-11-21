@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +8,9 @@ import test from 'node:test';
 import Fastify from 'fastify';
 import pg from 'pg';
 import { createChannelSettings } from '../src/server/channel-settings.ts';
+import { createChannelSessionStore } from '../src/server/channel-session.ts';
+import { createChatSdkSetupVerifier } from '../src/providers/chat-sdk/settings.ts';
+import { createWhatsAppLinkedTransport } from '../src/providers/chat-sdk/whatsapp.ts';
 import type { ApplicationAdapters } from '../src/server/composition.ts';
 import type { MessagingTransport } from '../src/ports/messaging.ts';
 import type { SpeechProvider } from '../src/ports/speech.ts';
@@ -548,6 +552,131 @@ test('person properties use an awaited PostHog update independent of event captu
 });
 
 test(
+  'queued channel schedule requests wait until channel initialization finishes',
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  async (t) => {
+    const suffix = randomUUID().replaceAll('-', '').slice(0, 16);
+    const schema = 'test_channel_startup_' + suffix;
+    const bossSchema = 'test_channel_startup_boss_' + suffix;
+    const data = await mkdtemp(join(tmpdir(), 'nod-channel-startup-'));
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    t.after(async () => {
+      await admin.query(
+        `DROP SCHEMA IF EXISTS ${bossSchema} CASCADE; DROP SCHEMA IF EXISTS ${schema} CASCADE`,
+      );
+      await admin.end();
+      await rm(data, { recursive: true, force: true });
+    });
+    await admin.query('CREATE SCHEMA ' + schema);
+    const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+      timeoutMs: 25_000,
+      env: {
+        ...serviceEnvironment(),
+        DOTENV_CONFIG_PATH: '/dev/null',
+        TEST_DATABASE_URL: process.env.TEST_DATABASE_URL,
+        NOD_TEST_STARTUP_SCHEMA: schema,
+        NOD_TEST_STARTUP_BOSS: bossSchema,
+        NOD_TEST_STARTUP_ROOT: data,
+      },
+      input: String.raw`
+        import assert from 'node:assert/strict';
+        import { randomUUID } from 'node:crypto';
+        import { setTimeout as delay } from 'node:timers/promises';
+        const repo = process.cwd();
+        const schema = process.env.NOD_TEST_STARTUP_SCHEMA;
+        const bossSchema = process.env.NOD_TEST_STARTUP_BOSS;
+        const url = new URL(process.env.TEST_DATABASE_URL);
+        url.searchParams.set('options', '-c search_path=' + schema);
+        process.env.DATABASE_URL = url.href;
+        process.env.PGBOSS_SCHEMA = bossSchema;
+        const data = process.env.NOD_TEST_STARTUP_ROOT;
+        process.env.NOD_DATA_ROOT = data;
+        globalThis.fetch = async () => { throw new Error('This check must not call an outside service.'); };
+        const { createApplication } = await import(repo + '/src/server/composition.ts');
+        const { pool, initializeDatabase } = await import(repo + '/src/server/db.ts');
+        const { ownerId } = await import(repo + '/src/server/config.ts');
+        const thread = await import(repo + '/src/server/thread.ts');
+        const { fakeComputer, fakeWorkspace } = await import(repo + '/tests/runtime-fixtures.ts');
+        const { createIntegrationFixture } = await import(repo + '/scripts/e2e-fixtures.ts');
+        const { createChatSdkTransport } = await import(repo + '/src/providers/chat-sdk/index.ts');
+        const { createChatSdkSetupVerifier } = await import(repo + '/src/providers/chat-sdk/settings.ts');
+        await initializeDatabase();
+        await thread.initializeThreads();
+        const submitted = await thread.submitUserMessage('Create the synthetic queued channel schedule.', [], { channel: 'telegram:synthetic-startup', clientMessageId: randomUUID() });
+        const prompt = 'Review inbox@example.test. Never send email.';
+        let calls = 0;
+        let release;
+        let entered;
+        const held = new Promise(resolve => { release = resolve; });
+        const initializing = new Promise(resolve => { entered = resolve; });
+        const query = pool.query.bind(pool);
+        pool.query = async (...args) => {
+          if (typeof args[0] === 'string' && args[0].startsWith('CREATE TABLE IF NOT EXISTS channel_settings(')) {
+            await query('INSERT INTO account_settings(owner_id,onboarding_completed,usage_data,traces) VALUES($1,true,false,false) ON CONFLICT(owner_id) DO UPDATE SET onboarding_completed=true', [ownerId]);
+            entered();
+            await held;
+          }
+          return query(...args);
+        };
+        const curator = {
+          id: 'fixture', configured: true,
+          curate: async ({ input }) => input.purpose === 'confirmation'
+            ? { text: 'Create this schedule?', action: 'Create schedule' }
+            : input.purpose === 'confirmation_review' ? { valid: true } : { run: false },
+        };
+        const transport = createChatSdkTransport(pool, { TELEGRAM_ENABLED: 'true', TELEGRAM_BOT_TOKEN: '987:fixture-not-live', TELEGRAM_ALLOWED_USER_ID: '123456', TELEGRAM_WEBHOOK_SECRET_TOKEN: 'fixture-webhook-secret-32-characters' });
+        let application;
+        const opening = createApplication({
+          agent: { open: async (options) => ({ resumed: false, abort() {}, dispose() {}, prompt: async () => {
+            calls++;
+            const tool = options.tools.find(tool => tool.name === 'manage_personal_context');
+            assert.ok(tool);
+            await tool.execute({ action: 'schedule_create', args: { title: 'Synthetic startup review', prompt, kind: 'recurring', cron: '0 15 * * *', timeZone: 'UTC' } });
+            options.onEvent({ type: 'final', text: '' });
+          } }), dispose() {} },
+          computer: fakeComputer(), workspace: fakeWorkspace(),
+          integrations: createIntegrationFixture('http://localhost:4320').provider,
+          memoryCurator: { id: 'fixture', configured: false, curate: async () => undefined },
+          onboardingCurator: curator, trustCurator: curator, trustModel: 'llm',
+          speech: { id: 'fixture', configured: false, synthesize: async () => { throw new Error('Synthetic speech is unused.'); } },
+          keyStore: { id: 'fixture', configured: true, getKey: async () => Buffer.alloc(32, 7) },
+          model: { provider: 'fixture', name: 'fixture', configured: true },
+          messagingSetup: { verifier: createChatSdkSetupVerifier(), create: () => transport },
+        }, { heartbeat: false });
+        try {
+          await initializing;
+          await delay(1200);
+          assert.equal(calls, 0, 'A queued owner turn ran before channels were ready.');
+          assert.equal((await query('SELECT status FROM turns WHERE id=$1', [submitted.turnId])).rows[0].status, 'queued');
+          release();
+          application = await opening;
+          let card;
+          for (let attempt = 0; attempt < 250; attempt++) {
+            card = (await query('SELECT a.status,m.text FROM approvals a JOIN messages m ON m.id=a.confirmation_message_id WHERE a.turn_id=$1', [submitted.turnId])).rows[0];
+            if (card) break;
+            const turn = (await query('SELECT status,error FROM turns WHERE id=$1', [submitted.turnId])).rows[0];
+            assert.notEqual(turn.status, 'failed', turn.error);
+            await delay(20);
+          }
+          assert.ok(card, 'The queued request did not produce its complete approval after startup.');
+          assert.equal(card.status, 'pending');
+          assert.ok(card.text.includes(prompt));
+          assert.ok(card.text.includes('Synthetic startup review'));
+          assert.equal(calls, 1);
+          assert.equal((await query('SELECT count(*)::int AS count FROM schedules')).rows[0].count, 0);
+        } finally {
+          release();
+          application ??= await opening;
+          await application.app.close();
+          await pool.end();
+        }
+      `,
+    });
+    assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+  },
+);
+
+test(
   'saved voice changes reach the next explicit and automatic audio delivery',
   { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
   async () => {
@@ -1066,8 +1195,10 @@ test(
       assert.equal(cloud.channels.find((item) => item.id === 'whatsapp')?.accountId, '555000');
       await cloud.close();
     }
-    const verifier = {
-      verify: async () => {
+    const channelVerifier = createChatSdkSetupVerifier();
+    const verifier: ReturnType<typeof createChatSdkSetupVerifier> = {
+      verify: async (provider, input) => {
+        if (provider === 'whatsapp') return channelVerifier.verify(provider, input);
         return {
           environment: {
             TELEGRAM_ENABLED: 'true',
@@ -1104,6 +1235,11 @@ test(
     await seedApp.close();
     const applied: Record<string, string>[] = [];
     const sent: string[] = [];
+    const approvalMessages = new Map<string, string>();
+    const acknowledgements: string[] = [];
+    const whatsapp = new EventEmitter();
+    const whatsappReplies: { jid: string; text: string }[] = [];
+    const allowedNumber = '12025550101';
     let incomingFile: MessagingAttachment | undefined;
     let voiceCalls = 0;
     let modelConfigured = false;
@@ -1203,6 +1339,34 @@ test(
         verifier,
         create: (environment) => {
           applied.push(environment);
+          if (environment.WHATSAPP_MODE === 'bot') {
+            type Factory = NonNullable<
+              Parameters<typeof createWhatsAppLinkedTransport>[0]['createSocket']
+            >;
+            return createWhatsAppLinkedTransport({
+              mode: 'bot',
+              allowedNumber: environment.WHATSAPP_ALLOWED_NUMBER,
+              store: createChannelSessionStore({ pool, ownerId, keyStore }),
+              createSocket: () =>
+                ({
+                  ev: whatsapp,
+                  user: { id: '12025550102@s.whatsapp.net' },
+                  signalRepository: {
+                    lidMapping: { getPNForLID: async () => null, getLIDForPN: async () => null },
+                  },
+                  end: () => {},
+                  sendPresenceUpdate: async () => {},
+                  sendMessage: async (
+                    jid: string,
+                    content: { text?: string },
+                    { messageId }: { messageId: string },
+                  ) => {
+                    if (content.text) whatsappReplies.push({ jid, text: content.text });
+                    return { key: { id: messageId } };
+                  },
+                }) as unknown as ReturnType<Factory>,
+            });
+          }
           const transport: MessagingTransport = {
             channels: [
               {
@@ -1215,6 +1379,25 @@ test(
             ],
             receive: async (request) => {
               const body = JSON.parse(Buffer.from(request.body).toString());
+              if (body.tap) {
+                return {
+                  status: 200,
+                  body: { ok: true },
+                  approvals: [
+                    {
+                      channelId: 'telegram',
+                      accountId: '42',
+                      senderId: '123',
+                      threadId: 'telegram:123',
+                      messageId: body.tap.messageId,
+                      approved: body.tap.approved,
+                      acknowledge: async (result) => {
+                        acknowledgements.push(result);
+                      },
+                    },
+                  ],
+                };
+              }
               return {
                 status: 200,
                 body: { ok: true },
@@ -1235,7 +1418,9 @@ test(
             },
             post: async (message) => {
               sent.push(message.text);
-              return { id: 'fixture-sent-' + sent.length };
+              const id = 'fixture-sent-' + sent.length;
+              if (message.approval) approvalMessages.set(message.text, id);
+              return { id, ...(message.approval ? { approvalButtons: true as const } : {}) };
             },
             close: async () => {},
           };
@@ -1285,7 +1470,7 @@ test(
       assert.equal(diagnostics.statusCode, 200);
       const diagnosticReport = JSON.parse(diagnostics.json().content);
       assert.equal(diagnosticReport.coverage.contentIncluded, true);
-      const failure = diagnosticReport.logs.find(
+      const failure = diagnosticReport.failures.find(
         (entry: any) => entry.data?.event === 'request_failed',
       );
       assert.ok(failure);
@@ -1308,11 +1493,16 @@ test(
       const journal = async () =>
         (
           await Promise.all(
-            (await readdir(logDirectory))
-              .filter((name) => name.endsWith('.jsonl'))
-              .map((name) => readFile(join(logDirectory, name), 'utf8')),
+            [logDirectory, `${logDirectory}-failures`].map(async (directory) =>
+              Promise.all(
+                (await readdir(directory))
+                  .filter((name) => name.endsWith('.jsonl'))
+                  .map((name) => readFile(join(directory, name), 'utf8')),
+              ),
+            ),
           )
         )
+          .flat()
           .join('')
           .trim()
           .split('\n')
@@ -1437,13 +1627,14 @@ test(
         assert.ok(application.app.hasRoute({ method: method as 'GET', url }), route);
       }
       assert.equal(applied[0].TELEGRAM_BOT_TOKEN, '42:private-fixture');
-      const send = async (id: number, text: string, replyTo?: string) =>
+      const telegram = (payload: object) =>
         application.app.inject({
           method: 'POST',
           url: '/api/webhooks/telegram',
           headers: { host: headers.host, 'content-type': 'application/json' },
-          payload: { id, text, replyTo },
+          payload,
         });
+      const send = (id: number, text: string, replyTo?: string) => telegram({ id, text, replyTo });
       assert.equal((await send(1, 'Fixture request')).statusCode, 200);
       await application.channels!.drain();
       const first = (await pool.query('SELECT id,thread_id,channel FROM turns')).rows[0];
@@ -1576,6 +1767,99 @@ test(
         assert.equal(voiceCalls, 1);
       }
       incomingFile = undefined;
+      await t.test('Telegram approval taps answer the exact saved question once', async () => {
+        assert.equal((await send(12, 'Review two synthetic changes')).statusCode, 200);
+        await application.channels!.drain();
+        const channelSource = 'channel:telegram:42:12';
+        const request = (
+          await pool.query('SELECT turn_id,message_id FROM channel_inbox WHERE source_id=$1', [
+            channelSource,
+          ])
+        ).rows[0];
+        const proposals = [];
+        for (const draft of ['first', 'second']) {
+          const turnId = randomUUID();
+          const messageId = randomUUID();
+          const approvalId = randomUUID();
+          const question = `Apply the ${draft} synthetic change?`;
+          await pool.query(
+            `WITH proposal_turn AS (
+               INSERT INTO turns(id,owner_id,thread_id,parent_turn_id,source,prompt,status,waiting_reason,background,channel,channel_source_id)
+               SELECT $1,owner_id,thread_id,id,'task',$2,'waiting','question',true,channel,$3 FROM turns WHERE id=$4
+               RETURNING id,owner_id,thread_id
+             ), confirmation AS (
+               INSERT INTO messages(id,owner_id,role,text,thread_id,turn_id)
+               SELECT $5,owner_id,'assistant',$6,thread_id,id FROM proposal_turn
+               RETURNING id,owner_id,thread_id,turn_id
+             )
+             INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,source_message_id,confirmation_message_id)
+             SELECT $7,owner_id,thread_id,turn_id,'NOD_notification_preferences_update',$8,$9,id FROM confirmation`,
+            [
+              turnId,
+              `Review the ${draft} change`,
+              channelSource,
+              request.turn_id,
+              messageId,
+              question,
+              approvalId,
+              { notificationRule: draft },
+              request.message_id,
+            ],
+          );
+          proposals.push({ approvalId, messageId, question });
+        }
+        await application.channels!.drain();
+
+        const [first, second] = proposals;
+        const firstProviderId = approvalMessages.get(first.question);
+        const secondProviderId = approvalMessages.get(second.question);
+        assert.ok(firstProviderId);
+        assert.ok(secondProviderId);
+        const tap = async (messageId: string, approved: boolean) => {
+          const response = await telegram({ tap: { messageId, approved } });
+          assert.equal(response.statusCode, 200, response.body);
+        };
+        const answers = async () =>
+          (
+            await pool.query(
+              `SELECT a.status,m.reply_to_message_id,m.approval_answer,r.id=a.execution_turn_id AS exact_resume
+               FROM approvals a
+               LEFT JOIN turns r ON r.parent_turn_id=a.turn_id AND r.source='resume'
+               LEFT JOIN messages m ON m.id=r.message_id
+               WHERE a.id=ANY($1::uuid[]) ORDER BY array_position($1::uuid[],a.id)`,
+              [[first.approvalId, second.approvalId]],
+            )
+          ).rows;
+        const accepted = {
+          status: 'confirmed',
+          reply_to_message_id: first.messageId,
+          approval_answer: true,
+          exact_resume: true,
+        };
+        await tap(firstProviderId, true);
+        await tap(firstProviderId, false);
+        assert.deepEqual(await answers(), [
+          accepted,
+          {
+            status: 'pending',
+            reply_to_message_id: null,
+            approval_answer: null,
+            exact_resume: null,
+          },
+        ]);
+        await tap(secondProviderId, false);
+        await tap(secondProviderId, true);
+        assert.deepEqual(await answers(), [
+          accepted,
+          {
+            status: 'declined',
+            reply_to_message_id: second.messageId,
+            approval_answer: false,
+            exact_resume: true,
+          },
+        ]);
+        assert.deepEqual(acknowledgements, ['recorded', 'unavailable', 'recorded', 'unavailable']);
+      });
       const disabled = await application.app.inject({
         method: 'DELETE',
         url: '/api/channel-settings/telegram',
@@ -1584,6 +1868,49 @@ test(
       assert.equal(disabled.statusCode, 200);
       assert.deepEqual(applied.at(-1), { TELEGRAM_ENABLED: 'false' });
       assert.equal((await send(3, 'New task')).statusCode, 404);
+      await t.test('WhatsApp private-ID messages appear in chat and receive replies', async () => {
+        const linked = await application.app.inject({
+          method: 'PUT',
+          url: '/api/channel-settings/whatsapp',
+          headers,
+          payload: { mode: 'bot', allowedNumber, policyConfirmed: true },
+        });
+        assert.equal(linked.statusCode, 200, linked.body);
+        const channels = application.channels!;
+        await channels.pairing();
+        whatsapp.emit('connection.update', { connection: 'open' });
+        assert.equal((await channels.pairing()).state, 'connected');
+        const lid = '77777777@lid';
+        const text = 'A request from WhatsApp';
+        whatsapp.emit('lid-mapping.update', { lid, pn: `${allowedNumber}@s.whatsapp.net` });
+        whatsapp.emit('messages.upsert', {
+          type: 'notify',
+          messages: [
+            {
+              key: { id: 'private-request', remoteJid: lid, fromMe: false, addressingMode: 'lid' },
+              messageTimestamp: Math.floor(Date.now() / 1000),
+              message: { conversation: text },
+            },
+          ],
+        });
+        await channels.drain();
+        const history = await application.app.inject({ url: '/api/messages', headers });
+        assert.equal(history.statusCode, 200);
+        const message = history
+          .json()
+          .messages.find(
+            (item: { role: string; text: string }) => item.role === 'user' && item.text === text,
+          );
+        assert.ok(message);
+        const reply = 'A reply from Nod';
+        await pool.query(
+          `INSERT INTO messages(id,owner_id,role,text,thread_id,turn_id)
+           SELECT $1,owner_id,'assistant',$2,thread_id,turn_id FROM messages WHERE id=$3`,
+          [randomUUID(), reply, message.id],
+        );
+        await channels.drain();
+        assert.deepEqual(whatsappReplies, [{ jid: lid, text: reply }]);
+      });
     } finally {
       try {
         await application.app.close();

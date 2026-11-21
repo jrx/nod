@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { SpeechProviderError, type SpeechProvider } from '../../ports/speech.ts';
 import type { ProviderUsageEvent } from '../../ports/provider-usage.ts';
 import type { SpeechVoice } from '../../shared/speech.ts';
+import { appPages } from '../../shared/app-links.ts';
 import { readSpeechResponse } from '../speech.ts';
 
 export class ElevenLabsConnectionError extends SpeechProviderError {}
@@ -102,7 +103,7 @@ export function createElevenLabsSpeechProvider(options: {
     await response.body?.cancel().catch(() => {});
     throw new SpeechProviderError(
       response.status === 401
-        ? 'ElevenLabs did not accept this API key. Reconnect ElevenLabs in Settings → General → Voice.'
+        ? `ElevenLabs did not accept this API key. Reconnect ElevenLabs in ${appPages['/settings/voice']}.`
         : response.status === 403
           ? `Give this ElevenLabs API key ${operation === 'synthesize' ? 'Text to speech' : 'Speech to text'} permission, then try again.`
           : 'ElevenLabs reached a limit. Check your ElevenLabs account before trying again.',

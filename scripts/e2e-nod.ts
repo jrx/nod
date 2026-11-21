@@ -372,6 +372,7 @@ try {
     { createContainerBrowserComputer },
     { createDockerWorkspace },
     { createPublicLinkPreviewProvider },
+    { createGoogleFlights },
     { events },
   ] = await Promise.all([
     import('../src/server/composition.ts'),
@@ -381,6 +382,7 @@ try {
     import('../src/providers/container-browser/index.ts'),
     import('../src/providers/docker/index.ts'),
     import('../src/providers/public-web/link-preview.ts'),
+    import('../src/providers/google-flights.ts'),
     import('../src/server/events.ts'),
   ]);
   databasePool = pool;
@@ -410,6 +412,7 @@ try {
     },
     keyStore: { id: 'isolated-memory', configured: true, getKey: async () => vaultKey },
     linkPreviews: createPublicLinkPreviewProvider(),
+    flights: createGoogleFlights(),
     model: { provider, name: model, configured: true },
   });
   const { app } = application;

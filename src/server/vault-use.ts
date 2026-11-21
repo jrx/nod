@@ -1,4 +1,5 @@
 import { transaction as inTransaction } from './transaction.ts';
+import { withTurnCancellation } from './turn-cancellation.ts';
 import { randomUUID } from 'node:crypto';
 import { DatabaseError, type Pool, type PoolClient } from 'pg';
 import { logFailure } from './failure-log.ts';
@@ -32,6 +33,7 @@ export class VaultUseError extends Error {
   constructor(
     message: string,
     readonly statusCode: number,
+    readonly notEntered = false,
   ) {
     super(message);
   }
@@ -63,7 +65,12 @@ function failureCause(error: unknown) {
   return 'operation';
 }
 
-export async function createVaultUses(pool: Pool, ownerId: string, analytics?: CaptureAnalytics) {
+export async function createVaultUses(
+  pool: Pool,
+  ownerId: string,
+  analytics?: CaptureAnalytics,
+  lifetime?: AbortSignal,
+) {
   await pool.query(`CREATE TABLE IF NOT EXISTS vault_uses (
     id text PRIMARY KEY, owner_id text NOT NULL, root_turn_id uuid,
     origin text NOT NULL, kind text NOT NULL, item_id text, status text NOT NULL,
@@ -86,6 +93,7 @@ export async function createVaultUses(pool: Pool, ownerId: string, analytics?: C
       id?: string;
       ownerId: string;
       rootTurnId?: string;
+      turnId: string;
       origin: string;
       kind: string;
       itemId?: string;
@@ -93,88 +101,110 @@ export async function createVaultUses(pool: Pool, ownerId: string, analytics?: C
     },
     operation: {
       prepare?(client: PoolClient): Promise<void | false>;
-      perform(): Promise<T>;
+      perform(signal: AbortSignal): Promise<T>;
       complete?(client: PoolClient, result: T): Promise<void>;
     },
   ): Promise<T | undefined> {
-    if (use.ownerId !== ownerId)
-      throw new VaultUseError('This private operation belongs to another owner.', 409);
-    const id = use.id ?? randomUUID();
-    const uncertain = () =>
-      new VaultUseError(
-        'The private operation did not finish. It may have reached the website. Check its result before another attempt.',
-        502,
-      );
-    const report = (stage: 'claim' | 'entry' | 'completion', error: unknown) =>
-      logFailure('vault_private_operation_interrupted', uncertain(), {
-        stage,
-        kind: ['identifier', 'password', 'otp', 'method', 'card', 'payment'].includes(use.kind)
-          ? use.kind
-          : 'other',
-        cause: failureCause(error),
-        ...(error instanceof BrowserActionError && browserErrorMessage(error.code)
-          ? { browserCode: error.code }
-          : {}),
-      });
-    let claimStarted = false;
-    const ready = await transaction(async (client) => {
-      if ((await operation.prepare?.(client)) === false) return false;
-      claimStarted = true;
-      const claimed = await client.query(
-        `INSERT INTO vault_uses(id,owner_id,root_turn_id,origin,kind,item_id,status)
-         VALUES($1,$2,$3,$4,$5,$6,'running') ON CONFLICT DO NOTHING RETURNING id`,
-        [id, use.ownerId, use.rootTurnId ?? null, use.origin, use.kind, use.itemId ?? null],
-      );
-      if (!claimed.rowCount)
-        throw new VaultUseError(
-          'This private operation was already used. Check its result before entering fresh credentials.',
+    return withTurnCancellation(use.turnId, async (cancelled) => {
+      const signal = lifetime ? AbortSignal.any([cancelled, lifetime]) : cancelled;
+      if (use.ownerId !== ownerId)
+        throw new VaultUseError('This private operation belongs to another owner.', 409);
+      const stoppedBeforeEntry = () =>
+        new VaultUseError(
+          'This private step was stopped before entry. No values were entered in this step.',
           409,
+          true,
         );
-      return true;
-    }).catch(async (error: unknown) => {
-      if (error instanceof VaultUseError || !claimStarted) throw error;
-      report('claim', error);
-      try {
-        const recovered = await pool.query(
-          "UPDATE vault_uses SET status='uncertain' WHERE id=$1 AND owner_id=$2 AND status='running' RETURNING id",
-          [id, use.ownerId],
+      if (signal.aborted) throw stoppedBeforeEntry();
+      const id = use.id ?? randomUUID();
+      const uncertain = (cause?: unknown) =>
+        new VaultUseError(
+          [
+            'The private operation did not finish. It may have reached the website. Check its result before another attempt.',
+            cause instanceof BrowserActionError ? browserErrorMessage(cause.code) : undefined,
+          ]
+            .filter(Boolean)
+            .join(' '),
+          502,
         );
-        if (recovered.rowCount) {
-          captureSecureEntry(analytics, use, 'uncertain');
+      const report = (stage: 'claim' | 'entry' | 'completion', error: unknown) =>
+        logFailure('vault_private_operation_interrupted', uncertain(), {
+          stage,
+          kind: ['identifier', 'password', 'otp', 'method', 'card', 'payment'].includes(use.kind)
+            ? use.kind
+            : 'other',
+          cause: failureCause(error),
+          ...(error instanceof BrowserActionError && browserErrorMessage(error.code)
+            ? { browserCode: error.code }
+            : {}),
+        });
+      let claimStarted = false;
+      const ready = await transaction(async (client) => {
+        const prepared = await operation.prepare?.(client);
+        if (signal.aborted) throw stoppedBeforeEntry();
+        if (prepared === false) return false;
+        claimStarted = true;
+        const claimed = await client.query(
+          `INSERT INTO vault_uses(id,owner_id,root_turn_id,origin,kind,item_id,status)
+         VALUES($1,$2,$3,$4,$5,$6,'running') ON CONFLICT DO NOTHING RETURNING id`,
+          [id, use.ownerId, use.rootTurnId ?? null, use.origin, use.kind, use.itemId ?? null],
+        );
+        if (!claimed.rowCount)
+          throw new VaultUseError(
+            'This private operation was already used. Check its result before entering fresh credentials.',
+            409,
+          );
+        if (signal.aborted) throw stoppedBeforeEntry();
+        return true;
+      }).catch(async (error: unknown) => {
+        if (error instanceof VaultUseError || !claimStarted) throw error;
+        report('claim', error);
+        try {
+          const recovered = await pool.query(
+            "UPDATE vault_uses SET status='uncertain' WHERE id=$1 AND owner_id=$2 AND status='running' RETURNING id",
+            [id, use.ownerId],
+          );
+          if (recovered.rowCount) {
+            captureSecureEntry(analytics, use, 'uncertain');
+            throw uncertain();
+          }
+        } catch (recoveryError) {
+          if (!(recoveryError instanceof VaultUseError))
+            logFailure('vault_claim_recovery', recoveryError);
           throw uncertain();
         }
-      } catch (recoveryError) {
-        if (!(recoveryError instanceof VaultUseError))
-          logFailure('vault_claim_recovery', recoveryError);
-        throw uncertain();
-      }
-      throw error;
-    });
-    if (!ready) return;
-    let stage: 'entry' | 'completion' = 'entry';
-    try {
-      const result = await operation.perform();
-      stage = 'completion';
-      await transaction(async (client) => {
-        await operation.complete?.(client, result);
-        await client.query("UPDATE vault_uses SET status='submitted' WHERE id=$1 AND owner_id=$2", [
-          id,
-          use.ownerId,
-        ]);
+        throw error;
       });
-      captureSecureEntry(analytics, use, 'submitted');
-      return result;
-    } catch (error) {
-      report(stage, error);
-      captureSecureEntry(analytics, use, 'uncertain');
-      await pool
-        .query("UPDATE vault_uses SET status='uncertain' WHERE id=$1 AND owner_id=$2", [
-          id,
-          use.ownerId,
-        ])
-        .catch((error: unknown) => logFailure('vault_use_uncertain', error));
-      throw uncertain();
-    }
+      if (!ready) return;
+      let stage: 'claim' | 'entry' | 'completion' = 'claim';
+      try {
+        if (signal.aborted) throw stoppedBeforeEntry();
+        stage = 'entry';
+        const result = await operation.perform(signal);
+        stage = 'completion';
+        await transaction(async (client) => {
+          await operation.complete?.(client, result);
+          await client.query(
+            "UPDATE vault_uses SET status='submitted' WHERE id=$1 AND owner_id=$2",
+            [id, use.ownerId],
+          );
+        });
+        captureSecureEntry(analytics, use, 'submitted');
+        return result;
+      } catch (error) {
+        const notEntered = stage === 'claim' && error instanceof VaultUseError && error.notEntered;
+        if (!notEntered) report(stage, error);
+        captureSecureEntry(analytics, use, notEntered ? 'failed' : 'uncertain');
+        await pool
+          .query('UPDATE vault_uses SET status=$3 WHERE id=$1 AND owner_id=$2', [
+            id,
+            use.ownerId,
+            notEntered ? 'not_entered' : 'uncertain',
+          ])
+          .catch((error: unknown) => logFailure('vault_use_uncertain', error));
+        throw notEntered ? error : uncertain(error);
+      }
+    });
   }
 
   return { run, transaction };

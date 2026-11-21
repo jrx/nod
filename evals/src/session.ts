@@ -21,7 +21,12 @@ export interface Session {
   interruptWhen(first: string, ready: () => Promise<boolean>): Promise<void>;
   sayDuringWithAttachments(first: string, interjection: string, attach: string[]): Promise<void>;
   upload(name: string, bytes: Buffer, mimeType?: string): Promise<string>;
-  api(method: string, path: string, body?: unknown): Promise<{ status: number; body: any }>;
+  api(
+    method: string,
+    path: string,
+    body?: unknown,
+    redirect?: RequestRedirect,
+  ): Promise<{ status: number; body: any }>;
   proactivity: Stack['proactivity'];
   fireSchedules(): Promise<number>;
   event(summary: string, sources?: string[]): Promise<string>;
@@ -407,11 +412,12 @@ export function createSession(options: {
       return (await response.json()).id as string;
     },
     proactivity: stack.proactivity,
-    async api(method, path, body) {
+    async api(method, path, body, redirect) {
       if (new URL(path, stack.origin).origin !== stack.origin)
         throw new Error('Scenario API calls must stay on the Nod server.');
       const response = await stack.request(path, {
         method,
+        redirect,
         headers: { 'content-type': 'application/json', origin: stack.origin },
         body: body === undefined ? undefined : JSON.stringify(body),
       });

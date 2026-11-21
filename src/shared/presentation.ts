@@ -132,6 +132,34 @@ const flightsPresentation = z.strictObject({
     .max(8),
 });
 
+const bugReportPresentation = z.strictObject({
+  ...common,
+  type: z.literal('bug-report'),
+  draftId: z.uuid(),
+  summary: text(4000),
+});
+
+const instant = z.iso.datetime({ offset: true });
+const scheduleRunPresentation = z.strictObject({
+  ...common,
+  type: z.literal('schedule-run'),
+  scheduleId: z.uuid(),
+  revision: z.number().int().nonnegative(),
+  outcome: z.enum(['failed', 'ran']),
+  dueAt: instant,
+  startedAt: instant,
+  skipped: z.array(z.strictObject({ at: instant, reason: z.enum(['stopped', 'paused']) })).max(100),
+  reason: text(2400).optional(),
+  code: text(40).optional(),
+  link: z.enum(['server', 'models']).optional(),
+  nextRunAt: instant.optional(),
+  timeZone: text(80),
+});
+export type ScheduleRunPresentation = z.infer<typeof scheduleRunPresentation>;
+
+export const bugReportReplyHint =
+  'Reply "send" to share this summary with the Nod team, or ignore it. To add a diagnostic report, send it from Nod on your computer.';
+
 export const presentationSchema = z
   .discriminatedUnion('type', [
     z.strictObject({
@@ -239,6 +267,8 @@ export const presentationSchema = z
         .max(20),
       edges: z.array(z.strictObject({ from: id, to: id, label: text(120).optional() })).max(32),
     }),
+    bugReportPresentation,
+    scheduleRunPresentation,
   ])
   .superRefine((value, context) => {
     const invalid = (message: string) => context.addIssue({ code: 'custom', message });
@@ -346,7 +376,12 @@ export const presentationInputSchema = z
         .min(1)
         .max(8),
     }),
-    ...presentationSchema.options.filter((schema) => schema !== flightsPresentation),
+    ...presentationSchema.options.filter(
+      (schema) =>
+        schema !== flightsPresentation &&
+        schema !== bugReportPresentation &&
+        schema !== scheduleRunPresentation,
+    ),
   ])
   .pipe(presentationSchema);
 
@@ -390,11 +425,13 @@ export function mapLocationUrl(place: { latitude: number; longitude: number }) {
 }
 
 export function presentationText(value: Presentation) {
+  if (value.type === 'schedule-run') return '';
   const lines = [value.title];
   if (value.caption) lines.push(value.caption);
   if (value.asOf) lines.push(value.asOf);
   if (value.type === 'image') lines.push(value.alt);
   if (value.type === 'apps') lines.push(`Connect in Apps: ${value.services.join(', ')}`);
+  if (value.type === 'bug-report') lines.push(value.summary, '', bugReportReplyHint);
   if (value.type === 'map')
     for (const place of value.places)
       lines.push(

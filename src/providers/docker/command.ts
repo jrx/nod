@@ -1,3 +1,4 @@
+import { logFailure } from '../../ports/failure-log.ts';
 import {
   spawn,
   type ChildProcessWithoutNullStreams,
@@ -7,6 +8,10 @@ import { createHash } from 'node:crypto';
 import { serviceEnvironment } from '../process.ts';
 import type { ConnectedCli } from '../../ports/computer.ts';
 import { threadIdentity } from '../../ports/thread-identity.ts';
+import {
+  appEnvironmentNamePattern,
+  appEnvironmentNameMaxLength,
+} from '../../shared/app-definitions.ts';
 import type { CommandProcess } from '../command-process.ts';
 
 const cliInstallProgram = `import bz2,fcntl,gzip,hashlib,json,lzma,os,shutil,subprocess,sys
@@ -87,7 +92,7 @@ try:
  r=json.loads(line)
  if not isinstance(r['args'],list) or not all(isinstance(v,str) for v in r['args']): raise ValueError()
  env=r.get('environment',{})
- if not isinstance(env,dict) or not all(isinstance(k,str) and re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}(?:TOKEN|KEY|SECRET|PASSWORD|_ID|_SID)',k) and isinstance(v,str) and v for k,v in env.items()): raise ValueError()
+ if not isinstance(env,dict) or not all(isinstance(k,str) and len(k)<=${appEnvironmentNameMaxLength} and re.fullmatch(${JSON.stringify(appEnvironmentNamePattern.source)},k) and isinstance(v,str) and v for k,v in env.items()): raise ValueError()
  limit=int(r['maxBytes'])
  timeout=float(r['timeoutMs'])/1000
  if limit<1 or not 0<timeout: raise ValueError()
@@ -190,7 +195,7 @@ for index,(args,child_env,seconds) in enumerate(steps):
   output('stderr',b'The connected CLI install is not sealed. Propose it again.\\n')
   finish({'type':'exit','code':126,'reason':None})
  try: p=subprocess.Popen(args,stdin=subprocess.PIPE if last else subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True,env=child_env,cwd=home)
- except OSError as error:
+ except (OSError,ValueError) as error:
   output('stderr',(str(error)+'\\n').encode())
   finish({'type':'exit','code':127,'reason':None})
  sel.register(p.stdout,selectors.EVENT_READ,'stdout')
@@ -200,7 +205,7 @@ for index,(args,child_env,seconds) in enumerate(steps):
  deadline=time.monotonic()+seconds
  while True:
   now=time.monotonic()
-  if now>=deadline: cancel('timeout')
+  if now>=deadline: cancel('timeout' if last else 'install')
   if reason and not killed and now-stopping>=2:
    kill(signal.SIGKILL)
    killed=True
@@ -276,6 +281,13 @@ while True:
   except OSError as error: sys.exit('Nod could not stop process %d: %s.'%(pid,error))
  time.sleep(0.1)
 `;
+
+const byteSize = (bytes: number) =>
+  bytes % 1048576 === 0
+    ? `${bytes / 1048576} MB`
+    : bytes % 1024 === 0
+      ? `${bytes / 1024} KB`
+      : `${bytes}-byte`;
 
 export class WorkspaceCommandError extends Error {
   stop?: () => Promise<void>;
@@ -403,8 +415,12 @@ export function runSupervisedCommand(options: {
     let cancelling = false;
     let response: { code: number; reason: string | null } | undefined;
     let drain: ReturnType<typeof setTimeout> | undefined;
+    let exceeded: 'timeout' | 'limit' | undefined;
     const timer = setTimeout(
-      () => cancel(),
+      () => {
+        exceeded ??= 'timeout';
+        cancel();
+      },
       Math.min(
         transportGraceMs + timeoutMs + (options.cli ? cliInstallTimeoutMs : 0) + 1000,
         2 ** 31 - 1,
@@ -419,6 +435,7 @@ export function runSupervisedCommand(options: {
     const unavailable = (reason: string) => {
       if (settled) return;
       settled = true;
+      logFailure('workspace_command_failed', new Error(reason));
       cleanup();
       child.stdin.destroy();
       child.kill('SIGKILL');
@@ -457,7 +474,7 @@ export function runSupervisedCommand(options: {
             frame.type === 'exit' &&
             Number.isInteger(frame.code) &&
             (frame.reason === null ||
-              ['cancelled', 'timeout', 'limit', 'connection'].includes(frame.reason))
+              ['cancelled', 'timeout', 'install', 'limit', 'connection'].includes(frame.reason))
           ) {
             response = { code: frame.code, reason: frame.reason };
           } else if (
@@ -468,8 +485,10 @@ export function runSupervisedCommand(options: {
           ) {
             const bytes = Buffer.from(frame.data, 'base64');
             size += bytes.length;
-            if (size > maxBytes) cancel();
-            else if (options.onData) options.onData(bytes);
+            if (size > maxBytes) {
+              exceeded ??= 'limit';
+              cancel();
+            } else if (options.onData) options.onData(bytes);
             else (frame.type === 'stdout' ? output : errors).push(bytes);
           } else throw new Error();
         } catch {
@@ -491,11 +510,24 @@ export function runSupervisedCommand(options: {
       }
       settled = true;
       cleanup();
-      if (options.signal?.aborted || response.reason === 'cancelled')
+      const reason =
+        response.reason && response.reason !== 'cancelled'
+          ? response.reason
+          : (exceeded ?? response.reason);
+      if (options.signal?.aborted || reason === 'cancelled')
         return reject(new WorkspaceCommandError(false, 'Task cancelled.'));
-      if (cancelling || response.reason)
+      if (reason)
         return reject(
-          new WorkspaceCommandError(false, 'Workspace command exceeded its time or output limit.'),
+          new WorkspaceCommandError(
+            false,
+            reason === 'timeout'
+              ? `Workspace command ran longer than its ${timeoutMs / 1000}-second limit.`
+              : reason === 'install'
+                ? `The connected CLI install ran longer than its ${cliInstallTimeoutMs / 1000}-second limit.`
+                : reason === 'limit'
+                  ? `Workspace command output passed its ${byteSize(maxBytes)} limit.`
+                  : 'Workspace command stopped because its connection to Nod closed.',
+          ),
         );
       resolve({
         stdout: Buffer.concat(output),

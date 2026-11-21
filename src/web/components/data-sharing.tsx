@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import {
   ArrowUpRight,
   ChartColumn,
+  Globe2,
   LockKeyhole,
   MessageSquareText,
   type IconComponent,
@@ -16,7 +17,7 @@ import {
   DialogTrigger,
 } from './ui';
 
-const detailsUrl = 'https://nod.n8n.io/docs/trust/privacy/#what-nod-shares-with-n8n';
+const detailsUrl = 'https://nod.n8n.io/docs/trust/privacy/';
 
 function Item({
   icon: Icon,
@@ -64,29 +65,64 @@ export function DataSharing({
       <DialogContent className="data-sharing">
         <DialogTitle>How Nod uses your data</DialogTitle>
         <DialogDescription>
-          A little data shows the Nod team at n8n where Nod gets stuck, so they can make it better.
+          These switches control usage data and conversation traces. Connected services receive the
+          data they need to do your work.
         </DialogDescription>
         <ul>
           {usage !== undefined && (
             <Item icon={ChartColumn} title="Usage data" state={state(usage)}>
-              Which screens and features you use, the kinds of tasks you ask for, what fails, your
-              onboarding and survey answers, and your email (if you provide it). Never your
-              messages.
+              On by default for new owners. Your saved choice stays unchanged. Feature use, task
+              types, failures, fixed About you choices and survey answers. Survey answers are sent
+              as entered and may contain personal details. Chat messages and memory stay out. Usage
+              data also includes browser details, screen sizes, and analytics session and window
+              IDs. It has no screen recordings or session replays. Your email needs separate
+              consent.
             </Item>
           )}
           {traces !== undefined && (
             <Item icon={MessageSquareText} title="Conversation traces" state={state(traces)}>
-              Your chats with Nod, after it removes the personal details it can recognize. It can
-              miss some. Deleted after 14 days and never used to train AI.
+              Off by default for new owners. With n8n&apos;s default trace service, the Nod team can
+              review conversations and app results. A custom trace service sends them to its
+              operator. Nod removes personal details it recognizes. Traces can still identify you.
+              Traces include a stable analytics ID whenever trace sharing is on, even if usage
+              sharing is off. It links traces across conversations. It can also link them to stored
+              usage data, About you choices, and an email you gave with consent to updates.
+              n8n&apos;s default service keeps them for 14 days and never uses them to train AI
+              models.
             </Item>
           )}
-          <Item icon={LockKeyhole} title="Never shared">
-            Saved passwords and cards, your memory, or screen recordings.
+          <Item icon={Globe2} title="Your models and connected apps">
+            Your model services receive your conversation and what Nod reads. By default, managed
+            app calls pass through n8n&apos;s connection service and Composio, including email
+            content.
+          </Item>
+          <Item icon={LockKeyhole} title="Saved passwords and cards">
+            Encrypted in Vault on your Nod computer or server. Nod fills secret values on websites
+            for sign-ins and payments you allow. Tools that fill saved values do not return them to
+            the model. Private content visible in screenshots can still reach your model services.
           </Item>
         </ul>
         <p>
-          Stored in the EU. Turning a switch off stops new data of that kind; ask us to delete
-          earlier data.
+          When Composio Zero Data Retention is on, it limits covered execution logs. Composio's own
+          sign-in apps need a Composio Enterprise plan for this coverage. Composio still processes
+          calls and keeps metadata. Tool search queries, files and trigger events have separate
+          rules.
+        </p>
+        <p>
+          n8n&apos;s default services store usage data and traces in the EU. Custom trace services
+          use their operator&apos;s storage and retention rules.
+        </p>
+        <p>
+          With usage sharing on and your consent to updates, n8n&apos;s default services link your
+          email address and consent record to usage data in EU PostHog. The default signup service
+          also sends the address and signup data to Customer.io in the US. The signup also includes
+          fixed About you choices only if you shared them successfully. A failed signup can leave
+          data in either service.
+        </p>
+        <p>
+          Turning a switch off stops new sends for that setting. A send already in progress can
+          finish. Ask n8n to delete data sent to its services. For a custom trace service, contact
+          its operator.
         </p>
         <div className="data-sharing-actions">
           <a href={detailsUrl} target="_blank" rel="noreferrer">

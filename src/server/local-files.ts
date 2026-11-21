@@ -1,11 +1,6 @@
-import {
-  hasOwnerInstructions,
-  validateOwnerInstructions,
-  type OwnerInstructions,
-} from './owner-instructions.ts';
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { constants, type Stats } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { constants, type BigIntStats, type Stats } from 'node:fs';
 import {
   chmod,
   copyFile,
@@ -35,6 +30,8 @@ import type { Trash } from '../ports/trash.ts';
 import { fileBytes, fileMimeType } from '../shared/files.ts';
 import { workspaceFileReference } from './integration-files.ts';
 import { IntegrationError } from './integration-connection.ts';
+import { addKeepOut, removeKeepOut } from './keep-out.ts';
+import { assertStartedByOwner as startedByOwner } from './owner-started.ts';
 
 const readBytes = 256 * 1024;
 const writeBytes = 1024 * 1024;
@@ -61,10 +58,16 @@ function absolutePath(home: string) {
 }
 function localFileSchemas(absolute: ReturnType<typeof absolutePath>) {
   const onePath = z.object({ path: absolute }).strict();
+  const observation = onePath.extend({
+    version: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+  });
   return {
     LOCAL_FILES_LIST: onePath,
-    LOCAL_FILES_READ: onePath,
-    LOCAL_FILES_IMPORT: onePath,
+    LOCAL_FILES_READ: observation,
+    LOCAL_FILES_IMPORT: observation,
     LOCAL_FILES_CREATE_FOLDER: onePath,
     LOCAL_FILES_MOVE: z
       .object({
@@ -124,6 +127,18 @@ const programs: Partial<Record<NodeJS.Platform, RegExp>> = {
 };
 const run = promisify(execFile);
 const maybeLstat = (path: string) => lstat(path).catch(() => undefined);
+const fileVersion = (info: BigIntStats) =>
+  createHash('sha256')
+    .update([info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(':'))
+    .digest('hex');
+const changedRead = (path: string, reason?: unknown) =>
+  Object.assign(
+    new IntegrationError(
+      `${path} changed after this file read was checked.${reason === undefined ? '' : ` ${reason instanceof Error ? reason.message : String(reason)}`}`,
+      409,
+    ),
+    { notRun: true },
+  );
 const keepOutLimit = 100;
 
 type Turn = { turnId: string; threadId: string };
@@ -250,41 +265,12 @@ export function createLocalFiles(
   }
 
   async function assertStartedByOwner(turn: Turn | undefined, database: Query = pool) {
-    const { rows } = turn
-      ? await database.query<{
-          id: string;
-          source: string;
-          message_id: string | null;
-          proactive: boolean;
-        }>(
-          `WITH RECURSIVE lineage AS (
-            SELECT id,parent_turn_id,source,message_id,proactive,0 AS depth FROM turns WHERE id=$1 AND owner_id=$2 AND thread_id=$3
-            UNION ALL SELECT p.id,p.parent_turn_id,p.source,p.message_id,p.proactive,c.depth+1 FROM turns p JOIN lineage c ON c.parent_turn_id=p.id WHERE p.owner_id=$2 AND p.thread_id=$3 AND c.depth<100
-          ) SELECT id,source,message_id,bool_or(proactive) OVER () AS proactive FROM lineage ORDER BY depth DESC LIMIT 1`,
-          [turn.turnId, ownerId, turn.threadId],
-        )
-      : { rows: [] };
-    const root = rows[0];
-    const schedule =
-      root?.source === 'schedule'
-        ? (
-            await database.query<{ authority: OwnerInstructions | null }>(
-              'SELECT authority FROM schedule_runs WHERE turn_id=$1 AND owner_id=$2',
-              [root.id, ownerId],
-            )
-          ).rows[0]
-        : undefined;
-    const owned =
-      root &&
-      !root.proactive &&
-      ((root.source === 'user' && root.message_id) || hasOwnerInstructions(schedule?.authority));
-    if (owned && schedule?.authority)
-      await validateOwnerInstructions(database, ownerId, schedule.authority);
-    if (!owned)
-      throw new IntegrationError(
-        "Local files only open in work the owner started: a message, or a schedule the owner set up. Nod didn't touch any file.",
-        403,
-      );
+    await startedByOwner(
+      database,
+      ownerId,
+      turn,
+      "Local files only open in work the owner started: a message, or a schedule the owner set up. Nod didn't touch any file.",
+    );
   }
 
   async function resolvedAsFarAsItExists(path: string) {
@@ -303,30 +289,11 @@ export function createLocalFiles(
     const input = absolute.safeParse(typeof path === 'string' ? path.trim() : path);
     if (!input.success) throw new IntegrationError('Name the absolute path to keep Nod out of.');
     const real = await resolvedAsFarAsItExists(nodePath.resolve(input.data));
-    const current = await keptOut(database);
-    if (current.includes(real)) return current;
-    if (current.length >= keepOutLimit)
-      throw new IntegrationError(
-        `The keep-out list already has ${keepOutLimit} folders. The owner can remove some in Settings.`,
-        409,
-      );
-    const { rows } = await database.query<{ local_keep_out: string[] }>(
-      `INSERT INTO preferences(owner_id,local_keep_out) VALUES($1,ARRAY[$2]::text[])
-       ON CONFLICT(owner_id) DO UPDATE SET local_keep_out=CASE WHEN $2=ANY(preferences.local_keep_out)
-         THEN preferences.local_keep_out ELSE array_append(preferences.local_keep_out,$2) END
-       RETURNING local_keep_out`,
-      [ownerId, real],
-    );
-    return rows[0]!.local_keep_out;
+    return addKeepOut(database, ownerId, 'local_keep_out', real, keepOutLimit, 'folders');
   }
 
-  async function letIn(path: string) {
-    const { rows } = await pool.query<{ local_keep_out: string[] }>(
-      `UPDATE preferences SET local_keep_out=array_remove(local_keep_out,$2)
-       WHERE owner_id=$1 RETURNING local_keep_out`,
-      [ownerId, path],
-    );
-    return rows[0]?.local_keep_out ?? [];
+  function letIn(path: string) {
+    return removeKeepOut(pool, ownerId, 'local_keep_out', path);
   }
 
   function unavailable() {
@@ -594,18 +561,44 @@ export function createLocalFiles(
     );
   }
 
-  async function readFile(path: string, limit: number) {
-    const checked = await maybeLstat(path);
-    if (!checked?.isFile()) throw new IntegrationError(`${path} is not a file.`);
-    const file = await open(path, constants.O_RDONLY | noFollow | noBlock);
+  async function readFile(path: string, limit: number, version?: string, complete = false) {
+    const fail = (error: unknown): never => {
+      throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+        notRun: true,
+      });
+    };
+    const checked = await lstat(path).catch(fail);
+    if (!checked.isFile()) fail(new IntegrationError(`${path} is not a file.`));
+    const file = await open(path, constants.O_RDONLY | noFollow | noBlock).catch(fail);
+    let readStarted = false;
     try {
       const opened = await file.stat();
       if (opened.dev !== checked.dev || opened.ino !== checked.ino)
         throw new IntegrationError(`${path} changed while Nod was opening it.`);
+      const checkVersion = async () => {
+        if (!version) return;
+        if (fileVersion(await file.stat({ bigint: true })) !== version) throw changedRead(path);
+        const current = await lstat(path, { bigint: true }).catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw changedRead(path, error);
+          throw error;
+        });
+        if (fileVersion(current) !== version) throw changedRead(path);
+      };
+      await checkVersion();
       const size = opened.size;
+      if (complete && size > limit)
+        throw Object.assign(
+          new IntegrationError(`Files up to ${limit / 1024 / 1024} MB can be copied.`),
+          { notRun: true },
+        );
       const length = Math.min(size, limit);
+      readStarted = true;
       const { buffer, bytesRead } = await file.read(Buffer.alloc(length), 0, length, 0);
+      await checkVersion();
       return { size, bytes: buffer.subarray(0, bytesRead) };
+    } catch (error) {
+      if (!readStarted) fail(error);
+      throw error;
     } finally {
       await file.close();
     }
@@ -627,6 +620,7 @@ export function createLocalFiles(
 
   type Input = {
     path: string;
+    version?: string;
     moves: Array<{ from: string; to: string }>;
     paths: string[];
     text: string;
@@ -655,7 +649,18 @@ export function createLocalFiles(
         ),
       };
     if (input.paths) return { paths: await Promise.all(input.paths.map(real)) };
-    return { ...input, path: await real(input.path!) };
+    const path = await real(input.path!);
+    if (action === 'LOCAL_FILES_READ' || action === 'LOCAL_FILES_IMPORT') {
+      const version = fileVersion(
+        await lstat(path, { bigint: true }).catch((error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw changedRead(path, error);
+          throw error;
+        }),
+      );
+      if (input.version && input.version !== version) throw changedRead(path);
+      return { ...input, path, version };
+    }
+    return { ...input, path };
   }
 
   async function execute(
@@ -678,7 +683,24 @@ export function createLocalFiles(
         );
       return resolved;
     };
-    const target = async (path: string) => bound(await resolve(path), path);
+    const target = async (path: string) => {
+      try {
+        return bound(await resolve(path), path);
+      } catch (error) {
+        if (action === 'LOCAL_FILES_READ' || action === 'LOCAL_FILES_IMPORT')
+          throw Object.assign(error instanceof Error ? error : new Error(String(error)), {
+            notRun: true,
+          });
+        throw error;
+      }
+    };
+    if ((action === 'LOCAL_FILES_READ' || action === 'LOCAL_FILES_IMPORT') && !input.version) {
+      await target(input.path);
+      throw Object.assign(
+        new IntegrationError('This file read has no checked version. Request a new read.', 409),
+        { notRun: true },
+      );
+    }
     const destination = async (path: string, source?: string) => {
       const resolved = await target(path);
       if (
@@ -732,7 +754,7 @@ export function createLocalFiles(
     }
     if (action === 'LOCAL_FILES_READ') {
       const path = await target(input.path);
-      const { size, bytes } = await readFile(path, readBytes);
+      const { size, bytes } = await readFile(path, readBytes, input.version);
       const truncated = size > readBytes;
       if (bytes.includes(0)) return { path, size, binary: true };
       return {
@@ -744,9 +766,7 @@ export function createLocalFiles(
     }
     if (action === 'LOCAL_FILES_IMPORT') {
       const path = await target(input.path);
-      if (((await maybeLstat(path))?.size ?? 0) > fileBytes)
-        throw new IntegrationError(`Files up to ${fileBytes / 1024 / 1024} MB can be copied.`);
-      const { size, bytes } = await readFile(path, fileBytes);
+      const { size, bytes } = await readFile(path, fileBytes, input.version, true);
       const name = nodePath.basename(path);
       const file: IntegrationFile = { name, mimeType: fileMimeType(name), bytes };
       return { path, size, file };
@@ -782,7 +802,7 @@ export function createLocalFiles(
       let text: string;
       try {
         if (bytes.includes(0)) throw new Error();
-        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
       } catch {
         throw new IntegrationError(`${path} is not a UTF-8 text file. Nothing was changed.`);
       }

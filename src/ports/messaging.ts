@@ -50,6 +50,16 @@ export interface InboundReaction {
   reaction: string | null;
 }
 
+export interface InboundApproval {
+  channelId: string;
+  accountId: string;
+  senderId: string;
+  threadId: string;
+  messageId: string;
+  approved: boolean;
+  acknowledge(result: 'recorded' | 'unavailable' | 'retry'): Promise<void>;
+}
+
 export interface ChannelPairingRequest {
   channelId: string;
   accountId: string;
@@ -76,11 +86,13 @@ export interface MessagingWebhookResult {
   contentType?: string;
   messages?: InboundMessage[];
   reactions?: InboundReaction[];
+  approvals?: InboundApproval[];
   pairing?: ChannelPairingRequest;
 }
 
 export interface MessagingTransport {
   channels: MessagingChannel[];
+  canDeliverLiteral?(input: { channelId: string; text: string; literal: string }): boolean;
   pairing?(): Promise<ChannelLinkStatus>;
   cancelPairing?(pairingId: string, restart?: boolean): Promise<boolean>;
   unlink?(): Promise<void>;
@@ -88,6 +100,7 @@ export interface MessagingTransport {
     accept: (message: InboundMessage) => Promise<void>,
     pair?: (request: ChannelPairingRequest) => Promise<void>,
     react?: (reaction: InboundReaction) => Promise<void>,
+    approve?: (approval: InboundApproval) => Promise<void>,
   ): Promise<void>;
   receive(request: MessagingWebhook): Promise<MessagingWebhookResult>;
   post(input: {
@@ -95,11 +108,12 @@ export interface MessagingTransport {
     accountId: string;
     threadId: string;
     text: string;
+    approval?: { approve: string; decline: string };
     attachments?: MessagingAttachment[];
     replyToMessageId?: string;
     replyToText?: string;
-    attachmentFailure?: (names: string[]) => Promise<string | undefined>;
-  }): Promise<{ id: string; ids?: string[] }>;
+    attachmentFailure?: (files: { name: string; reason?: string }[]) => Promise<string | undefined>;
+  }): Promise<{ id: string; ids?: string[]; approvalButtons?: true }>;
   react?(input: {
     channelId: string;
     accountId: string;

@@ -24,9 +24,9 @@ import { integrationMetadata, integrationServiceIds } from '../shared/integratio
 import { untrustedBlock } from '../shared/untrusted.ts';
 import {
   DiscoveredConnectionError,
-  officialMcp,
   type createDiscoveredConnections,
 } from './discovered-connections.ts';
+import { bundledApps } from './app-catalog.ts';
 import { transaction } from './transaction.ts';
 import type { WorkAdmission } from './work-admission.ts';
 import type { SiteIcon } from '../ports/link-preview.ts';
@@ -118,6 +118,7 @@ type ConnectionRow = {
   setup_link_hash: string | null;
   callback_expires: Date | null;
   callback_expired?: boolean;
+  callback_timeout_recorded: boolean;
   callback_return_to: ReturnTarget;
   trigger_id: string | null;
   triggers_enabled: boolean;
@@ -279,7 +280,8 @@ export async function initializeIntegrationSchema(pool: Pool) {
       ADD COLUMN IF NOT EXISTS activity_token text,
       ADD COLUMN IF NOT EXISTS activity_failed boolean NOT NULL DEFAULT false,
       ADD COLUMN IF NOT EXISTS activity_poll_at timestamptz,
-      ADD COLUMN IF NOT EXISTS activity_claim_id text;
+      ADD COLUMN IF NOT EXISTS activity_claim_id text,
+      ADD COLUMN IF NOT EXISTS callback_timeout_recorded boolean NOT NULL DEFAULT false;
     INSERT INTO app_setup_links(owner_id,link_hash,slug)
       SELECT owner_id,setup_link_hash,slug FROM app_connections WHERE setup_link_hash IS NOT NULL
       ON CONFLICT DO NOTHING;
@@ -288,6 +290,7 @@ export async function initializeIntegrationSchema(pool: Pool) {
 }
 
 const activeCallbackClaims = new Set<string>();
+const callbackLifetimeMs = 600_000;
 
 function protectedCallback(row: Pick<ConnectionRow, 'callback_claim_id' | 'callback_expired'>) {
   return Boolean(
@@ -297,6 +300,7 @@ function protectedCallback(row: Pick<ConnectionRow, 'callback_claim_id' | 'callb
 }
 
 export async function createIntegrations(pool: Pool, options: IntegrationOptions) {
+  const directApps = options.discovered?.apps ?? bundledApps;
   const mailCheck = options.mailCheck ?? noMailCheck;
   const configuredOwner = z.string().min(1).max(200).parse(options.ownerId);
   const provider = options.provider;
@@ -315,11 +319,37 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       AnalyticsEvent,
       { event: 'connection_changed' }
     >['properties']['failure_reason'],
+    failure?: { step: string; error?: unknown },
   ) {
     captureConnection(options.analytics, connectionAnalytics(app), status, failureReason);
+    if (status === 'failed')
+      logFailure('app_connection_failed', failure?.error, {
+        app: slugSchema.safeParse(app).success ? app : 'custom',
+        step: failure?.step,
+        status: [Object(failure?.error).statusCode, Object(failure?.error).status].find(
+          (value) => Number.isInteger(value) && value >= 400 && value < 600,
+        ),
+        reason: failureReason,
+      });
   }
   function connectionFailure(error: unknown) {
     return serviceFailureReason(error);
+  }
+  function watchExpiry(slug: string, hash: string) {
+    setTimeout(
+      () =>
+        pool
+          .query(
+            `UPDATE app_connections SET callback_timeout_recorded=true WHERE owner_id=$1 AND callback_hash=$2
+             AND callback_claim_id IS NULL AND callback_expires<=now() AND NOT callback_timeout_recorded`,
+            [configuredOwner, hash],
+          )
+          .then(({ rowCount }) => {
+            if (rowCount) track(slug, 'failed', 'timeout', { step: 'sign_in' });
+          })
+          .catch(() => {}),
+      callbackLifetimeMs + 1000,
+    ).unref();
   }
   const providerId = z
     .string()
@@ -327,6 +357,15 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     .parse(provider.id);
   let serviceCatalog: Map<string, IntegrationServiceInfo> | undefined;
   function serviceInfo(slug: string): IntegrationServiceInfo {
+    const direct = directApps.get(slug);
+    if (direct)
+      return {
+        slug,
+        name: direct.name,
+        description: direct.description,
+        categories: direct.categories,
+        ...(direct.icon ? { logoUrl: `/api/apps/catalog/${slug}/icon` } : {}),
+      };
     const info = serviceCatalog?.get(slug);
     return { slug, ...info, ...integrationMetadata(slug, info) };
   }
@@ -450,7 +489,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           latest.watch_revision !== row.watch_revision ||
           latest.account_id !== row.account_id
         )
-          throw new IntegrationError('This connected account is unavailable.', 404);
+          throw Object.assign(new IntegrationError('This connected account is unavailable.', 404), {
+            notRun: true,
+          });
       }
       return await operation(session);
     } finally {
@@ -502,9 +543,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
   }
 
   async function catalog(): Promise<Connection[]> {
-    const services = await providerCatalog();
-    if (options.discovered && !services.has('notion'))
-      services.set('notion', serviceInfo('notion'));
+    const services = new Map(await providerCatalog());
+    if (options.discovered)
+      for (const slug of directApps.keys()) services.set(slug, serviceInfo(slug));
     return [...services.values()]
       .sort((left, right) => {
         const featured = (slug: string) => {
@@ -686,11 +727,12 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     const result: Connection[] = [];
     const services = new Set<string>([
       ...integrationServiceIds,
+      ...directApps.keys(),
       ...rows.filter((row) => row.account_id).map((row) => row.slug),
     ]);
     for (const slug of services) {
       const service = serviceInfo(slug);
-      if (officialMcp.has(slug)) {
+      if (directApps.has(slug)) {
         result.push({
           slug,
           name: service.name,
@@ -930,6 +972,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     if (active.length >= 10)
       throw new IntegrationError('This service supports up to ten connected accounts.', 409);
     const nonce = randomBytes(32).toString('base64url');
+    const hash = createHash('sha256').update(nonce).digest('hex');
     const callbackUrl = new URL('/api/apps/callback', options.baseUrl);
     callbackUrl.searchParams.set('state', nonce);
     const configurationId = provider.configurationId;
@@ -991,12 +1034,12 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         }
         await client.query(
           `INSERT INTO app_connections (owner_id,slug,pending_account_id,callback_hash,callback_expires,provider_id,callback_return_to,turn_id,setup_link_hash,callback_verifier,configuration_id,replaces_connection_id,pending_account_email)
-           VALUES ($1,$2,$3,$4,now() + interval '10 minutes',$5,$6,$7,$8,$9,$10,$11,$12)`,
+           VALUES ($1,$2,$3,$4,now() + $13 * interval '1 millisecond',$5,$6,$7,$8,$9,$10,$11,$12)`,
           [
             configuredOwner,
             slug,
             attempt.accountId,
-            createHash('sha256').update(nonce).digest('hex'),
+            hash,
             providerId,
             returnTo,
             turn?.turnId ?? null,
@@ -1005,6 +1048,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
             configurationId ?? null,
             replacement?.id ?? null,
             replacement ? normalizedEmail(replacement.account_email!) : null,
+            callbackLifetimeMs,
           ],
         );
         await client.query(
@@ -1024,12 +1068,13 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         client.release();
       }
       for (const previous of discarded) await discardReconnect(previous);
+      watchExpiry(slug, hash);
       return {
         url: attempt.url,
         ...(returnTo === 'window' || returnTo === 'desktop' ? { attempt: nonce } : {}),
       };
     } catch (error) {
-      track(slug, 'failed', connectionFailure(error));
+      track(slug, 'failed', connectionFailure(error), { step: 'start', error });
       throw error;
     } finally {
       if (session) provider.deleteSession(session.id).catch(() => {});
@@ -1058,7 +1103,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     );
     if (discarded.rows[0]) {
       await discardReconnect(discarded.rows[0]);
-      return discarded.rows[0].pending_account_id;
+      return discarded.rows[0];
     }
     const { rows } = await pool.query<ConnectionRow>(
       `WITH pending AS (
@@ -1070,7 +1115,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       [id, configuredOwner, hash, claimId ?? null, expiredOnly],
     );
     if (rows[0]) await discardReconnect(rows[0]);
-    return rows[0]?.pending_account_id;
+    return rows[0];
   }
 
   async function abandonSetup(linkHash: string, reason: 'cancelled' | 'unavailable' | 'unknown') {
@@ -1080,11 +1125,14 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       [configuredOwner, linkHash],
     );
     let abandoned = (await options.discovered?.abandonSetup(linkHash, reason)) ?? false;
-    for (const row of rows)
-      if ((await clearReconnect(row.id, row.callback_hash!)) !== undefined) {
-        track(row.slug, 'failed', reason);
+    for (const row of rows) {
+      const cleared = await clearReconnect(row.id, row.callback_hash!);
+      if (cleared) {
+        if (!cleared.callback_timeout_recorded)
+          track(row.slug, 'failed', reason, { step: 'sign_in' });
         abandoned = true;
       }
+    }
     return abandoned;
   }
 
@@ -1137,7 +1185,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
          AND (callback_claim_id IS NULL OR callback_expires<=now())
          AND (callback_claim_id IS NULL OR NOT (callback_claim_id=ANY($9::text[]))) FOR UPDATE
        ) UPDATE app_connections c SET pending_account_id=NULL,pending_account_email=$6,pending_auth_config_id=NULL,
-       callback_hash=$5,callback_claim_id=NULL,callback_verifier=NULL,callback_expires=now()+interval '10 minutes',callback_return_to=$7,setup_link_hash=NULL,turn_id=$8
+       callback_hash=$5,callback_claim_id=NULL,callback_verifier=NULL,callback_expires=now()+$10 * interval '1 millisecond',callback_timeout_recorded=false,callback_return_to=$7,setup_link_hash=NULL,turn_id=$8
        FROM previous WHERE c.id=previous.id RETURNING previous.*`,
       [
         row.id,
@@ -1149,6 +1197,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         returnTo,
         turn?.turnId ?? null,
         [...activeCallbackClaims],
+        callbackLifetimeMs,
       ],
     );
     if (!reserved.rowCount)
@@ -1198,6 +1247,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         'INSERT INTO app_setup_links(owner_id,link_hash,slug) VALUES($1,$2,$3) ON CONFLICT DO NOTHING',
         [configuredOwner, createHash('sha256').update(redirect.href).digest('hex'), slug],
       );
+      watchExpiry(slug, hash);
       return {
         url: attempt.url,
         ...(returnTo === 'window' || returnTo === 'desktop' ? { attempt: nonce } : {}),
@@ -1205,8 +1255,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       };
     } catch (error) {
       const cleared = await clearReconnect(row.id, hash);
-      if (attemptedId && cleared !== attemptedId) await discardReconnect(row, attemptedId);
-      track(slug, 'failed', connectionFailure(error));
+      if (attemptedId && cleared?.pending_account_id !== attemptedId)
+        await discardReconnect(row, attemptedId);
+      track(slug, 'failed', connectionFailure(error), { step: 'reconnect', error });
       throw error;
     }
   }
@@ -1515,6 +1566,43 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     return slug;
   }
 
+  const offeredActions = new Set<string>();
+  async function assertOffered(ownerId: string, action: string, signal?: AbortSignal) {
+    assertOwner(ownerId);
+    if (offeredActions.has(action) || !provider.configured || provider.connectionBackoff?.())
+      return;
+    let offered: boolean;
+    try {
+      const rows = await connectionRows(ownerId);
+      const slug = matchingService(action, knownServices(rows));
+      const row = rows.find(
+        (candidate) =>
+          candidate.slug === slug &&
+          candidate.account_id &&
+          !candidate.revoked &&
+          candidate.account_active &&
+          configurationMatches(candidate),
+      );
+      if (!slug || slug === retiredNotionMcp || directApps.has(slug) || !row) return;
+      const bounded = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(15_000)]);
+      offered = await withAccountSession(
+        ownerId,
+        [row],
+        bounded,
+        async (session) => (await session.offers?.(action, bounded)) ?? true,
+      );
+    } catch {
+      signal?.throwIfAborted();
+      return;
+    }
+    if (!offered)
+      throw new IntegrationError(
+        `${action} is not an action the connection service offers, so no app request was sent. Find the exact action name with SEARCH_TOOLS.`,
+        404,
+      );
+    offeredActions.add(action);
+  }
+
   async function selectedConnection(
     ownerId: string,
     action: string,
@@ -1560,6 +1648,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     turn?: TurnRef,
     signal?: AbortSignal,
     expectedBinding?: string,
+    beforeDispatch?: () => Promise<void>,
   ) {
     if (isLocalFilesAction(action)) {
       assertOwner(ownerId);
@@ -1590,13 +1679,15 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       return options.discovered.execute(action, args, turn, signal, expectedBinding);
     }
     assertOwner(ownerId);
-    const connectionId = z.uuid().safeParse(args.connectionId);
-    const observed = connectionId.success
-      ? (await connectionRows(ownerId)).find((row) => row.id === connectionId.data)
-      : undefined;
-    const known = observed ?? (await selectedConnection(ownerId, action, args));
-    const connection = connectionAnalytics(known.slug);
+    let known: ConnectionRow | undefined;
+    let dispatched = false;
     try {
+      const connectionId = z.uuid().safeParse(args.connectionId);
+      const observed = connectionId.success
+        ? (await connectionRows(ownerId)).find((row) => row.id === connectionId.data)
+        : undefined;
+      known = observed ?? (await selectedConnection(ownerId, action, args));
+      const connection = connectionAnalytics(known.slug);
       return await withServiceAnalytics(
         options.analytics,
         connection,
@@ -1612,7 +1703,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               throw Object.assign(new IntegrationError('The selected account changed.', 409), {
                 notRun: true,
               });
+            if (beforeDispatch) await beforeDispatch();
             signal?.throwIfAborted();
+            dispatched = true;
             return session.execute(action, providerArgs, row.account_id!, signal);
           });
           return result;
@@ -1620,14 +1713,16 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         signal,
       );
     } catch (error) {
-      if (error instanceof IntegrationError) throw error;
-      if (error instanceof IntegrationPermissionError)
-        throw new IntegrationError(
-          `${failure('The app request failed', error)} The selected ${known.slug} connection (${known.id}) lacks permissions for this action. Preserve this account and prepared work. Do not retry until permissions change. Ask before switching to browser sign-in unless the user already chose that recovery. The connection service's auth configuration must request the missing permission before reconnection can grant it; its operator may need to update it first. If the user chooses to reconnect, use manage_apps connect ${JSON.stringify({ service: known.slug, connectionId: known.id })}.`,
-          403,
-        );
-      const failed = requestFailure('The app request failed', error);
-      throw notRunMarker.safeParse(error).success
+      const failed =
+        error instanceof IntegrationError
+          ? error
+          : error instanceof IntegrationPermissionError && known
+            ? new IntegrationError(
+                `${failure('The app request failed', error)} The selected ${known.slug} connection (${known.id}) lacks permissions for this action. Preserve this account and prepared work. Do not retry until permissions change. Ask before switching to browser sign-in unless the user already chose that recovery. The connection service's auth configuration must request the missing permission before reconnection can grant it; its operator may need to update it first. If the user chooses to reconnect, use manage_apps connect ${JSON.stringify({ service: known.slug, connectionId: known.id })}.`,
+                403,
+              )
+            : requestFailure('The app request failed', error);
+      throw !dispatched || notRunMarker.safeParse(error).success
         ? Object.assign(failed, { notRun: true })
         : failed;
     }
@@ -1689,11 +1784,13 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               signal?.throwIfAborted();
               return session.search(query, signal);
             });
+            for (const action of Object.keys(found.tools as Record<string, unknown>))
+              offeredActions.add(action);
             tools = Object.fromEntries(
               Object.entries(found.tools as Record<string, unknown>).filter(([action]) => {
                 const slug = matchingService(action, services);
                 return (
-                  !(slug && officialMcp.has(slug)) &&
+                  !(slug && directApps.has(slug)) &&
                   slug !== retiredNotionMcp &&
                   (!connectionId || rows.some((row) => row.slug === slug))
                 );
@@ -2562,11 +2659,11 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
             ? await provider.connectionStatus?.(configuredOwner, pairingUrl).catch(() => undefined)
             : undefined;
         const discoveredLinks = discovered.flatMap(
-          ({ id, link_hash, available, expired, ...service }) => {
+          ({ id, link_hash, available, expired, error, ...service }) => {
             const proposalHash = createHash('sha256').update(`/apps?connect=${id}`).digest('hex');
             return [
               ...(link_hash && hashes.includes(link_hash)
-                ? [{ ...service, hash: link_hash, available }]
+                ? [{ ...service, hash: link_hash, available, ...(error ? { error } : {}) }]
                 : []),
               ...(hashes.includes(proposalHash)
                 ? [{ ...service, hash: proposalHash, ...(expired ? { available: false } : {}) }]
@@ -2584,6 +2681,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               slug: row.slug,
               name: 'name' in row && typeof row.name === 'string' ? row.name : info.name,
               ...('available' in row ? { available: row.available } : {}),
+              ...('error' in row && typeof row.error === 'string' ? { error: row.error } : {}),
               ...(info.logoUrl ? { logoUrl: info.logoUrl } : {}),
               ...(connectionStatus?.pairingConfirmed && row.hash === pairingHash
                 ? { pairingConfirmed: true }
@@ -2600,6 +2698,20 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
           apps,
         } satisfies AppSetupStatus);
       });
+      scope.get<{ Params: { slug: string } }>(
+        '/api/apps/catalog/:slug/icon',
+        async (request, reply) => {
+          const value = directApps.get(request.params.slug)?.icon;
+          if (!value) return reply.code(404).send({ error: 'The app icon is unavailable.' });
+          return reply
+            .header('Content-Type', value.mimeType)
+            .header('X-Content-Type-Options', 'nosniff')
+            .header('Content-Security-Policy', "default-src 'none'; sandbox")
+            .header('Cross-Origin-Resource-Policy', 'same-origin')
+            .header('Cache-Control', 'private, max-age=300')
+            .send(Buffer.from(value.bytes));
+        },
+      );
       scope.get<{ Params: { id: string } }>('/api/apps/:id/icon', async (request, reply) => {
         const value = await icon(request.params.id);
         if (!value) return reply.code(404).send({ error: 'The app icon is unavailable.' });
@@ -2652,7 +2764,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
         const service = request.params.slug === retiredNotionMcp ? 'notion' : request.params.slug;
         if (request.params.slug === retiredNotionMcp && input.connectionId)
           throw new IntegrationError(retiredNotionMessage, 409);
-        if (officialMcp.has(service)) {
+        if (directApps.has(service)) {
           if (!options.discovered)
             throw new IntegrationError('Discovered connections are unavailable.', 503);
           const selected = (await options.discovered.list()).find(
@@ -2747,11 +2859,9 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               : 'apps';
             if (!configurationMatches(row)) {
               outcome = 'failed';
-              const pending = await clearReconnect(
-                row.id,
-                hash,
-                row.callback_claim_id ?? undefined,
-              );
+              const pending = (
+                await clearReconnect(row.id, hash, row.callback_claim_id ?? undefined)
+              )?.pending_account_id;
               const previous = rowProvider(row);
               if (pending && previous)
                 try {
@@ -2763,10 +2873,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
                   if (result.success && result.accountId !== pending)
                     await discardReconnect(row, result.accountId);
                 } catch {}
-            } else if (
-              row.callback_expires &&
-              new Date(row.callback_expires).getTime() > Date.now()
-            ) {
+            } else {
               const claimId = randomBytes(32).toString('base64url');
               const claimed = (
                 await pool.query<ConnectionRow>(
@@ -2790,23 +2897,30 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
                   if (!result.success) {
                     outcome = 'cancelled';
                     await clearReconnect(claimed.id, hash, claimId);
-                    track(claimed.slug, 'failed', 'cancelled');
+                    track(claimed.slug, 'failed', 'cancelled', { step: 'callback' });
                   } else {
                     const resumed = await completeConnection(result, claimed, (id) => {
                       verifiedAccountId = id;
                     });
                     outcome = resumed ? 'continued' : 'connected';
                   }
-                } catch {
+                } catch (error) {
                   outcome = 'failed';
-                  track(claimed.slug, 'failed', 'verification_failed');
+                  track(claimed.slug, 'failed', 'verification_failed', {
+                    step: 'callback',
+                    error,
+                  });
                   await clearReconnect(claimed.id, hash, claimId);
                   if (verifiedAccountId) await discardReconnect(claimed, verifiedAccountId);
                 } finally {
                   activeCallbackClaims.delete(claimId);
                 }
+              } else {
+                const cleared = await clearReconnect(row.id, hash, undefined, true);
+                if (cleared && !cleared.callback_timeout_recorded)
+                  track(row.slug, 'failed', 'timeout', { step: 'callback' });
               }
-            } else if (!row.callback_claim_id) await clearReconnect(row.id, hash);
+            }
           } else if (options.discovered) {
             const result = await options.discovered
               .completeOAuth(request.query)
@@ -2917,6 +3031,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
     readActivity,
     watchable,
     watchState,
+    assertOffered,
     execute,
     executeApproved,
     serviceWait,
@@ -3009,10 +3124,17 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
               !connection.browserState ||
               ['saved', 'needs_sign_in', 'pending'].includes(connection.browserState),
           )
-          .map(({ accountId: _accountId, browserUrl: _browserUrl, ...connection }) => ({
-            ...connection,
-            ...(connection.browserState ? { browserAccess: 'browser_session' } : {}),
-          }));
+          .map(
+            ({
+              accountId: _accountId,
+              browserUrl: _browserUrl,
+              canRename: _canRename,
+              ...connection
+            }) => ({
+              ...connection,
+              ...(connection.browserState ? { browserAccess: 'browser_session' } : {}),
+            }),
+          );
         const logins = connections.filter((connection) => connection.savedLogin);
         const matching = site
           ? logins.filter((connection) => {
@@ -3051,7 +3173,7 @@ export async function createIntegrations(pool: Pool, options: IntegrationOptions
       const slug = slugSchema.parse(service === retiredNotionMcp ? 'notion' : service);
       if (service === retiredNotionMcp && connectionId)
         throw new IntegrationError(retiredNotionMessage, 409);
-      if (officialMcp.has(slug)) {
+      if (directApps.has(slug)) {
         if (!options.discovered)
           throw new IntegrationError('Discovered connections are unavailable.', 503);
         const accounts = (await options.discovered.list())

@@ -15,6 +15,7 @@ import {
 import type { WorkspaceSession } from '../../ports/computer.ts';
 
 const streamBytes = 1024 * 1024;
+const helperPath = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 const rawCommand =
   /[|&;<>\n\r`$\\]|^\s*\w+=\S*|(?:^|\s)["']?(?:--(?:json|porcelain|raw|format|pretty|output|outfile|output-file|null|zero)(?:[-=\s"']|$)|-[oO]|-(?:0|z|print0)(?:[\s"']|$))/;
 const invocationWrapper =
@@ -45,7 +46,7 @@ async function run(
   options: { input?: string; signal?: AbortSignal } = {},
 ) {
   const chunks: Buffer[] = [];
-  const { exitCode } = await workspace.exec(script, {
+  const { exitCode } = await workspace.exec(`export PATH=${quote(helperPath)}\n${script}`, {
     ...options,
     onData: (chunk) => chunks.push(chunk),
   });
@@ -141,7 +142,7 @@ async function moveHostOutputs(texts: string[], workspace: WorkspaceSession, sig
       });
       if (!bytes) continue;
       signal?.throwIfAborted();
-      if (!moved.size && (await workspace.exec(`mkdir -p -- '${directory}'`, { signal })).exitCode)
+      if (!moved.size && (await run(workspace, `mkdir -p -- '${directory}'`, { signal })).exitCode)
         throw new Error();
       const name = basename(path);
       const target = posix.join(
@@ -230,6 +231,8 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
     const diagnostics = `${file}.timeout`;
     const marker = `\nnod-timeout-${randomUUID()}`;
     const script = [
+      'nod_path=${nod_workspace_path-$PATH}',
+      `export PATH=${quote(helperPath)}`,
       `cd -- ${quote(cwd)} || exit 1`,
       `mkdir -p ${quote(posix.dirname(file))}`,
       ...(timeZone ? [`export TZ=${quote(timeZone)}`] : []),
@@ -237,12 +240,12 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
       `nod_command=${quote(command)}`,
       ...(!rawCommand.test(command) && !/^\s*(?:git\s+log\s*$|find(?:\s|$))/.test(command)
         ? [
-            'nod_rewrite=$(timeout -k 1 2 rtk rewrite "$nod_command" 2>/dev/null)',
+            'nod_rewrite=$(timeout -k 1 2 /usr/local/bin/rtk rewrite "$nod_command" 2>/dev/null)',
             'nod_rewrite_code=$?',
-            `if { [ "$nod_rewrite_code" -eq 0 ] || [ "$nod_rewrite_code" -eq 3 ]; } && [ -n "$nod_rewrite" ]${invocationWrapper.test(command) ? ' && [ "$nod_rewrite" = "rtk $nod_command" ]' : ''}; then nod_command=$nod_rewrite; fi`,
+            `if { [ "$nod_rewrite_code" -eq 0 ] || [ "$nod_rewrite_code" -eq 3 ]; } && [ -n "$nod_rewrite" ]${invocationWrapper.test(command) ? ' && [ "$nod_rewrite" = "rtk $nod_command" ]' : ''}; then case "$nod_rewrite" in "rtk "*) nod_command="/usr/local/bin/$nod_rewrite";; esac; fi`,
           ]
         : []),
-      `timeout --verbose -k 5 ${seconds} bash -c ${quote('exec bash -c "$1" 2>&1')} bash "$nod_command" > ${quote(file)} 2> ${quote(diagnostics)} < /dev/null`,
+      `timeout --verbose -k 5 ${seconds} /bin/bash --noprofile --norc -p -c ${quote('PATH="$1"; export PATH; exec /bin/bash -c "$2" 2>&1')} bash "$nod_path" "$nod_command" > ${quote(file)} 2> ${quote(diagnostics)} < /dev/null`,
       'code=$?',
       'timed_out=0',
       `if { [ "$code" -eq 124 ] || [ "$code" -eq 137 ]; } && [ -s ${quote(diagnostics)} ]; then timed_out=1; fi`,
@@ -297,7 +300,7 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
     ].join('\n');
     const { exitCode, output } = await run(
       workspace,
-      `python3 -c ${quote(program)} ${quote(root)} ${quote(pattern)} ${options.limit} ${quote(JSON.stringify(options.ignore))}`,
+      `/usr/bin/python3 -I -c ${quote(program)} ${quote(root)} ${quote(pattern)} ${options.limit} ${quote(JSON.stringify(options.ignore))}`,
     );
     if (exitCode) throw new Error(`Could not search ${root}.`);
     return output.toString('utf8').split('\0').filter(Boolean);
@@ -349,7 +352,7 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
           path = workspacePath(path);
           const { exitCode, output } = await run(
             workspace,
-            `python3 -c ${quote(listProgram)} ${quote(path)}`,
+            `/usr/bin/python3 -I -c ${quote(listProgram)} ${quote(path)}`,
           );
           if (exitCode) throw new Error(`Cannot read directory: ${path}`);
           const parts = output.toString('utf8').split('\0');
@@ -367,7 +370,7 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
     ...definition,
     ...(definition.name === 'bash'
       ? {
-          description: `${definition.description}\nSupported simple commands automatically use RTK for compact output. Prefer bash with rtk ls, rtk read and rtk grep for exploration; use native read for exact edit context. Use rtk test or rtk err around scripts to compact their output, and rtk proxy for unfiltered output. Shell data flows and explicit machine-output formats stay raw.`,
+          description: `${definition.description}\nSupported simple commands automatically use RTK for compact output. Prefer bash with rtk ls, rtk read and rtk grep for exploration; use native read for exact edit context. Use rtk test or rtk err around scripts to compact their output, and rtk proxy for unfiltered output. Shell data flows and explicit machine-output formats stay raw.\nTrust sees the command text, folder and time limit. It does not read named script files. If a Trust refusal confirms that a filename-only command did not run, inspect the full program. Use an inline form only if the program contains no secrets or private data and does not depend on its file name, path, shebang or script-relative resources. Put its full text in a new checked command without command substitution. For a here-document, quote the delimiter and choose one that is not a complete line of the program. Use the same interpreter, flags, folder, inputs and outputs. If the text form can change its effects, do not run it. Command records keep a redacted prefix of up to 4,000 characters. All permission checks still apply.`,
         }
       : {}),
     execute: async (id, params, signal, onUpdate, context) => {
