@@ -27,6 +27,7 @@ export function analyticsRoute(value: string) {
       [
         '/settings/models',
         '/settings/memory',
+        '/settings/computer-use',
         '/settings/notifications',
         '/settings/voice',
         '/settings/privacy',

@@ -10,5 +10,6 @@
   "/settings/models": "Settings > Models",
   "/settings/voice": "Settings > Voice & audio",
   "/settings/memory": "Settings > Memory",
+  "/settings/computer-use": "Settings > Computer use",
   "/settings/privacy": "Settings > Privacy & data"
 }

@@ -15,9 +15,9 @@ export function combineMessagingTransports(
         ).values(),
       ];
     },
-    async poll(accept, pair, react) {
+    async poll(accept, pair, react, approve) {
       const results = await Promise.allSettled(
-        transports.map((transport) => transport.poll?.(accept, pair, react)),
+        transports.map((transport) => transport.poll?.(accept, pair, react, approve)),
       );
       const failed = results.find((result) => result.status === 'rejected');
       if (failed?.status === 'rejected') throw failed.reason;

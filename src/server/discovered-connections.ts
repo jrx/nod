@@ -33,6 +33,7 @@ import {
 } from './analytics-connections.ts';
 
 const envName = appEnvironmentNameSchema;
+const manualMcpService = /^mcp-[0-9a-f]{24}$/;
 
 const proposalSchema = z.object({
   service: z
@@ -52,6 +53,7 @@ type AccountRow = {
   owner_id: string;
   service: string;
   name: string;
+  display_name: string | null;
   account_name: string;
   account_id: string;
   paths: AccessPath[];
@@ -63,6 +65,7 @@ type ProposalRow = {
   service: string;
   name: string;
   paths: AccessPath[];
+  display_name?: string | null;
   setup_url: string | null;
   setup_text: string | null;
   account_name: string | null;
@@ -267,7 +270,8 @@ export async function createDiscoveredConnections(
     );
     ALTER TABLE discovered_connections ADD COLUMN IF NOT EXISTS account_id uuid NOT NULL DEFAULT gen_random_uuid(),
       ADD COLUMN IF NOT EXISTS reconnect_required boolean NOT NULL DEFAULT false,
-      ADD COLUMN IF NOT EXISTS replaced_at timestamptz;
+      ADD COLUMN IF NOT EXISTS replaced_at timestamptz,
+      ADD COLUMN IF NOT EXISTS display_name text;
     ALTER TABLE discovered_connection_proposals ADD COLUMN IF NOT EXISTS oauth_status text,
       ADD COLUMN IF NOT EXISTS link_hash text,
       ADD COLUMN IF NOT EXISTS callback_return_to text,
@@ -292,6 +296,12 @@ export async function createDiscoveredConnections(
     if (!result.rows[0]) throw error('This connected account is unavailable.', 404);
     return result.rows[0];
   }
+  async function lockDisplayName(client: PoolClient, service: string) {
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1),hashtext($2))', [
+      `discovered-mcp-name:${owner}`,
+      service,
+    ]);
+  }
   async function list(client?: PoolClient): Promise<Connection[]> {
     const rows = (
       await (client ?? pool).query<AccountRow>(
@@ -301,7 +311,12 @@ export async function createDiscoveredConnections(
     ).rows;
     return rows.map((row) => ({
       slug: row.service,
-      name: row.name,
+      name: row.display_name ?? row.name,
+      ...(manualMcpService.test(row.service) &&
+      !apps.has(row.service) &&
+      row.paths.some((path) => path.kind === 'mcp')
+        ? { canRename: true }
+        : {}),
       status: row.reconnect_required ? 'disconnected' : 'connected',
       ...(row.reconnect_required ? { canReconnect: true } : {}),
       connectionId: row.id,
@@ -330,9 +345,12 @@ export async function createDiscoveredConnections(
       oauth_status: ProposalRow['oauth_status'];
       oauth_error: string | null;
     }>(
-      `SELECT id,service AS slug,name,oauth_status IS NOT DISTINCT FROM 'connected' AS completed,
+      `SELECT id,service AS slug,
+       COALESCE((SELECT min(display_name) FROM discovered_connections
+                 WHERE owner_id=p.owner_id AND service=p.service),name) AS name,
+       oauth_status IS NOT DISTINCT FROM 'connected' AS completed,
        expires_at<=now() AS expired,link_hash,oauth_status,oauth_error
-       FROM discovered_connection_proposals WHERE owner_id=$1
+       FROM discovered_connection_proposals p WHERE owner_id=$1
        AND (id=ANY($2::uuid[]) OR link_hash=ANY($3::text[]))`,
       [owner, requested, hashes],
     );
@@ -673,8 +691,9 @@ export async function createDiscoveredConnections(
   async function proposal(id: string, client: Pool | PoolClient = pool, lock = false) {
     const row = (
       await client.query<ProposalRow>(
-        `SELECT id,owner_id,service,name,paths,connection_id,turn_id,setup_url,setup_text,account_name,oauth_state_hash,oauth_status,oauth_error,callback_return_to,created_at
-       FROM discovered_connection_proposals
+        `SELECT id,owner_id,service,name,paths,connection_id,turn_id,setup_url,setup_text,account_name,oauth_state_hash,oauth_status,oauth_error,callback_return_to,created_at,
+       (SELECT min(display_name) FROM discovered_connections WHERE owner_id=p.owner_id AND service=p.service) AS display_name
+       FROM discovered_connection_proposals p
        WHERE id=$1 AND owner_id=$2 AND expires_at>now()${lock ? ' FOR UPDATE' : ''}`,
         [z.uuid().parse(id), owner],
       )
@@ -726,9 +745,16 @@ export async function createDiscoveredConnections(
           ],
         );
       } else {
+        const sharesName =
+          manualMcpService.test(pending.service) &&
+          pending.paths.some((path) => path.kind === 'mcp');
+        if (sharesName) await lockDisplayName(client, pending.service);
         await client.query(
-          `INSERT INTO discovered_connections
-           (id,owner_id,service,name,account_name,paths) VALUES($1,$2,$3,$4,$5,$6)`,
+          `INSERT INTO discovered_connections (id,owner_id,service,name,account_name,paths,display_name)
+           VALUES($1,$2,$3,$4,$5,$6,
+             CASE WHEN $7 THEN
+               (SELECT min(display_name) FROM discovered_connections WHERE owner_id=$2 AND service=$3)
+             END)`,
           [
             idToSave,
             owner,
@@ -736,6 +762,7 @@ export async function createDiscoveredConnections(
             pending.name,
             accountName,
             JSON.stringify(pending.paths),
+            sharesName,
           ],
         );
       }
@@ -769,8 +796,8 @@ export async function createDiscoveredConnections(
     const { token: entered, accountName } = z
       .object({
         token: z.union([
-          z.string().min(1).max(8192),
-          z.record(envName, z.string().min(1).max(8192)),
+          z.string().trim().min(1).max(8192),
+          z.record(envName, z.string().trim().min(1).max(8192)),
         ]),
         accountName: z.string().trim().min(1).max(200),
       })
@@ -1408,7 +1435,7 @@ export async function createDiscoveredConnections(
       returnTo,
       localOrigin,
     );
-    return { name, url: `/apps?connect=${id}` };
+    return { name: row.display_name ?? name, url: `/apps?connect=${id}` };
   }
   async function search(query: string, connectionId?: string, signal?: AbortSignal) {
     signal?.throwIfAborted();
@@ -1450,7 +1477,8 @@ export async function createDiscoveredConnections(
               };
             try {
               const { tools: available, instructions } = await catalog(row, path, signal);
-              const accountMatch = score(row.service) || score(row.name);
+              const accountMatch =
+                score(row.service) || score(row.name) || score(row.display_name ?? '');
               const matching = available
                 .map((tool) => ({ tool, score: score(`${tool.name} ${tool.description ?? ''}`) }))
                 .filter((entry) => entry.score)
@@ -1485,6 +1513,7 @@ export async function createDiscoveredConnections(
         return {
           connectionId: row.id,
           service: row.service,
+          ...(row.display_name ? { name: row.display_name } : {}),
           accountName: row.account_name,
           ...(app ? { description: app.description, documentation: app.contract.source } : {}),
           paths,
@@ -1510,7 +1539,7 @@ export async function createDiscoveredConnections(
                     connectionId: row.id,
                     pathId: path.id,
                     service: row.service,
-                    name: row.name,
+                    name: row.display_name ?? row.name,
                     accountName: row.account_name,
                     ...(instructions ? { instructions } : {}),
                     tools,
@@ -1551,7 +1580,15 @@ export async function createDiscoveredConnections(
       if (path.kind !== 'cli') throw error('Choose a CLI access path.');
       if (!path.source || !path.env)
         throw error('Propose this CLI again with its install source and connectionId.', 409);
-      const argv = z.array(z.string().min(1)).min(1).parse(args.argv);
+      const argv = z
+        .array(
+          z
+            .string()
+            .min(1)
+            .refine((value) => !value.includes('\0')),
+        )
+        .min(1)
+        .parse(args.argv);
       const timeoutSeconds = z.number().int().min(1).optional().parse(args.timeoutSeconds);
       return { row, call: { kind: 'cli' as const, path, argv, timeoutSeconds } };
     }
@@ -1590,7 +1627,7 @@ export async function createDiscoveredConnections(
     const verifiedBinding = JSON.stringify([row.account_id, row.paths]);
     await assertBinding(row);
     signal?.throwIfAborted();
-    const account = { name: row.name, identity: row.account_name };
+    const account = { name: row.display_name ?? row.name, identity: row.account_name };
     if (call.kind === 'http')
       return {
         account,
@@ -1720,6 +1757,25 @@ export async function createDiscoveredConnections(
     return rows.rows.flatMap((row) => row.paths.map(connection));
   }
   function registerRoutes(app: FastifyInstance) {
+    app.patch<{ Params: { service: string } }>('/api/apps/mcp/:service', async (request) => {
+      const { service } = request.params;
+      if (!manualMcpService.test(service) || apps.has(service))
+        throw error('This custom MCP server is unavailable.', 404);
+      const input = z.object({ name: proposalSchema.shape.name }).strict().safeParse(request.body);
+      if (!input.success) throw error('To rename this server, enter a name of 1 to 80 characters.');
+
+      await transaction(async (client) => {
+        await lockDisplayName(client, service);
+        const result = await client.query(
+          `UPDATE discovered_connections SET display_name=$3
+           WHERE owner_id=$1 AND service=$2 AND paths @> '[{"kind":"mcp"}]'::jsonb`,
+          [owner, service, input.data.name],
+        );
+        if (!result.rowCount) throw error('This custom MCP server is unavailable.', 404);
+      }, pool);
+      options.refresh?.();
+      return { name: input.data.name };
+    });
     app.post('/api/apps/mcp', async (request, reply) => {
       const parsed = z
         .object({
@@ -1808,19 +1864,21 @@ export async function createDiscoveredConnections(
           : undefined;
       const address = apps.get(row.service)?.instancePath && !row.paths.length;
       const localAddress = address ? await nearby(row.service) : undefined;
+      const catalogApp = Boolean(
+        apps.get(row.service) &&
+        (address ||
+          row.paths.every((path) => {
+            const app = apps.get(row.service)!;
+            if (app.instancePath) return path.kind === 'mcp';
+            const { id: _id, local: _local, ...saved } = path;
+            return isDeepStrictEqual(saved, appAccessPath(app));
+          })),
+      );
       return reply.header('Cache-Control', 'no-store').send({
         service: row.service,
-        name: row.name,
-        catalogApp: Boolean(
-          apps.get(row.service) &&
-          (address ||
-            row.paths.every((path) => {
-              const app = apps.get(row.service)!;
-              if (app.instancePath) return path.kind === 'mcp';
-              const { id: _id, local: _local, ...saved } = path;
-              return isDeepStrictEqual(saved, appAccessPath(app));
-            })),
-        ),
+        name: row.display_name ?? row.name,
+        catalogApp,
+        hints: catalogApp ? apps.get(row.service)?.hints : undefined,
         credentialLabels:
           apps.get(row.service)?.kind === 'cli'
             ? (apps.get(row.service) as Extract<BundledApp, { kind: 'cli' }>).environment

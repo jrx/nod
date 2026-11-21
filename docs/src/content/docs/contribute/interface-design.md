@@ -80,6 +80,8 @@ Turn on standard ligatures, balance short headings, and let paragraphs wrap natu
 
 Page padding changes with the available width. Pages share one title size, and actions align with the page heading.
 
+Leave 8 px before a file preview that follows reply text or an action card in the same message.
+
 ## Icons and brand details
 
 | Item               | Rule                                                                                                                                  |

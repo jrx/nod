@@ -28,7 +28,12 @@ import {
   safeMessageLink,
   setupLink,
 } from '../lib/message-links';
-import { rehypeLocalLinks, rehypeMessageBreaks, remarkLinkDestinations } from '../lib/markdown';
+import {
+  rehypeDropBlankMessage,
+  rehypeLocalLinks,
+  rehypeMessageBreaks,
+  remarkLinkDestinations,
+} from '../lib/markdown';
 import { nextReaction, reactionName } from '../lib/reactions';
 import { SetupActions } from './setup-link';
 import { TelegramChatLink, useTelegramChatUrl } from './telegram-chat-link';
@@ -216,6 +221,7 @@ export const MessageText = memo(function MessageText({
             rehypeMessageBreaks,
             rehypeLocalLinks,
             [rehypeSanitize, messageSchema],
+            rehypeDropBlankMessage,
           ]}
           components={{
             table: ({ node, ...props }) => (
@@ -234,12 +240,12 @@ export const MessageText = memo(function MessageText({
               if (href === telegramUrl) return <TelegramChatLink href={telegramUrl} />;
               const linkText = messageLinkText(node?.children ?? []);
               const setup = setupLink(link, linkText);
-              if (setup && actions.some((action) => action.href === setup.href))
-                return (
-                  <strong className="setup-phrase">
-                    {linkText.trim() && !linkText.includes(setup.href) ? children : setup.label}
-                  </strong>
-                );
+              if (setup && actions.some((action) => action.href === setup.href)) {
+                const phrase = linkText.trim().replace(/\s+/g, ' ');
+                const bare = !phrase || phrase.includes(setup.href);
+                if (!connected(setup.href) && (bare || phrase === setup.label)) return null;
+                return <strong className="setup-phrase">{bare ? setup.label : children}</strong>;
+              }
               return (
                 <a
                   href={link.kind === 'external' ? href : link.href}
@@ -294,7 +300,7 @@ export interface MessageWork {
   onOpen?(): void;
 }
 
-function WorkLabel({ work }: { work: MessageWork }) {
+export function WorkLabel({ work }: { work: MessageWork }) {
   const content = (
     <>
       {work.status !== 'idle' && <span className="message-work-dot" aria-hidden="true" />}

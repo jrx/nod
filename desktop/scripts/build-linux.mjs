@@ -6,7 +6,13 @@ import { packager } from '@electron/packager';
 import { copyEngineSource, verifyApplicationRuntime } from './engine-source.mjs';
 import { copyBundleSource as copy, copyEngineDependencies } from './engine-dependencies.mjs';
 import { buildDesktopUI } from './build-ui.mjs';
-import { desktopBuildOptions, hardenElectron, run, sourceRevision } from './release-tools.mjs';
+import {
+  copyAgentDesktop,
+  desktopBuildOptions,
+  hardenElectron,
+  run,
+  sourceRevision,
+} from './release-tools.mjs';
 
 if (process.platform !== 'linux' || !['arm64', 'x64'].includes(process.arch))
   throw new Error('This desktop build requires a 64-bit Linux computer.');
@@ -78,6 +84,7 @@ const licenses = join(resources, 'licenses');
 await mkdir(licenses, { recursive: true });
 for (const name of ['LICENSE', 'LICENSES.chromium.html'])
   await copy(join(packaged, name), join(licenses, name));
+await copyAgentDesktop(packaged, 'linux', process.arch);
 await hardenElectron(join(packaged, 'nod'));
 await verifyApplicationRuntime(packaged, electronVersion, {
   engine: join(resources, 'engine'),

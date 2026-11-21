@@ -34,6 +34,7 @@ export async function prepare(stack: Stack, world: World, timeZone: string) {
     await stack.pool.query('UPDATE preferences SET local_files_enabled=true, local_keep_out=$1', [
       ['/Volumes', '/media', '/run/media'],
     ]);
+  if (world.desktop) await call(stack, 'PATCH', '/api/computer-use', { enabled: true });
   const slugs = world.apps?.services ?? [];
   for (const slug of slugs) {
     await call(stack, 'POST', `/api/apps/${slug}/connect`, { returnTo: 'apps' });

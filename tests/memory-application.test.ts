@@ -90,7 +90,7 @@ test(
         sensitive: false,
       }));
     let rememberAnswer: (input: Remembered) => unknown = () => ({ ops: [] });
-    let whilePreparing: (() => Promise<void>) | undefined;
+    let whilePreparing: ((signal?: AbortSignal) => Promise<void>) | undefined;
     const plans = new Map<string, { steps: Step[]; finalText?: string }>();
     const finalTexts = new Set(['Synthetic memory request handled.']);
     const threads = new Set<string>();
@@ -148,15 +148,16 @@ test(
         memoryCurator: {
           id: 'fixture',
           configured: true,
-          curate: async ({ task, input }) => {
+          curate: async ({ task, input }, signal) => {
             if (task === 'review') reviews.push(JSON.stringify(input));
             if (task === 'remember') {
               rememberInputs.push(JSON.stringify(input));
+              await whilePreparing?.(signal);
               return rememberAnswer(input as Remembered);
             }
             if (task === 'skill') {
               skillDrafts.push(JSON.stringify(input));
-              await whilePreparing?.();
+              await whilePreparing?.(signal);
               const { draft } = input as { draft: { description: string; body: string } };
               return {
                 skill: {
@@ -383,6 +384,33 @@ test(
       assert.deepEqual((await savedEntry(explicit))?.sources, [await sourceOf(explicitTurn)]);
       await assertSilent(explicitTurn);
 
+      const punctuation = 'Remember that I prefer “compact reports”.';
+      const support = punctuation.replace(/[“”]/g, '"');
+      rememberAnswer = (input) => ({
+        ops: keep(input, [punctuation], 'preferences').map((op) => ({
+          ...op,
+          quote: support,
+        })),
+      });
+      const punctuationTurn = await ask(punctuation, [learn()]);
+      const punctuationNote = (await application.memory.load()).entries.find(
+        (entry) => entry.text === punctuation,
+      );
+      assert.ok(punctuationNote);
+      const supported = await application.memory.read({
+        path: `preferences/${punctuationNote.slug}`,
+      });
+      assert.ok('sources' in supported);
+      assert.deepEqual(
+        supported.sources.map(({ id, text }) => ({ id, text })),
+        [{ id: await sourceOf(punctuationTurn), text: support }],
+      );
+      assert.equal(
+        (await view()).notes.find((entry) => entry.path === supported.path)?.sources[0].quote,
+        support,
+      );
+      await assertSilent(punctuationTurn);
+
       const skill = (args: Record<string, unknown>, rejected = false): Step => ({
         tool: 'skills',
         args,
@@ -512,6 +540,60 @@ test(
         ),
       ]);
       assert.deepEqual((await view()).skills, []);
+
+      for (const kind of ['skill', 'remember'] as const) {
+        await t.test(`Stop cancels ${kind} preparation and refuses a late save`, async () => {
+          const before = await memoryFile();
+          let entered!: () => void;
+          const preparing = new Promise<void>((resolve) => {
+            entered = resolve;
+          });
+          let finish!: () => void;
+          const held = new Promise<void>((resolve) => {
+            finish = resolve;
+          });
+          let signal: AbortSignal | undefined;
+          whilePreparing = async (current) => {
+            signal = current;
+            entered();
+            await held;
+          };
+          const text = `Save my synthetic ${kind} preference.`;
+          rememberAnswer = (input) => ({ ops: keep(input, [text], 'preferences') });
+          plans.set(text, {
+            steps: [
+              kind === 'remember'
+                ? learn()
+                : skill({
+                    action: 'save',
+                    name: 'synthetic-cancelled-skill',
+                    description: 'Use when checking a synthetic file.',
+                    body: 'Read the synthetic file.',
+                  }),
+            ],
+          });
+          try {
+            const turn = await send({ text });
+            await preparing;
+            assert.ok(signal);
+            assert.equal(signal.aborted, false);
+            const stopped = await application.app.inject({
+              method: 'POST',
+              url: '/api/thread/stop',
+              headers,
+            });
+            assert.equal(stopped.statusCode, 200, stopped.body);
+            assert.equal(signal.aborted, true);
+            finish();
+            await settle(turn, 'cancelled');
+            await delay(25);
+            assert.equal(await memoryFile(), before);
+          } finally {
+            whilePreparing = undefined;
+            finish();
+          }
+        });
+      }
 
       const foreign = randomUUID();
       await pool.query(
@@ -841,6 +923,74 @@ test('memory notes keep their line breaks from every writer while other control 
     ),
     { applied: [], rejected: ['quote'] },
   );
+  for (const [said, quoted] of [
+    ['I\u2019m allergic to peanuts', "I'm allergic to peanuts"],
+    ["I'm allergic to peanuts", 'I\u2019m allergic to peanuts'],
+    ['Call it \u201cthe shed\u201d', 'Call it "the shed"'],
+    ...[...'“”«»„‟'].flatMap((mark) => [
+      [`Call it ${mark}the shed${mark}`, 'Call it "the shed"'],
+      ['Call it "the shed"', `Call it ${mark}the shed${mark}`],
+    ]),
+    ...[...'‘’‚‛‹›'].flatMap((mark) => [
+      [`I${mark}m ready`, "I'm ready"],
+      ["I'm ready", `I${mark}m ready`],
+    ]),
+  ]) {
+    let source = said;
+    const supported = createMemoryService({
+      ownerId: 'quote-owner',
+      store: memoryObjectStore(),
+      pool: {
+        query: async (_sql: string, values: unknown[]) => {
+          assert.deepEqual(values, ['quote-owner', [ids[1]]]);
+          return {
+            rows: [{ id: ids[1], text: source, created_at: new Date(when), channel: 'web' }],
+          };
+        },
+      } as unknown as pg.Pool,
+    });
+    const result = await supported.edit((tree) =>
+      applyOps(
+        tree,
+        [add('Synthetic quote preference', quoted)],
+        [{ id: ids[1], text: said }],
+        when,
+        'stated',
+      ),
+    );
+    assert.deepEqual(result.rejected, [], said);
+    const note = await supported.read({ path: 'preferences/email-signoff' });
+    assert.ok('sources' in note);
+    assert.deepEqual(
+      note.sources.map(({ id, text }) => ({ id, text })),
+      [{ id: ids[1], text: quoted }],
+    );
+    assert.equal((await supported.view()).notes[0].sources[0].quote, quoted);
+    source = 'A different synthetic message.';
+    const changed = await supported.read({ path: 'preferences/email-signoff' });
+    assert.ok('sources' in changed);
+    assert.equal(changed.sources[0].text, null);
+    assert.equal((await supported.view()).notes[0].sources[0].quote, undefined);
+  }
+  for (const [said, quoted, m] of [
+    ['I\u2019m allergic to peanuts', "I'm allergic to cashews", [1]],
+    ['I\u2019m allergic to peanuts', "I'm allergic to peanuts", [2]],
+    ['Use short reports.', 'Use', [1, 2]],
+    ['Use short—clear reports.', 'Use short-clear reports.', [1]],
+    ['Use short… reports.', 'Use short... reports.', [1]],
+    ['Iʼm ready', "I'm ready", [1]],
+  ] as const)
+    assert.deepEqual(
+      applyOps(
+        emptyTree(),
+        [{ ...add('Synthetic quote preference', quoted), m }],
+        [{ id: ids[1], text: said }],
+        when,
+        'stated',
+      ).rejected,
+      ['quote'],
+      said,
+    );
   assert.deepEqual(
     applyOps(
       emptyTree(),

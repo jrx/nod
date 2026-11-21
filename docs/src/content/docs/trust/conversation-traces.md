@@ -41,11 +41,49 @@ Nod excludes:
 - Checks of emails that may give access to an account.
 - Requests to decision services.
 - Separate requests to the models that write your memory, writing style or learned skills.
+- The request to a small model that writes the short line about your request in the chat's status line.
 - Attention and review tasks.
 - Codemode scripts and results.
-- Usage analytics, which have their own switch.
+- Usage events, which have their own switch.
 
 Each trace includes the Nod version as `app_version` metadata when a valid release version or source revision is available.
+
+### IDs, errors, and cost
+
+First desktop release for `user_id`, stable `thread_id`, and the expanded error classes: **v0.9.1**. See [release coverage](/deploy/analytics/#event-properties) for older data and fallback IDs.
+
+A trace can lack `user_id` when Nod cannot load the analytics ID. Nod still sends the trace. Count analytics IDs only where this field exists. Older releases can also omit it.
+
+| Metadata                  | Meaning                                                                                                                                           |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `user_id`                 | The analytics ID (`local:<UUID>`). It equals the PostHog `distinct_id`. It identifies a runtime profile, not a verified person.                   |
+| `thread_id`               | For saved sessions, a keyed hash that stays stable when the private key loads. Work without a saved session gets a new auxiliary ID for each job. |
+| `turn_id`                 | A pseudonymous ID for one unit of Nod's work: a user request, schedule fire, observer batch, or continuation. It is not a user-message count.     |
+| `run_id`, `parent_run_id` | Pseudonymous agent execution IDs, when available. They connect helper calls to their parent.                                                      |
+| `error_type`              | A fixed error class, when the request fails. See the values below.                                                                                |
+| `cost_usd`                | Nod's known cost estimate for this model call, as a number in US dollars. A known zero stays zero. An unknown cost is absent.                     |
+
+Curator requests within a turn share its conversation and turn IDs. Curator requests outside a turn use `turn_id` for their auxiliary work. Retries keep that ID. Requests excluded for privacy stay excluded.
+
+While usage sharing is on, server events within a turn carry the same `thread_id` and `turn_id`. Join on the analytics ID (`user_id`) matching PostHog's `distinct_id`, plus the same `thread_id` and `turn_id`. These keys identify the turn's source and task type. Task classification can arrive after the turn ends. The PostHog `run_id` is a separate analytics ID; it does not equal the trace's agent `run_id`.
+
+Error details pass through the same removal steps as messages. The fixed error classes are:
+
+| `error_type`           | Meaning                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------ |
+| `auth`                 | HTTP 401, an invalid API key, or an expired authentication token.                    |
+| `billing`              | HTTP 402 or an explicit provider billing cause, such as a required positive balance. |
+| `provider_unavailable` | HTTP 503, high model demand, or an overloaded provider.                              |
+| `quota`                | A free-tier, daily, or subscription usage limit, including ChatGPT plan limits.      |
+| `rate_limit`           | A short-term request or token limit.                                                 |
+| `model_config`         | A local setup failure, such as a missing cost estimate.                              |
+| `connection`           | A failed connection, timeout, or terminated stream.                                  |
+| `aborted`              | The model runtime reports an aborted request.                                        |
+| `unknown`              | The available reason does not match another class.                                   |
+
+Keep `aborted` separate from provider failures in failure-rate reports. This class follows the runtime's stop reason. It can include local deadline cancellations, so it does not prove that you selected Stop.
+
+Cost remains in the token usage data too. Plan requests use their API-price estimate. Unknown prices are not free usage; reports must keep their coverage separate. Model-call costs must be summed once, without adding helper costs again to a parent total.
 
 When available, a trace also records the observed request phase. A prepared payload does not prove that the request reached the provider. This field contains no transport headers or request content.
 
@@ -93,12 +131,14 @@ Nod removes what it can recognize. A trace can still contain private content in 
 
 ## How traces are pseudonymised
 
+- **Stable analytics ID.** Each trace carries the same analytics ID as usage analytics, even when usage sharing is off. It does not rotate across conversations, days, or restarts. It links traces from the same runtime profile. This ID can link traces to earlier usage data, About you choices, and an email submitted for updates. The trace switch controls sending traces. The usage switch controls sending usage events. Neither switch deletes stored data.
 - **Session metadata.** Nod removes its original session ID from trace metadata and replaces its turn and run IDs with keyed hashes. Account or device IDs in conversation text or app results can remain.
-- **IDs that change.** The traces of one conversation are grouped under a random ID so the team can read them in order. A conversation is one chat, task or background check, and it gets a new ID after 30 minutes without a request to the model or when Nod restarts. Nod's own IDs on a trace and inside messages and tool results get a keyed hash that changes every day and whenever Nod restarts. The key stays with the assistant and hides the original IDs. Repeated IDs can still link traces within the same runtime and UTC day. Other content can also connect traces, such as a website address, a document link or an account handle.
+- **Stable conversation IDs.** A conversation is one saved chat, task, or background session. Its `thread_id` is a keyed hash of the private session ID. When the private key loads, it stays the same across idle gaps, days, and restarts. It links traces from that saved session over time. A new session, such as a reset chat or a separate schedule fire, gets a different ID. Work without a saved session gets a new auxiliary ID for each job. The key stays in the runtime profile's private `trace-key` file. Deleting or replacing that key changes conversation IDs. Earlier releases used IDs that changed after 30 idle minutes or a restart; these earlier IDs cannot be joined to the new IDs.
+- **Other execution IDs.** Turn and agent run IDs, and IDs inside messages and tool results, keep their existing keyed hashes. These hashes change daily and on restart. One active turn keeps its trace IDs until it ends. Repeated hashes can link records within the same runtime and UTC day. Other content can also connect traces, such as a website address or an account handle.
 - **No owner context.** Nod replaces your saved memory, learned skills and format preferences with `[owner context omitted]`, including memory notes and learned skills it reads with a tool. Those reads keep only their action, such as `memory_read`, not the note path, search words or skill name. The attention and review tasks that read your saved memory are not traced at all, and a codemode step keeps neither its script nor its result, because a script can read memory or a connected account.
 - **No images.** Images are replaced with `[image]`.
 
-These steps reduce direct links to you. Traces are still pseudonymised, not anonymous: what a conversation says can identify you, for example a detail the scrubber doesn't recognize.
+These steps reduce private content. Traces are pseudonymised, not anonymous. The shared analytics ID and details in a conversation can identify you.
 
 ## Where traces go
 
@@ -120,12 +160,18 @@ Anyone who unpacks the desktop app can read the token it sends. The token keeps 
 
 ## For operators
 
+If the private conversation key cannot load, Nod records `trace_conversation_key_unavailable` and keeps sending traces with a temporary runtime key. These conversation IDs survive idle gaps but change on restart. This failure does not stop Nod. The key itself never enters a trace.
+
+The receiver accepts at most 20 input metadata keys. Contract checks send the full producer payload through the receiver, accept 20 keys, and reject 21. Keep this check when you add a metadata field.
+
 | Variable           | What it does                                                                                  |
 | ------------------ | --------------------------------------------------------------------------------------------- |
 | `NOD_TRACES_URL`   | The HTTPS address that receives traces. An empty value turns traces off for everyone.         |
 | `NOD_TRACES_TOKEN` | The token sent as `x-nod-traces-token`. Without it, Nod sends no traces and hides the switch. |
 
 Official desktop builds take the token from the `NOD_TRACES_TOKEN` secret of the `release` environment, and only the packaging steps can read it. The service is defined in [`deployment/n8n/traces.mjs`](https://github.com/n8n-io/nod/blob/main/deployment/n8n/traces.mjs). It uses two n8n credentials: **Nod traces webhook** holds the token and **Nod LangSmith traces** holds the LangSmith tracing key. The tracing key expires after one year. Create a new **Tracing Only** key in LangSmith and update the credential before then. To change the token, update the n8n credential and the release secret together. Desktop builds made with the old token stop sending until people update.
+
+Before a desktop release with numeric `cost_usd` metadata, update the Nod Traces workflow from the same source revision. Earlier workflow validation accepts only string metadata and rejects traces with numeric cost metadata.
 
 ## Where this is enforced
 

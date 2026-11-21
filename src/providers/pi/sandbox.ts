@@ -370,7 +370,7 @@ export function createSandbox(workspace: WorkspaceSession, timeZone?: string) {
     ...definition,
     ...(definition.name === 'bash'
       ? {
-          description: `${definition.description}\nSupported simple commands automatically use RTK for compact output. Prefer bash with rtk ls, rtk read and rtk grep for exploration; use native read for exact edit context. Use rtk test or rtk err around scripts to compact their output, and rtk proxy for unfiltered output. Shell data flows and explicit machine-output formats stay raw.`,
+          description: `${definition.description}\nSupported simple commands automatically use RTK for compact output. Prefer bash with rtk ls, rtk read and rtk grep for exploration; use native read for exact edit context. Use rtk test or rtk err around scripts to compact their output, and rtk proxy for unfiltered output. Shell data flows and explicit machine-output formats stay raw.\nTrust sees the command text, folder and time limit. It does not read named script files. If a Trust refusal confirms that a filename-only command did not run, inspect the full program. Use an inline form only if the program contains no secrets or private data and does not depend on its file name, path, shebang or script-relative resources. Put its full text in a new checked command without command substitution. For a here-document, quote the delimiter and choose one that is not a complete line of the program. Use the same interpreter, flags, folder, inputs and outputs. If the text form can change its effects, do not run it. Command records keep a redacted prefix of up to 4,000 characters. All permission checks still apply.`,
         }
       : {}),
     execute: async (id, params, signal, onUpdate, context) => {

@@ -1,6 +1,17 @@
 import { parse } from 'tldts';
-import { createRedactor, redactSecretText } from './redaction.ts';
-import { createPersonalDataRedactor, personalKey, type PersonalProfile } from './personal-data.ts';
+import { secretField, secretTextSpans } from './redaction.ts';
+import {
+  addRedactionSpan,
+  redactionMatches,
+  renderRedactionSpans,
+  type RedactionSpan,
+} from './redaction-spans.ts';
+import {
+  createPersonalDataRedactor,
+  createPersonalDataSpans,
+  personalKey,
+  type PersonalProfile,
+} from './personal-data.ts';
 
 const maxString = 32_000;
 const maxScanned = 96_000;
@@ -21,30 +32,6 @@ const className = /^[A-Za-z][A-Za-z0-9_$]{0,80}$/;
 const hostPattern =
   /\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24})\b(?:\.(?=[:/?#]))?(?::\d{1,5})?/gi;
 const linkTail = /[/?#][^\s<>"']*/y;
-
-function hosts(text: string, encodedToken = false) {
-  let result = '';
-  let last = 0;
-  hostPattern.lastIndex = 0;
-  for (let match = hostPattern.exec(text); match; match = hostPattern.exec(text)) {
-    const domain = parse(match[1], { allowPrivateDomains: true });
-    if (
-      !domain.isIcann &&
-      !domain.isPrivate &&
-      !/\.(?:internal|local|localhost|test|invalid)$/i.test(match[1])
-    )
-      continue;
-    linkTail.lastIndex = hostPattern.lastIndex;
-    const tail = linkTail.exec(text)?.[0] ?? '';
-    if (encodedToken) {
-      if (tail) return '[url]';
-      continue;
-    }
-    result += text.slice(last, match.index) + (tail ? '[url]' : '[host]');
-    last = hostPattern.lastIndex += tail.length;
-  }
-  return result + text.slice(last);
-}
 
 function normalize(key: string) {
   return key.replace(/[^a-z0-9]/gi, '').toLowerCase();
@@ -70,7 +57,7 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
     options.profile.names.length <= 100 &&
     options.profile.names.every((name) => typeof name === 'string' && name.length <= 500);
   const personal = createPersonalDataRedactor(profileReady ? options.profile : { names: [] });
-  const redact = createRedactor([], { string: 64_000, payload: 160_000, minimumSecretLength: 1 });
+  const personalSpans = createPersonalDataSpans(profileReady ? options.profile : { names: [] });
   let previousSecrets: string[] = [];
   let secretPattern: RegExp | null = null;
   let ready = profileReady;
@@ -114,70 +101,153 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
       : null;
   }
 
-  function text(value: string, stack = false) {
-    const decoded = value.replace(/[^\s<>"']*%[0-9a-f]{2}[^\s<>"']*/gi, (encoded) => {
-      try {
-        return hosts(decodeURIComponent(encoded), true);
-      } catch {
-        return encoded;
-      }
+  function literalSpans(input: string) {
+    const spans: RedactionSpan[] = [];
+    if (secretPattern)
+      redactionMatches(
+        input,
+        secretPattern,
+        (match) => addRedactionSpan(spans, match.index, match.index + match[0].length, hidden),
+        true,
+      );
+    return spans;
+  }
+
+  function textSpans(
+    input: string,
+    stack: boolean,
+    budget: { decoded: number; carriers: number },
+    decodeDepth = 0,
+  ) {
+    const spans: RedactionSpan[] = [];
+    for (const span of [...personalSpans(input), ...literalSpans(input), ...secretTextSpans(input)])
+      addRedactionSpan(spans, span.start, span.end, span.replacement);
+    const whole = (pattern: RegExp, replacement: string) =>
+      redactionMatches(input, pattern, (match) =>
+        addRedactionSpan(spans, match.index, match.index + match[0].length, replacement),
+      );
+    whole(/\bdata:[^\s"'<>]+/gi, '[binary omitted]');
+    whole(/(?<![\p{L}\p{N}._%+-])@[\p{L}\p{N}][\p{L}\p{N}_.-]{1,80}/gu, '[handle]');
+    whole(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '[identifier]');
+    whole(
+      /\b(?:\d{6,}(?![ -]?(?:tokens?|bytes?|characters?|chars|ms|[KMG]B|[KM]iB|items|rows)\b)|(?:rec|cus|msg|acct|usr)[_-][A-Za-z0-9_-]{6,})\b/g,
+      '[identifier]',
+    );
+    whole(/\b[A-Za-z0-9+/=_-]{128,}\b/g, '[encoded data omitted]');
+    redactionMatches(input, hostPattern, (match) => {
+      const domain = parse(match[1], { allowPrivateDomains: true });
+      if (
+        !domain.isIcann &&
+        !domain.isPrivate &&
+        !/\.(?:internal|local|localhost|test|invalid)$/i.test(match[1])
+      )
+        return;
+      const tailPattern = new RegExp(linkTail);
+      tailPattern.lastIndex = match.index + match[0].length;
+      const tail = tailPattern.exec(input)?.[0] ?? '';
+      addRedactionSpan(
+        spans,
+        match.index,
+        match.index + match[0].length + tail.length,
+        tail ? '[url]' : '[host]',
+      );
     });
-    let safe = personal(decoded);
-    safe = redactSecretText(secretPattern ? safe.replace(secretPattern, hidden) : safe);
-    const frames: string[] = [];
+    redactionMatches(input, /[^\s<>"']*%[0-9a-f]{2}[^\s<>"']*/gi, (match) => {
+      const encoded = match[0];
+      let sensitive = true;
+      if (
+        ++budget.carriers <= 128 &&
+        decodeDepth < 3 &&
+        (budget.decoded += Buffer.byteLength(encoded)) <= maxScanned
+      ) {
+        try {
+          const decoded = decodeURIComponent(encoded);
+          sensitive =
+            (budget.decoded += Buffer.byteLength(decoded)) > maxScanned ||
+            /^[{[\"]/.test(decoded.trim()) ||
+            new RegExp(opening).test(decoded) ||
+            textSpans(decoded, false, budget, decodeDepth + 1).length > 0;
+        } catch {}
+      }
+      if (sensitive)
+        addRedactionSpan(
+          spans,
+          match.index,
+          match.index + encoded.length,
+          '[encoded data omitted]',
+        );
+    });
+    const privateSpans = [...spans];
+    const frames: Array<{ start: number; end: number; replacement: string }> = [];
     if (stack) {
-      const frame = (path: string) => {
+      const frame = (match: RegExpExecArray) => {
+        const path = match[2];
+        const start = match.index + match[1].length;
+        const end = start + path.length;
         const file = path.replace(/\\/g, '/');
         const modules = file.lastIndexOf('/node_modules/');
-        const start =
+        const offset =
           modules >= 0
             ? modules
             : Math.max(...['/src/', '/dist/', '/desktop/'].map((part) => file.lastIndexOf(part)));
-        const kept = file.slice(start + 1);
-        if (start < 0 || !appFile.test(kept)) return '[path]';
-        frames.push(kept);
-        return `\0${frames.length - 1}\0`;
+        const kept = file.slice(offset + 1);
+        const allowed =
+          offset >= 0 &&
+          appFile.test(kept) &&
+          !privateSpans.some((span) => span.start < end && span.end > start) &&
+          textSpans(kept, false, budget).length === 0;
+        frames.push({ start, end, replacement: allowed ? kept : '[path]' });
       };
-      safe = safe
-        .replace(/\0/g, '')
-        .replace(
-          /\(((?:file:\/\/\/|[A-Za-z]:[\\/]|\/)[^\r\n]+)(:\d+:\d+\))/g,
-          (_, path: string, position: string) => '(' + frame(path) + position,
-        )
-        .replace(
-          /^(\s*at (?:async )?)((?:file:\/\/\/|[A-Za-z]:[\\/]|\/)[^\r\n]+)(:\d+:\d+)$/gm,
-          (_, prefix: string, path: string, position: string) => prefix + frame(path) + position,
-        );
+      redactionMatches(
+        input,
+        /(\()((?:file:\/\/\/|[A-Za-z]:[\\/]|\/)[^\r\n]+)(:\d+:\d+\))/g,
+        frame,
+      );
+      redactionMatches(
+        input,
+        /^(\s*at (?:async )?)((?:file:\/\/\/|[A-Za-z]:[\\/]|\/)[^\r\n]+)(:\d+:\d+)$/gm,
+        frame,
+      );
     }
-    const location = (value: string, marker: string) =>
-      marker + (stack ? (value.match(/:\d+:\d+[),;]*$/)?.[0] ?? '') : '');
-    const masked = safe
-      .replace(/\bdata:[^\s"'<>]+/gi, '[binary omitted]')
-      .replace(/(["'])(?:https?|wss?|ftp|file):\/\/[^\r\n]*?\1/gi, '[url]')
-      .replace(/\b(?:https?|wss?|ftp|file):\/\/[^\r\n]+/gi, (value) => location(value, '[url]'))
-      .replace(/\b(?:https?|wss?|ftp|file)%3a(?:%2f){2}[^\r\n]+/gi, (value) =>
-        location(value, '[url]'),
-      )
-      .replace(/(["'])(?:[A-Za-z]:[\\/]|~?\/)[^\r\n]*?\1/g, '[path]')
-      .replace(
-        /(?:[A-Za-z]:[\\/]|(?:~\/|\/(?:Users|home)\/[^/\r\n]+\/|\/(?:root|private|var|tmp|Volumes|mnt|media|run\/media|workspace|app|data)\/))[^\r\n]*/g,
-        (value) => location(value, '[path]'),
-      )
-      .replace(
-        /\/(?:api|users|accounts|profiles|contacts|members|files|documents|attachments|vault|credentials|approvals|oauth)(?:\/|\?)[^\s<>"']+/gi,
-        (value) => location(value, '[path]'),
-      )
-      .replace(/(?<![\p{L}\p{N}._%+-])@[\p{L}\p{N}][\p{L}\p{N}_.-]{1,80}/gu, '[handle]')
-      .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '[identifier]')
-      .replace(
-        /\b(?:\d{6,}(?![ -]?(?:tokens?|bytes?|characters?|chars|ms|[KMG]B|[KM]iB|items|rows)\b)|(?:rec|cus|msg|acct|usr)[_-][A-Za-z0-9_-]{6,})\b/g,
-        '[identifier]',
-      )
-      .replace(/\b[A-Za-z0-9+/=_-]{128,}\b/g, '[encoded data omitted]');
-    return hosts(masked).replace(
-      /\0(\d+)\0/g,
-      (_, index: string) => frames[Number(index)] ?? '[path]',
+    const quotedLocations: Array<{ start: number; end: number }> = [];
+    const location = (pattern: RegExp, replacement: string, quoted = false) =>
+      redactionMatches(
+        input,
+        pattern,
+        (match) => {
+          const start = match.index;
+          const end = start + match[0].length;
+          if (!quoted && quotedLocations.some((span) => start >= span.start && start < span.end))
+            return;
+          if (quoted) quotedLocations.push({ start, end });
+          if (
+            frames.some(
+              (frame) =>
+                frame.replacement !== '[path]' &&
+                start >= frame.start &&
+                (end <= frame.end || /^:\d+:\d+[),;]*$/.test(input.slice(frame.end, end))),
+            )
+          )
+            return;
+          const position = stack ? (match[0].match(/:\d+:\d+[),;]*$/)?.[0] ?? '') : '';
+          addRedactionSpan(spans, start, end - position.length, replacement);
+        },
+        true,
+      );
+    location(/(["'])(?:https?|wss?|ftp|file):\/\/[^\r\n]*?\1/gi, '[url]', true);
+    location(/(["'])(?:[A-Za-z]:[\\/]|~?\/)[^\r\n]*?\1/g, '[path]', true);
+    location(/\b(?:https?|wss?|ftp|file):\/\/[^\r\n]+/gi, '[url]');
+    location(/\b(?:https?|wss?|ftp|file)%3a(?:%2f){2}[^\r\n]+/gi, '[url]');
+    location(
+      /(?:[A-Za-z]:[\\/]|(?:~\/|\/(?:Users|home)\/[^/\r\n]+\/|\/(?:root|private|var|tmp|Volumes|mnt|media|run\/media|workspace|app|data)\/))[^\r\n]*/g,
+      '[path]',
     );
+    location(
+      /\/(?:api|users|accounts|profiles|contacts|members|files|documents|attachments|vault|credentials|approvals|oauth)(?:\/|\?)[^\s<>"']+/gi,
+      '[path]',
+    );
+    for (const frame of frames) addRedactionSpan(spans, frame.start, frame.end, frame.replacement);
+    return spans;
   }
 
   function value(input: unknown): unknown {
@@ -186,25 +256,92 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
     let nodes = 0;
     let scanned = 0;
     let fragments = 0;
+    const budget = { decoded: 0, carriers: 0 };
+    const text = (input: string, stack = false) =>
+      renderRedactionSpans(input, textSpans(input, stack, budget));
     const seen = new WeakSet<object>();
+    const labels = new Map<string, string[] | null>();
+
+    function labelViews(input: string): string[] | null {
+      const cached = labels.get(input);
+      if (cached !== undefined) return cached;
+      if (input.length > maxString) return null;
+      const views = [input];
+      let current = input;
+      let jsonDepth = 0;
+      let uriDepth = 0;
+      while (true) {
+        const trimmed = current.trim();
+        if (views.length > 1 && (trimmed.startsWith('{') || trimmed.startsWith('['))) {
+          labels.set(input, null);
+          return null;
+        }
+        const json = trimmed.startsWith('"');
+        if (!json && !/%[0-9a-f]{2}/i.test(current)) {
+          labels.set(input, views);
+          return views;
+        }
+        if (
+          (json ? ++jsonDepth > 10 : ++uriDepth > 3) ||
+          ++budget.carriers > 128 ||
+          (budget.decoded += Buffer.byteLength(current)) > maxScanned
+        )
+          throw new Error('Metadata decode limit exceeded.');
+        let decoded: unknown;
+        try {
+          decoded = json ? JSON.parse(trimmed) : decodeURIComponent(current);
+        } catch {
+          labels.set(input, null);
+          return null;
+        }
+        if (typeof decoded !== 'string') {
+          labels.set(input, null);
+          return null;
+        }
+        if ((budget.decoded += Buffer.byteLength(decoded)) > maxScanned)
+          throw new Error('Metadata decode limit exceeded.');
+        views.push(decoded);
+        current = decoded;
+      }
+    }
+
+    function structured(input: string, parsed: unknown, depth: number) {
+      const strings: Array<{ start: number; end: number }> = [];
+      const escapes: Array<{ start: number; end: number }> = [];
+      redactionMatches(input, /"(?:\\.|[^"\\])*"/g, (match) =>
+        strings.push({ start: match.index, end: match.index + match[0].length }),
+      );
+      redactionMatches(input, /\\(?:u[0-9a-f]{4}|["\\/bfnrt])/gi, (match) =>
+        escapes.push({ start: match.index, end: match.index + match[0].length }),
+      );
+      if (
+        literalSpans(input).some(
+          (span) =>
+            !strings.some((token) => span.start > token.start && span.end < token.end) ||
+            escapes.some((escape) => span.start < escape.end && span.end > escape.start),
+        ) ||
+        textSpans(input, false, budget).some(
+          (span) => !strings.some((token) => span.start >= token.start && span.end <= token.end),
+        )
+      )
+        return '[structured data omitted]';
+      return visit(parsed, depth + 1);
+    }
 
     function string(input: string, depth: number, stackTrace: boolean): unknown {
       if (input.length > maxString || (scanned += input.length) > maxScanned)
         return '[oversized text omitted]';
-      input = personal(input);
-      if (secretPattern) input = input.replace(secretPattern, hidden);
       const trimmed = input.trim();
       if (/^[{[\"]/.test(trimmed)) {
         try {
-          return visit(JSON.parse(trimmed), depth + 1);
+          const parsed: unknown = JSON.parse(trimmed);
+          return structured(input, parsed, depth);
         } catch {}
       }
+      let spans = textSpans(input, stackTrace, budget);
       const openings = new RegExp(opening);
-      let output = '';
-      let offset = 0;
       for (let match = openings.exec(input); match; match = openings.exec(input)) {
-        output += text(input.slice(offset, match.index), stackTrace);
-        if (++fragments > 32) return output + '[structured data omitted]';
+        if (++fragments > 32) return '[structured data omitted]';
         const stack: string[] = [];
         let quoted = false;
         let escaped = false;
@@ -227,16 +364,25 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
             }
           }
         }
-        if (!complete) return output + '[incomplete structured data omitted]';
-        try {
-          output += JSON.stringify(visit(JSON.parse(input.slice(match.index, end)), depth + 1));
-        } catch {
-          output += '[invalid structured data omitted]';
+        if (!complete) {
+          addRedactionSpan(
+            spans,
+            match.index,
+            input.length,
+            '[incomplete structured data omitted]',
+          );
+          break;
         }
-        offset = end;
+        let replacement = '[invalid structured data omitted]';
+        try {
+          const fragment = input.slice(match.index, end);
+          replacement = JSON.stringify(structured(fragment, JSON.parse(fragment), depth));
+        } catch {}
+        spans = spans.filter((span) => span.start < match.index || span.end > end);
+        addRedactionSpan(spans, match.index, end, replacement);
         openings.lastIndex = end;
       }
-      return output + text(input.slice(offset), stackTrace);
+      return renderRedactionSpans(input, spans);
     }
 
     function visit(input: unknown, depth: number, stack = false): unknown {
@@ -253,6 +399,20 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
       if (Array.isArray(input)) {
         const result: unknown[] = [];
         const length = Object.getOwnPropertyDescriptor(input, 'length')?.value;
+        const first = Object.getOwnPropertyDescriptor(input, '0');
+        const names =
+          first && 'value' in first && typeof first.value === 'string'
+            ? labelViews(first.value)
+            : undefined;
+        const privateTuple =
+          first && (!('value' in first) || names === null || names?.some(secretField));
+        if (privateTuple)
+          return [
+            first && 'value' in first && names !== null
+              ? visit(first.value, depth + 1)
+              : '[omitted]',
+            hidden,
+          ];
         for (
           let index = 0;
           index < Math.min(typeof length === 'number' ? length : 0, 100);
@@ -270,25 +430,41 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
       const error = input instanceof Error;
       const binary = ['type', 'mimeType', 'mime_type'].some((key) => {
         const property = Object.getOwnPropertyDescriptor(input, key);
+        const types =
+          property && 'value' in property && typeof property.value === 'string'
+            ? labelViews(property.value)
+            : undefined;
         return (
           property &&
-          'value' in property &&
-          typeof property.value === 'string' &&
-          property.value.length < 100 &&
-          /^(?:(?:input_|output_)?(?:image|audio|video|base64)$|(?:image|audio|video)\/|application\/(?:octet-stream|pdf))/i.test(
-            property.value,
-          )
+          (!('value' in property) ||
+            types === null ||
+            types?.some(
+              (type) =>
+                type.length < 100 &&
+                /^(?:(?:input_|output_)?(?:image|audio|video|base64)$|(?:image|audio|video)\/|application\/(?:octet-stream|pdf))/i.test(
+                  type,
+                ),
+            ))
         );
       });
       const named = Object.getOwnPropertyDescriptor(input, 'name');
+      const names =
+        named && 'value' in named && typeof named.value === 'string' && named.value.length <= 200
+          ? labelViews(named.value)
+          : undefined;
       const privateValue =
         named &&
-        'value' in named &&
-        typeof named.value === 'string' &&
-        (named.value.length > 200 ||
-          privateNames.test(normalize(named.value)) ||
-          personalKey(named.value) ||
-          privateKeys.test(normalize(named.value)));
+        (!('value' in named) ||
+          typeof named.value !== 'string' ||
+          named.value.length > 200 ||
+          names === null ||
+          names?.some(
+            (name) =>
+              privateNames.test(normalize(name)) ||
+              secretField(name) ||
+              personalKey(name) ||
+              privateKeys.test(normalize(name)),
+          ));
       const errorStack = Object.getOwnPropertyDescriptor(input, 'stack')?.value;
       let count = 0;
       const keys = error
@@ -299,16 +475,15 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
             }
           })();
       for (const key of keys) {
-        if (++count > 100) {
-          result.truncated = true;
-          break;
-        }
+        if (++count > 100) return '[structured data omitted]';
         const property = Object.getOwnPropertyDescriptor(input, key);
         if (!property) continue;
-        if (key.length > 200) {
-          result['[oversized key omitted]'] = '[omitted]';
-          continue;
-        }
+        if (key.length > 200) return '[structured data omitted]';
+        if (
+          /%[0-9a-f]{2}|\\(?:u[0-9a-f]{4}|["\\/bfnrt])/i.test(key) ||
+          key.trimStart().startsWith('"')
+        )
+          return '[structured data omitted]';
         const safeKey = text(key);
         const normalized = normalize(key);
         const nativeStack =
@@ -325,7 +500,9 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
               ? visit(errorStackGetter.call(input), depth + 1, true)
               : !('value' in property)
                 ? '[omitted]'
-                : privateNames.test(normalized) || (privateValue && key === 'value')
+                : privateNames.test(normalized) ||
+                    secretField(key) ||
+                    (privateValue && key === 'value')
                   ? hidden
                   : personalKey(key) ||
                       claimKeys.test(normalized) ||
@@ -349,7 +526,7 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
     }
 
     try {
-      const safe = redact(visit(input, 0));
+      const safe = visit(input, 0);
       const encoded = JSON.stringify(safe);
       return Buffer.byteLength(encoded) <= 64_000
         ? safe

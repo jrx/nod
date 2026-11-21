@@ -30,6 +30,7 @@ import {
   modelProviders,
   modelSource,
   openAIRegions,
+  canReuseWorkCost,
   repriceUsd,
 } from '../../shared/models';
 import { analyticsForCurrentSession } from '../lib/analytics';
@@ -1039,8 +1040,8 @@ function tokenPrice(pricing: ModelChoice['pricing']) {
 export function workPrice(usage: WorkUsage | undefined, model: ModelChoice | undefined) {
   const spent = usage ? usage.agentUsd + usage.otherUsd : 0;
   if (!usage || spent <= 0 || !model) return null;
-  if (usage.models.length === 1 && usage.models[0] === model.id) return money(spent);
-  const value = repriceUsd(usage, model.pricing);
+  if (canReuseWorkCost(usage, model.id, model.pricing)) return money(spent);
+  const value = repriceUsd(usage, model.pricing, model.audio);
   return value === null ? 'No price' : `≈ ${money(value)}`;
 }
 

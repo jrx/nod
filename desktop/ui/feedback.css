@@ -1,0 +1,56 @@
+.startup-feedback.dialog-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(680px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+}
+
+.startup-feedback.dialog-content > p {
+  margin: 0;
+}
+
+.startup-feedback textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 80px;
+}
+
+.startup-feedback-choice,
+.startup-feedback-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.startup-feedback-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.startup-feedback > .dialog-close {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+}
+
+.startup-feedback[aria-busy='true'] > .dialog-close {
+  pointer-events: none;
+  opacity: 0.5;
+}
+
+.startup-feedback textarea {
+  border: 1px solid var(--border);
+  border-radius: var(--control-radius);
+  padding: 10px 12px;
+  color: var(--foreground);
+  background: var(--surface);
+  font: inherit;
+}
+
+#startup-feedback-report {
+  font:
+    12px/1.5 ui-monospace,
+    monospace;
+}

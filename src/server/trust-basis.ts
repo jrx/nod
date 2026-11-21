@@ -128,13 +128,8 @@ export function trustBasis(
   const command = action?.arguments?.command;
   const requiresQuote =
     settings ||
-    [
-      'NOD_sign_in',
-      'NOD_browser_session',
-      'NOD_vault_allow',
-      'LOCAL_FILES_READ',
-      'LOCAL_FILES_IMPORT',
-    ].includes(action?.name ?? '') ||
+    ['NOD_sign_in', 'NOD_browser_session', 'NOD_vault_allow'].includes(action?.name ?? '') ||
+    opensContent(action?.name) ||
     (action?.name === 'NOD_browser' &&
       (action.arguments?.step === 'upload' ||
         (command &&
@@ -206,4 +201,8 @@ export function becauseOf(
   if ((basis.kind === 'message' || (basis.kind === 'schedule' && basis.messageId)) && !said)
     return undefined;
   return { kind: basis.kind, text: basis.quote };
+}
+
+export function opensContent(action: string | undefined) {
+  return ['LOCAL_FILES_READ', 'LOCAL_FILES_IMPORT', 'COMPUTER_OPEN'].includes(action ?? '');
 }

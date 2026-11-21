@@ -14,6 +14,7 @@ export type ModelReview = (
   input: object,
   signal?: AbortSignal,
   question?: DecisionQuestion,
+  responseSchema?: Record<string, unknown>,
 ) => Promise<unknown>;
 
 export interface DecisionRequest {

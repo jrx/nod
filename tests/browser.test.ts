@@ -58,6 +58,7 @@ import {
 import { stagedLoginBrowser } from './login-fixture.ts';
 import { fakeComputer, fakeWorkspace } from './runtime-fixtures.ts';
 import { accessCookie, accessKey } from '../src/server/access.ts';
+import { withFailureLog } from '../src/ports/failure-log.ts';
 
 // Shared helpers
 
@@ -220,7 +221,7 @@ test(
         [randomUUID(), nextTurnId],
       );
       const fallback = (await request('/api/browser')).json();
-      assert.equal(fallback.currentBrowser.threadId, next.id);
+      assert.equal(fallback.currentBrowser.browserId, next.id);
 
       fail = false;
       const click = { type: 'mouse', event: 'down', x: 0.5, y: 0.25, button: 'left' };
@@ -955,7 +956,7 @@ for (const action of ['snapshot', 'click'] as const)
       browser.fail('snapshot', upstreamError);
       const before = browser.actions.length;
       await assert.rejects(
-        computer.act('fixture', { action, ...(action === 'click' ? { selector: 'button' } : {}) }),
+        computer.act('fixture', { action, selector: 'button' }),
         (error: unknown) => {
           assert.ok(error instanceof BrowserActionError);
           assert.equal(error.code, 'browser_observation_failed');
@@ -1352,7 +1353,8 @@ async function runtimeFixture(
   const runtime = createAgentRuntime({ agent, computer, workspace: fakeWorkspace() });
   const context: RuntimeContext = {
     threadId,
-    sessionId: threadId,
+    sessionId: randomUUID(),
+    background: true,
     turnId: randomUUID(),
     prompt: 'Open the synthetic destination after dismissing its covering dialog.',
     history: [],
@@ -1743,6 +1745,71 @@ test('a failed workspace browser action names only Nod-authored reasons', async 
       await assert.rejects(computer.act('task', { action: 'open', url: 'https://example.com/' }), {
         message: 'The workspace browser could not complete this action. Try again.',
       });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('sign-in refusal guards cross the worker boundary without private values or merged causes', async () => {
+  const privateValue = 'picker-private@example.test/private-selector';
+  let failure: Error;
+  const failures: unknown[] = [];
+  const fixture = await harness({
+    computer: {
+      ...syntheticComputer(),
+      signInMethods: async () => {
+        throw failure;
+      },
+    },
+  });
+  try {
+    const computer = fixture.client('/synthetic/sign-in-guard');
+    const inspect = () =>
+      withFailureLog(
+        (event, error, context) => failures.push({ event, error, context }),
+        () =>
+          computer.signInMethods!('task', 'https://example.test', [
+            { label: privateValue, selector: `[data-account="${privateValue}"]` },
+          ]),
+      );
+    for (const guard of ['control_changed', 'choice_duplicate'] as const) {
+      failure = Object.assign(new BrowserActionError('browser_target_changed', undefined, guard), {
+        cause: privateValue,
+      });
+      await assert.rejects(inspect(), (error: unknown) => {
+        assert.ok(error instanceof BrowserActionError);
+        assert.equal(error.signInGuard, guard);
+        assert.equal(error.code, 'browser_target_changed');
+        assert.equal(error.detail, undefined);
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+    }
+    assert.deepEqual(
+      failures.map((failure) => Object(failure).context.signInGuard),
+      ['control_changed', 'choice_duplicate'],
+    );
+    failure = Object.assign(new Error(privateValue), { signInGuard: 'control_covered' });
+    await assert.rejects(inspect(), (error: unknown) => {
+      assert.equal(Object(error).signInGuard, 'control_covered');
+      assert.equal(
+        Object(error).message,
+        'The workspace browser could not complete this action. Try again.',
+      );
+      return true;
+    });
+    failure = Object.assign(new Error(privateValue), { signInGuard: privateValue });
+    await assert.rejects(inspect(), (error: unknown) => {
+      assert.equal(Object(error).signInGuard, undefined);
+      assert.ok(
+        !JSON.stringify(
+          Object.getOwnPropertyNames(error).map((key) => Object(error)[key]),
+        ).includes(privateValue),
+      );
+      return true;
+    });
+    assert.equal(Object(failures.at(-1)).context.signInGuard, undefined);
+    assert.ok(!JSON.stringify(failures).includes(privateValue));
   } finally {
     await fixture.close();
   }
@@ -2145,6 +2212,116 @@ test('visual browser actions fence the session when releasing the pointer fails'
 });
 
 describe('native browser controls', { concurrency: 3 }, () => {
+  test(
+    'the browser bridge reports invalid wait conditions and keeps the page usable',
+    {
+      skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true' || process.platform !== 'linux',
+      timeout: 30_000,
+    },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-wait-'));
+      const server = createHttpServer((_request, response) => {
+        response.setHeader('content-type', 'text/html');
+        response.end('<p>Results ready</p>');
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const bridge = await harness({
+        computer: createAgentBrowserComputer({
+          ...containerBrowserOptions(directory),
+          privateNetwork: true,
+        }),
+      });
+      const computer = bridge.client('/synthetic/browser-wait');
+      try {
+        const url = `http://127.0.0.1:${address.port}/`;
+        await computer.act('fixture', { action: 'open', url });
+        for (const args of [{ waitMs: 3000 }, { text: 'Results ready', load: 'load' as const }])
+          await assert.rejects(computer.act('fixture', { action: 'wait', ...args }), {
+            name: 'BrowserActionError',
+            code: 'browser_wait_condition_required',
+          });
+        const ready = await computer.act('fixture', { action: 'wait', text: 'Results ready' });
+        assert.equal(ready.url, url);
+        assert.match(ready.text, /Results ready/);
+        assert.doesNotMatch(ready.text, /condition was not met/);
+        const timeout = await computer.act('fixture', {
+          action: 'wait',
+          text: 'An absent result',
+          waitMs: 50,
+        });
+        assert.equal(timeout.url, url);
+        assert.match(timeout.text, /condition was not met/);
+        assert.match(timeout.text, /Results ready/);
+      } finally {
+        await bridge.close();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test(
+    'a rejected snapshot scope preserves the page and reports its reason across the bridge',
+    {
+      skip: process.env.NOD_TEST_NATIVE_DOWNLOAD !== 'true' || process.platform !== 'linux',
+      timeout: 30_000,
+    },
+    async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'nod-snapshot-scope-'));
+      const server = createHttpServer((_request, response) => {
+        response.setHeader('content-type', 'text/html');
+        response.end(
+          '<article id="summary"><button>Continue</button></article><aside>Outside scope</aside>',
+        );
+      });
+      await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+      const address = server.address();
+      assert.ok(address && typeof address !== 'string');
+      const bridge = await harness({
+        computer: createAgentBrowserComputer({
+          ...containerBrowserOptions(directory),
+          privateNetwork: true,
+        }),
+      });
+      const computer = bridge.client('/synthetic/snapshot-scope');
+      try {
+        const url = `http://127.0.0.1:${address.port}/`;
+        await computer.act('fixture', { action: 'open', url });
+        const missing = '[data-region="synthetic-private-value"]';
+        const snapshot = (selector?: string) =>
+          computer.act('fixture', { action: 'snapshot', selector });
+        const rejectScope = (selector: string, code: string) =>
+          assert.rejects(snapshot(selector), (error: unknown) => {
+            assert.ok(error instanceof BrowserActionError);
+            assert.equal(error.code, code);
+            assert.equal(error.detail, undefined);
+            assert.doesNotMatch(error.message, /synthetic-private-value/);
+            return true;
+          });
+        await rejectScope(missing, 'browser_snapshot_scope_missing');
+        assert.ok((await computer.screenshot('fixture'))?.length);
+        await rejectScope(missing, 'browser_snapshot_scope_missing');
+        await rejectScope(
+          '[data-region="synthetic-private-value"]]',
+          'browser_snapshot_scope_invalid',
+        );
+        const scoped = await snapshot('#summary');
+        assert.match(scoped.text, /Continue/);
+        assert.doesNotMatch(scoped.text, /Outside scope/);
+        const recovered = await snapshot();
+        assert.equal(recovered.url, url);
+        assert.match(recovered.text, /Continue/);
+        assert.match(recovered.text, /Outside scope/);
+      } finally {
+        await bridge.close();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
   test(
     'native container browser stays responsive, streams live frames and refuses passkeys after heavy stderr output',
     {
@@ -3050,6 +3227,693 @@ test('the owner time zone and region reach a new browser launch without injectin
   }
 });
 
+test('feedback redaction checks original text and structure before masking', async (t) => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  type Probe = {
+    id: string;
+    input: unknown;
+    secrets?: string[];
+    names?: string[];
+    privateParts: string[];
+    kept?: string[];
+    omitted?: boolean;
+  };
+
+  const path = '/Users/Synthetic Owner/PrivateLedger.docx';
+  const url = 'https://synthetic.invalid/PrivateLedger.docx';
+  const email = 'PrivateMailbox@synthetic.invalid';
+  const opaque = 'PrivateOpaqueValue';
+  const payload = JSON.stringify({ payload: opaque });
+  const password = JSON.stringify({ password: opaque });
+  const unicode = '{"pass\\u0077ord":"PrivateOpaqueValue"}';
+  const tuple = ['Authorization', opaque];
+  const keyHeader = ['-----BEGIN', 'PRIVATE', 'KEY-----'].join(' ');
+  const keyFooter = ['-----END', 'PRIVATE', 'KEY-----'].join(' ');
+  const cases: Probe[] = [
+    { id: 'path-control', input: path, privateParts: ['Synthetic Owner', 'PrivateLedger'] },
+    {
+      id: 'path-slash-secret',
+      input: path,
+      secrets: ['/'],
+      privateParts: ['Synthetic Owner', 'PrivateLedger'],
+    },
+    {
+      id: 'path-name-root',
+      input: path,
+      names: ['Users'],
+      privateParts: ['Synthetic Owner', 'PrivateLedger'],
+    },
+    { id: 'url-control', input: url, privateParts: ['synthetic.invalid', 'PrivateLedger'] },
+    {
+      id: 'url-slash-secret',
+      input: url,
+      secrets: ['/'],
+      privateParts: ['synthetic.invalid', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-url-control',
+      input: encodeURIComponent(url),
+      privateParts: ['synthetic.invalid', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-url-slash-secret',
+      input: encodeURIComponent(url),
+      secrets: ['/'],
+      privateParts: ['synthetic.invalid', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-path-control',
+      input: encodeURIComponent(path),
+      privateParts: ['Synthetic Owner', 'PrivateLedger'],
+    },
+    {
+      id: 'encoded-path-slash-secret',
+      input: encodeURIComponent(path),
+      secrets: ['/'],
+      privateParts: ['Synthetic', 'PrivateLedger'],
+    },
+    { id: 'email-control', input: email, privateParts: ['PrivateMailbox', 'synthetic.invalid'] },
+    {
+      id: 'email-at-secret',
+      input: email,
+      secrets: ['@'],
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'encoded-email-control',
+      input: encodeURIComponent(email),
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'encoded-email-at-secret',
+      input: encodeURIComponent(email),
+      secrets: ['@'],
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'literal-overlap-control',
+      input: 'AlphaBridgeOmega',
+      secrets: ['AlphaBridgeOmega'],
+      privateParts: ['Alpha', 'Bridge', 'Omega'],
+    },
+    {
+      id: 'literal-overlap',
+      input: 'AlphaBridgeOmega',
+      secrets: ['AlphaBridge', 'BridgeOmega'],
+      privateParts: ['Alpha', 'Bridge', 'Omega'],
+    },
+    {
+      id: 'object-password-control',
+      input: { password: opaque },
+      secrets: ['pass'],
+      privateParts: [opaque],
+    },
+    { id: 'json-password-control', input: password, privateParts: [opaque] },
+    { id: 'json-password-quote-secret', input: password, secrets: ['"'], privateParts: [opaque] },
+    {
+      id: 'embedded-password-quote-secret',
+      input: `failed: ${password}`,
+      secrets: ['"'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'wrapped-password-quote-secret',
+      input: JSON.stringify(password),
+      secrets: ['"'],
+      privateParts: [opaque],
+    },
+    { id: 'json-unicode-password-control', input: unicode, privateParts: [opaque] },
+    {
+      id: 'json-unicode-password-backslash-secret',
+      input: unicode,
+      secrets: ['\\'],
+      privateParts: [opaque],
+    },
+    { id: 'object-vault-key-control', input: { vaultKey: opaque }, privateParts: [opaque] },
+    {
+      id: 'object-vault-key-literal',
+      input: { vaultKey: opaque },
+      secrets: ['vault'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'object-master-key-literal',
+      input: { masterKey: opaque },
+      secrets: ['master'],
+      privateParts: [opaque],
+    },
+    { id: 'tuple-control', input: tuple, privateParts: [opaque] },
+    {
+      id: 'private-tuple-tail',
+      input: ['Authorization', opaque, 'PrivateTrailingValue'],
+      privateParts: [opaque, 'PrivateTrailingValue'],
+    },
+    {
+      id: 'private-tuple-tail-with-literal',
+      input: ['Authorization', opaque, 'PrivateTrailingValue'],
+      secrets: ['Author'],
+      privateParts: [opaque, 'PrivateTrailingValue'],
+    },
+    {
+      id: 'encoded-secret-key',
+      input: { 'pass%77ord': opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-tuple-label',
+      input: ['Authoriz%61tion', opaque],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-escaped-tuple-label',
+      input: ['"\\u0041uthorization"', opaque],
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-name-alias',
+      input: { 'n%61me': 'Authorization', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-media-alias',
+      input: { 't%79pe': 'image', data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-media-value',
+      input: { type: 'im%61ge', data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-data-alias',
+      input: { type: 'image', 'd%61ta': opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-name-vault-alias',
+      input: { 'n%61me': 'vaultKey', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-media-value-with-literal',
+      input: { type: '"\\u0069mage"', data: opaque },
+      secrets: ['"'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-uri-named-value',
+      input: { name: '"vault%4Bey"', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'invalid-tuple-label',
+      input: ['Authoriz%61tion%ZZ', opaque, 'PrivateTrailingValue'],
+      privateParts: [opaque, 'PrivateTrailingValue'],
+    },
+    {
+      id: 'invalid-media-label',
+      input: { type: 'im%61ge%ZZ', data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'decoded-object-tuple-label',
+      input: [encodeURIComponent('{"password":"PrivateInnerValue"}'), opaque],
+      privateParts: [opaque, 'PrivateInnerValue'],
+    },
+    {
+      id: 'decoded-array-tuple-label',
+      input: [encodeURIComponent('["token","public"]'), opaque],
+      privateParts: [opaque],
+    },
+    {
+      id: 'decoded-object-media-label',
+      input: { type: encodeURIComponent('{"type":"image"}'), data: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'raw-structured-entry-is-not-a-tuple-label',
+      input: ['{"password":"PrivateInnerValue"}', 'Public scalar detail'],
+      privateParts: ['PrivateInnerValue'],
+      kept: ['Public scalar detail'],
+    },
+    {
+      id: 'raw-bracketed-entry-keeps-public-tail',
+      input: ['[notice]', 'Public scalar detail'],
+      privateParts: [],
+      kept: ['[notice]', 'Public scalar detail'],
+    },
+    {
+      id: 'metadata-uri-depth-limit',
+      input: [
+        Array.from({ length: 3 }).reduce<string>(
+          (value) => encodeURIComponent(value),
+          'Authoriz%61tion',
+        ),
+        opaque,
+      ],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-json-depth-limit',
+      input: [
+        Array.from({ length: 11 }).reduce<string>(
+          (value) => JSON.stringify(value),
+          'Authorization',
+        ),
+        opaque,
+      ],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-byte-limit',
+      input: [JSON.stringify(' '.repeat(31_981) + '"Authorization"'), opaque],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-count-limit',
+      input: Array.from({ length: 100 }, (_, index) => [
+        ' '.repeat(index) + '%41uthorization',
+        opaque,
+      ]),
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'metadata-after-rendered-field-limit',
+      input: Object.assign(
+        { value: opaque, data: opaque },
+        Object.fromEntries(Array.from({ length: 100 }, (_, index) => ['field' + index, index])),
+        { name: 'Authorization', type: 'image' },
+      ),
+      privateParts: [opaque],
+    },
+    {
+      id: 'encoded-name-after-field-limit',
+      input: Object.assign(
+        { value: opaque },
+        Object.fromEntries(Array.from({ length: 99 }, (_, index) => ['field' + index, index])),
+        { 'n%61me': 'Authorization' },
+      ),
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'encoded-type-after-field-limit',
+      input: Object.assign(
+        { data: opaque },
+        Object.fromEntries(Array.from({ length: 99 }, (_, index) => ['field' + index, index])),
+        { 't%79pe': 'image' },
+      ),
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'safe-object-below-field-limit',
+      input: Object.assign(
+        { status: 503 },
+        Object.fromEntries(Array.from({ length: 98 }, (_, index) => ['field' + index, index])),
+      ),
+      privateParts: [],
+      kept: ['"status":503', '"field97":97'],
+    },
+    {
+      id: 'safe-object-at-field-limit',
+      input: Object.assign(
+        { status: 503 },
+        Object.fromEntries(Array.from({ length: 99 }, (_, index) => ['field' + index, index])),
+      ),
+      privateParts: [],
+      kept: ['"status":503', '"field98":98'],
+    },
+    {
+      id: 'oversized-encoded-name-key',
+      input: { value: opaque, ['n%61me' + '-'.repeat(195)]: 'Authorization' },
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'oversized-encoded-media-key',
+      input: { data: opaque, ['t%79pe' + '-'.repeat(195)]: 'image' },
+      privateParts: [opaque],
+      kept: ['[structured data omitted]'],
+    },
+    {
+      id: 'safe-key-below-length-limit',
+      input: { status: 503, ['x'.repeat(199)]: 'Useful technical value' },
+      privateParts: [],
+      kept: ['"status":503', 'Useful technical value'],
+    },
+    {
+      id: 'safe-key-at-length-limit',
+      input: { status: 503, ['x'.repeat(200)]: 'Useful technical value' },
+      privateParts: [],
+      kept: ['"status":503', 'Useful technical value'],
+    },
+    { id: 'tuple-literal', input: tuple, secrets: ['Author'], privateParts: [opaque] },
+    {
+      id: 'json-tuple-literal',
+      input: JSON.stringify(tuple),
+      secrets: ['Author'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'named-vault-key-control',
+      input: { name: 'vaultKey', value: opaque },
+      privateParts: [opaque],
+    },
+    {
+      id: 'named-vault-key-literal',
+      input: { name: 'vaultKey', value: opaque },
+      secrets: ['vault'],
+      privateParts: [opaque],
+    },
+    { id: 'cookie-control', input: `Cookie: ${opaque}`, privateParts: [opaque] },
+    {
+      id: 'overlapping-bearer-prefix',
+      input: `Bearer Bearer ${opaque}`,
+      privateParts: [opaque],
+    },
+    {
+      id: 'overlapping-basic-prefix',
+      input: 'Basic Basic ' + Buffer.from('synthetic-user:synthetic-password').toString('base64'),
+      privateParts: [Buffer.from('synthetic-user:synthetic-password').toString('base64')],
+    },
+    {
+      id: 'quoted-then-unquoted-url',
+      input: `"https://public.invalid" https://${opaque}/path`,
+      privateParts: [opaque],
+    },
+    {
+      id: 'overlapping-key-blocks',
+      input: [
+        keyHeader,
+        'SyntheticAlpha',
+        keyHeader,
+        'SyntheticBeta',
+        keyFooter,
+        'SyntheticGamma',
+        keyFooter,
+      ].join('\n'),
+      privateParts: ['SyntheticAlpha', 'SyntheticBeta', 'SyntheticGamma'],
+    },
+    {
+      id: 'unclosed-key-block',
+      input: `HTTP 503: ${keyHeader}\n${opaque}`,
+      privateParts: [opaque],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'quoted-then-unquoted-path',
+      input: '"/home/Synthetic Owner/first.txt" /Users/PrivateOwner/PrivateLedger.docx',
+      privateParts: ['Synthetic Owner', 'PrivateOwner', 'PrivateLedger'],
+    },
+    { id: 'cookie-name', input: `Cookie: ${opaque}`, names: ['Cookie'], privateParts: [opaque] },
+    { id: 'cookie-literal', input: `Cookie: ${opaque}`, secrets: ['Cook'], privateParts: [opaque] },
+    { id: 'json-payload-name', input: payload, names: ['payload'], privateParts: [opaque] },
+    {
+      id: 'object-payload-name',
+      input: { payload: opaque },
+      names: ['payload'],
+      privateParts: [opaque],
+    },
+    { id: 'query-control', input: `?access_token=${opaque}`, privateParts: [opaque] },
+    {
+      id: 'query-literal',
+      input: `?access_token=${opaque}`,
+      secrets: ['access'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'token-control',
+      input: 'sk-proj-PrivateSyntheticTokenAB',
+      privateParts: ['PrivateSyntheticTokenAB'],
+    },
+    {
+      id: 'token-literal',
+      input: 'sk-proj-PrivateSyntheticTokenAB',
+      secrets: ['sk-'],
+      privateParts: ['PrivateSyntheticTokenAB'],
+    },
+    {
+      id: 'binary-control',
+      input: { type: 'image', data: opaque },
+      secrets: ['image'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'technical-control',
+      input: { status: 503, version: '0.8.0', count: 7, message: 'Engine request failed' },
+      privateParts: [],
+    },
+    {
+      id: 'reason-outside-private-span',
+      input: `HTTP 503 for ${email}; attempt 2`,
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+      kept: ['HTTP 503', 'attempt 2'],
+    },
+    {
+      id: 'encoded-email-percent-secret',
+      input: encodeURIComponent(email),
+      secrets: ['%'],
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'encoded-payload',
+      input: encodeURIComponent(payload),
+      privateParts: [opaque],
+    },
+    {
+      id: 'nested-encoded-payload',
+      input: encodeURIComponent(encodeURIComponent(payload)),
+      secrets: ['%'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'invalid-encoded-carrier',
+      input: `${opaque}%41%ZZ`,
+      privateParts: [opaque],
+    },
+    {
+      id: 'percentage-keeps-technical-text',
+      input: 'Upload 45% done; HTTP 503',
+      privateParts: [],
+      kept: ['Upload 45% done; HTTP 503'],
+    },
+    {
+      id: 'encoded-depth-limit',
+      input: Array.from({ length: 5 }).reduce<string>((value) => encodeURIComponent(value), email),
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'decode-count-limit',
+      input: '%41 '.repeat(130) + encodeURIComponent(email),
+      privateParts: ['PrivateMailbox', 'synthetic.invalid'],
+    },
+    {
+      id: 'sensitive-relative-route',
+      input: `/api/${opaque}`,
+      secrets: ['api'],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-literal-across-key-value',
+      input: JSON.stringify({ field: opaque }),
+      secrets: [`field":"${opaque}`],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-literal-within-value-keeps-reason',
+      input: JSON.stringify({ message: `HTTP 503 for ${opaque}` }),
+      secrets: [opaque],
+      privateParts: [opaque],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'literal-across-embedded-json',
+      input: `failed: ${JSON.stringify({ field: opaque })}`,
+      secrets: [`failed: {"field":"${opaque}`],
+      privateParts: [opaque],
+    },
+    {
+      id: 'json-boolean-literal',
+      input: '{"allowed":false}',
+      secrets: ['false'],
+      privateParts: ['false'],
+    },
+    {
+      id: 'literal-overlap-unicode',
+      input: '😀BridgeΩ',
+      secrets: ['😀Bridge', 'BridgeΩ'],
+      privateParts: ['Bridge', 'Ω'],
+    },
+    {
+      id: 'stack-technical-frame',
+      input: {
+        stack:
+          'Error: HTTP 503\n    at operation (/Users/Synthetic Owner/nod/src/server/worker.ts:12:4)',
+      },
+      privateParts: ['Synthetic Owner', '/Users/'],
+      kept: ['HTTP 503', 'src/server/worker.ts:12:4'],
+    },
+    {
+      id: 'stack-private-frame',
+      input: {
+        stack:
+          'Error: HTTP 503\n    at operation (/Users/Synthetic Owner/nod/src/server/worker.ts:12:4)',
+      },
+      secrets: ['worker'],
+      privateParts: ['Synthetic Owner', '/Users/', 'worker'],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'stack-normalized-private-frame',
+      input: {
+        stack:
+          'Error: HTTP 503\n    at operation (C:\\Synthetic Owner\\nod\\src\\server\\worker.ts:12:4)',
+      },
+      secrets: ['src/server'],
+      privateParts: ['Synthetic Owner', 'src/server'],
+      kept: ['HTTP 503'],
+    },
+    {
+      id: 'string-limit',
+      input: 'x'.repeat(32_000) + opaque,
+      privateParts: [opaque],
+    },
+    {
+      id: 'match-limit',
+      input: 'x'.repeat(5000) + opaque,
+      secrets: ['x'],
+      privateParts: [opaque],
+      omitted: true,
+    },
+    {
+      id: 'fragment-limit',
+      input: '{} '.repeat(33) + opaque,
+      privateParts: [opaque],
+    },
+    {
+      id: 'incomplete-structure',
+      input: `failed: {"payload":"${opaque}"`,
+      privateParts: [opaque],
+    },
+  ];
+
+  for (const probe of cases) {
+    await t.test(probe.id, () => {
+      const redactor = createFeedbackRedactor({
+        secrets: probe.secrets ?? [],
+        profile: { names: probe.names ?? [] },
+      });
+      assert.equal(redactor.isReady(), true);
+      const output = redactor.value(probe.input);
+      const encoded = JSON.stringify(output);
+      assert.deepEqual(
+        probe.privateParts.filter((part) => encoded.includes(part)),
+        [],
+        'A private value remained after feedback redaction.',
+      );
+      for (const kept of probe.kept ?? []) assert.ok(encoded.includes(kept), kept);
+      if (probe.omitted) assert.equal(output, '[unreadable data omitted]');
+      else assert.notEqual(output, '[unreadable data omitted]');
+      if (probe.id === 'technical-control') assert.deepEqual(JSON.parse(encoded), probe.input);
+    });
+  }
+});
+
+test('feedback redaction advances Unicode overlaps and resets recursive checks between calls', async () => {
+  const { execFileSync } = await import('node:child_process');
+  execFileSync(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '--eval',
+      `import assert from 'node:assert/strict';
+    import { createFeedbackRedactor } from ${JSON.stringify(new URL('../src/server/feedback-redaction.ts', import.meta.url).href)};
+    const redactor = createFeedbackRedactor({ secrets: [], profile: { names: ['😀😀😀'] } });
+    assert.equal(redactor.text('😀'.repeat(6)), '[owner]');`,
+    ],
+    { timeout: 3000, maxBuffer: 16_000 },
+  );
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const redactor = createFeedbackRedactor({ secrets: ['/', '@'], profile: { names: [] } });
+  const encoded = Array.from({ length: 4 }).reduce<string>(
+    (value) => encodeURIComponent(value),
+    '/Users/Synthetic Owner/PrivateLedger.docx',
+  );
+  const input = {
+    status: 503,
+    message: 'HTTP 503 for PrivateMailbox%40synthetic.invalid',
+    detail: encoded,
+    headers: ['Authoriz%61tion', 'PrivateRecursiveCredential'],
+  };
+  const expected = JSON.stringify(redactor.value(input));
+  assert.ok(expected.includes('HTTP 503'));
+  for (const privateValue of [
+    'PrivateMailbox',
+    'synthetic.invalid',
+    'Synthetic Owner',
+    'PrivateLedger',
+    'PrivateRecursiveCredential',
+  ])
+    assert.ok(!expected.includes(privateValue), privateValue);
+  for (let index = 0; index < 8; index++) {
+    redactor.text('%41 '.repeat(130) + encoded);
+    assert.equal(JSON.stringify(redactor.value(input)), expected);
+  }
+});
+
+test('feedback redaction omits a value when personal matching reaches its bound', async () => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const { createPersonalDataRedactor } = await import('../src/server/personal-data.ts');
+  const profile = { names: ['aaa'] };
+  const input = 'aaa '.repeat(5000) + 'Technical tail';
+  const redactor = createFeedbackRedactor({ secrets: [], profile });
+  let output = '';
+  assert.doesNotThrow(() => {
+    output = redactor.text(input);
+  });
+  assert.equal(output, '[unreadable data omitted]');
+  assert.ok(createPersonalDataRedactor(profile)(input).endsWith('Technical tail'));
+});
+
+test('feedback redaction omits values when classification metadata is a getter', async () => {
+  const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
+  const redactor = createFeedbackRedactor({ secrets: [], profile: { names: [] } });
+  let invoked = 0;
+  const named = { value: 'PrivateNamedValue' };
+  const media = { data: 'PrivateBinaryValue', bytes: 'PrivateBytesValue' };
+  const tuple = ['Authorization', 'PrivateTupleValue', 'PrivateTupleTail'];
+  for (const [target, key] of [
+    [named, 'name'],
+    [media, 'type'],
+    [tuple, '0'],
+  ] as const)
+    Object.defineProperty(target, key, {
+      enumerable: true,
+      get() {
+        invoked++;
+        throw new Error('Classification must not call a getter.');
+      },
+    });
+  const output = JSON.stringify(redactor.value({ named, media, tuple, status: 503 }));
+  assert.equal(invoked, 0);
+  for (const privateValue of [
+    'PrivateNamedValue',
+    'PrivateBinaryValue',
+    'PrivateBytesValue',
+    'PrivateTupleValue',
+    'PrivateTupleTail',
+  ])
+    assert.ok(!output.includes(privateValue), privateValue);
+  assert.ok(output.includes('503'));
+});
+
 test('rich feedback redaction handles embedded JSON, identifying addresses, encoded secrets and binary', async () => {
   const { createFeedbackRedactor } = await import('../src/server/feedback-redaction.ts');
   const redactor = createFeedbackRedactor({
@@ -3340,12 +4204,13 @@ test('rich feedback redaction keeps error classes, frame files, sizes and model 
   assert.ok(safe.error.stack.includes('([path]:5:1)'));
   for (const frame of [
     '(src/server/thread.ts:281:13)',
-    '(node_modules/@fixture/pg/lib/client.js:10:2)',
     '(dist/server/index.js:7:9)',
     'at [path]:18:4',
     'at [path]:3:1',
   ])
     assert.ok(safe.error.stack.includes(frame), frame);
+  assert.ok(safe.error.stack.includes(':10:2'));
+  assert.ok(!safe.error.stack.includes('@fixture'));
   for (const sensitive of [
     'private-owner',
     'private-project',
@@ -3460,9 +4325,26 @@ test('browser handoff preserves platform editing chords, text input and paste', 
         await act(async () => root.render(createElement(BrowserHandoff, { turnId: 'synthetic-turn' })));
         const frame = document.querySelector('.browser-handoff-screen img');
         assert.equal(frame.src, 'blob:synthetic-browser-frame');
+        Object.defineProperty(frame, 'naturalWidth', { value: 100 });
+        Object.defineProperty(frame, 'naturalHeight', { value: 100 });
+        frame.getBoundingClientRect = () => ({ left: 0, top: 0, width: 100, height: 100 });
         await act(async () => frame.dispatchEvent(new Event('load')));
         let screen = document.querySelector('.browser-handoff-screen');
         assert.equal(screen.getAttribute('aria-disabled'), 'false');
+        const press = async (type, button) => act(async () => frame.dispatchEvent(
+          new dom.window.MouseEvent(type, { button, clientX: 50, clientY: 50, bubbles: true }),
+        ));
+        for (const button of [3, 4]) {
+          await press('mousedown', button);
+          await press('mouseup', button);
+        }
+        assert.deepEqual(received, []);
+        await press('mousedown', 0);
+        await press('mouseup', 0);
+        assert.deepEqual(received, [
+          { type: 'mouse', event: 'down', x: 0.5, y: 0.5, button: 'left' },
+          { type: 'mouse', event: 'up', x: 0.5, y: 0.5, button: 'left' },
+        ]);
         let dispatchingKey = false;
         const key = async (key, options = {}) => {
           const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...options });
@@ -7311,6 +8193,193 @@ test('chat resumes history after a failed focus check and cancels pending focus 
   assert.equal(result.exitCode, 0, result.stdout + result.stderr);
 });
 
+test('chat state reads make progress during refresh events and reject late replies after reset', async () => {
+  const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
+    timeoutMs: 20_000,
+    input: String.raw`
+      import assert from 'node:assert/strict';
+      import { JSDOM } from 'jsdom';
+      const dom = new JSDOM('<!doctype html><div id="root"></div>', {
+        url: 'https://nod.fixture.invalid', pretendToBeVisual: true,
+      });
+      Object.assign(globalThis, {
+        window: dom.window, document: dom.window.document,
+        IS_REACT_ACT_ENVIRONMENT: true, localStorage: dom.window.localStorage,
+        getComputedStyle: dom.window.getComputedStyle.bind(dom.window),
+        requestAnimationFrame: dom.window.requestAnimationFrame.bind(dom.window),
+        cancelAnimationFrame: dom.window.cancelAnimationFrame.bind(dom.window),
+      });
+      for (const name of ['Node', 'NodeFilter', 'Element', 'HTMLElement', 'HTMLInputElement',
+        'HTMLButtonElement', 'MutationObserver', 'Event', 'KeyboardEvent', 'CustomEvent', 'DOMParser'])
+        globalThis[name] = dom.window[name];
+      Object.defineProperty(globalThis, 'navigator', { configurable: true, value: dom.window.navigator });
+      window.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {} });
+      HTMLElement.prototype.scrollTo = () => {};
+      HTMLElement.prototype.scrollIntoView = () => {};
+      const sources = [];
+      globalThis.EventSource = class {
+        static CLOSED = 2;
+        readyState = 1;
+        constructor() { sources.push(this); }
+        close() { this.readyState = 2; }
+      };
+      const reads = [];
+      let ownerId = 'synthetic-owner';
+      let expireRead = false;
+      const deadlines = [];
+      AbortSignal.timeout = () => {
+        const controller = new AbortController();
+        deadlines.push(controller);
+        return controller.signal;
+      };
+      const threadId = '00000000-0000-4000-8000-000000000901';
+      const nextThreadId = '00000000-0000-4000-8000-000000000902';
+      const message = (id, text) => ({ id, role: 'assistant', text, attachments: [],
+        turnId: null, createdAt: '2026-11-19T12:00:00Z' });
+      const state = (messages, current = threadId) => ({
+        threadId: current, turns: [], activity: [], tasks: [],
+        verificationRequests: [], configuration: { llmReady: true }, messages,
+      });
+      globalThis.fetch = async (path, options = {}) => {
+        if (path === '/api/session') return Response.json({
+          user: { id: ownerId, name: 'Synthetic', email: null, avatarUrl: null },
+          settings: { theme: 'system', onboardingCompleted: true, usageData: false, traces: false },
+          capabilities: { developer: false, traces: false },
+        });
+        if (path === '/api/state') return new Promise((resolve, reject) => {
+          reads.push({ resolve, signal: options.signal });
+          if (expireRead) options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+        });
+        if (path === '/api/conversation/reset') return Response.json({ ok: true, threadId: nextThreadId });
+        if (path === '/api/apps') return Response.json([]);
+        if (path === '/api/trust') return Response.json({});
+        if (path === '/api/speech') return Response.json({ transcription: true });
+        if (path === '/api/onboarding/introduction') return Response.json({ messageId: null });
+        throw new Error('Unexpected request: ' + path);
+      };
+      const { createElement, act, StrictMode } = await import('react');
+      const { createRoot } = await import('react-dom/client');
+      const { sessionStore } = await import('./src/web/lib/session.ts');
+      const { useAppState } = await import('./src/web/hooks/use-app-state.ts');
+      const { Chat } = await import('./src/web/pages/chat.tsx');
+      await sessionStore.refresh();
+      let app;
+      function Screen() {
+        app = useAppState(ownerId);
+        return app.state ? createElement(Chat, {
+          ownerId, state: app.state, streams: app.streams,
+          refresh: app.refresh, resetConversation: app.resetConversation,
+        }) : createElement('p', null, 'Loading');
+      }
+      let root = createRoot(document.getElementById('root'));
+      const event = data => sources.at(-1).onmessage({ data: JSON.stringify(data) });
+      const complete = (read, value) => act(async () => read.resolve(Response.json(value)));
+      try {
+        await act(async () => root.render(createElement(Screen)));
+        const first = reads[0];
+        await act(async () => sources[0].onopen());
+        for (let index = 0; index < 20; index++)
+          await act(async () => event({ type: 'refresh' }));
+        const saved = message('saved-reply', 'Synthetic saved reply');
+        await complete(first, state([saved]));
+        assert.ok(document.querySelector('[data-message-id="saved-reply"]'),
+          'The completed state read must show its saved reply during repeated updates.');
+        assert.equal(first.signal.aborted, false);
+        assert.equal(reads.length, 2);
+        let refreshed = false;
+        const awaitedRefresh = app.refresh().then(() => { refreshed = true; });
+        assert.equal(refreshed, false);
+        const activity = [{ turnId: 'synthetic-work', taskId: null, title: null,
+          step: null, site: null, since: '2026-11-19T12:00:00Z' }];
+        await act(async () => event({ type: 'activity', items: activity }));
+        const approval = { ...message('pending-approval', 'Synthetic pending change'),
+          approval: { id: 'synthetic-approval', state: 'pending', title: 'Save change', app: 'Nod', slug: 'nod' } };
+        await complete(reads[1], state([saved, message('newer-reply', 'Synthetic newer reply'), approval]));
+        assert.ok(document.querySelector('[data-message-id="newer-reply"]'));
+        assert.ok(document.querySelector('[data-message-id="pending-approval"] button'));
+        assert.deepEqual(app.state.activity, activity);
+        assert.equal(refreshed, false);
+        await complete(reads.at(-1), state([saved, message('awaited-reply', 'Synthetic awaited reply'), approval]));
+        await awaitedRefresh;
+        assert.equal(refreshed, true);
+        assert.ok(document.querySelector('[data-message-id="awaited-reply"]'));
+        await act(async () => event({ type: 'refresh' }));
+        const failed = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => failed.resolve(Response.json({ error: 'Synthetic state read failed' }, { status: 503 })));
+        assert.match(app.error, /Synthetic state read failed/);
+        assert.ok(document.querySelector('[data-message-id="pending-approval"] button'));
+        await complete(reads.at(-1), state([saved, message('recovered-reply', 'Synthetic recovered reply')]));
+        assert.equal(app.error, '');
+        assert.ok(document.querySelector('[data-message-id="recovered-reply"]'));
+        expireRead = true;
+        await act(async () => event({ type: 'refresh' }));
+        expireRead = false;
+        const timedOut = reads.at(-1);
+        const deadline = deadlines.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        const beforeTimeout = reads.length;
+        await act(async () => deadline.abort(new DOMException('Synthetic deadline', 'TimeoutError')));
+        assert.equal(timedOut.signal.aborted, true);
+        assert.match(app.error, /did not finish within 15 seconds/);
+        assert.equal(reads.length, beforeTimeout + 1);
+        assert.equal(reads.at(-1).signal.aborted, false);
+        await complete(reads.at(-1), state([message('after-timeout', 'Synthetic reply after timeout')]));
+        assert.equal(app.error, '');
+        assert.ok(document.querySelector('[data-message-id="after-timeout"]'));
+        await complete(timedOut, state([message('timed-out-reply', 'Synthetic expired reply')]));
+        assert.equal(document.querySelector('[data-message-id="timed-out-reply"]'), null);
+        await act(async () => event({ type: 'refresh' }));
+        const old = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => app.resetConversation(threadId));
+        assert.equal(app.state.threadId, nextThreadId);
+        assert.equal(app.error, '');
+        assert.equal(document.querySelector('[data-message-id="saved-reply"]'), null);
+        await act(async () => event({ type: 'refresh' }));
+        assert.equal(old.signal.aborted, true);
+        assert.notEqual(reads.at(-1), old);
+        await complete(reads.at(-1), state([message('new-thread-reply', 'Synthetic new conversation')], nextThreadId));
+        assert.ok(document.querySelector('[data-message-id="new-thread-reply"]'));
+        const resetReads = reads.length;
+        await complete(old, state([message('late-reply', 'Synthetic late reply')]));
+        assert.equal(app.state.threadId, nextThreadId);
+        assert.equal(document.querySelector('[data-message-id="late-reply"]'), null);
+        assert.equal(reads.length, resetReads);
+        await act(async () => event({ type: 'refresh' }));
+        const unmounted = reads.at(-1);
+        await act(async () => event({ type: 'refresh' }));
+        await act(async () => root.unmount());
+        assert.equal(unmounted.signal.aborted, true);
+        const count = reads.length;
+        const retiredSource = sources[0];
+        sessionStore.invalidate();
+        ownerId = 'other-synthetic-owner';
+        await sessionStore.refresh();
+        root = createRoot(document.getElementById('root'));
+        await act(async () => root.render(createElement(StrictMode, null, createElement(Screen, { key: ownerId }))));
+        assert.equal(reads.length, count + 2);
+        const abandoned = reads.at(-2);
+        assert.equal(abandoned.signal.aborted, true);
+        await act(async () => retiredSource.onmessage({ data: JSON.stringify({ type: 'refresh' }) }));
+        await complete(unmounted, state([message('unmounted-reply', 'Synthetic unmounted reply')]));
+        assert.equal(reads.length, count + 2);
+        await complete(reads.at(-1), state([message('other-owner-reply', 'Synthetic other owner reply')]));
+        assert.ok(document.querySelector('[data-message-id="other-owner-reply"]'));
+        await complete(abandoned, state([message('abandoned-reply', 'Synthetic abandoned reply')]));
+        assert.equal(reads.length, count + 2);
+        assert.equal(document.querySelector('[data-message-id="abandoned-reply"]'), null);
+        assert.equal(document.querySelector('[data-message-id="unmounted-reply"]'), null);
+        assert.equal(document.querySelector('[data-message-id="saved-reply"]'), null);
+      } finally {
+        await act(async () => root.unmount());
+        dom.window.close();
+      }
+    `,
+  });
+  assert.equal(result.exitCode, 0, result.stdout + result.stderr);
+});
+
 test('chat shows pending sends and active work before a model step', async () => {
   const result = await runProcess(process.execPath, ['--import', 'tsx', '--input-type=module'], {
     timeoutMs: 20_000,
@@ -7554,7 +8623,7 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
       const events = event => sent.filter(item => item.event === event);
       const settings = () => events('settings_viewed').map(item => item.properties.tab);
       const tabs = () => events('tab_viewed').map(item => [item.properties.page, item.properties.tab]);
-      const sectionLabels = ['General', 'Notifications', 'Models', 'Voice & audio', 'Memory', 'Privacy & data'];
+      const sectionLabels = ['General', 'Notifications', 'Models', 'Voice & audio', 'Memory', 'Computer use', 'Privacy & data'];
       try {
         await act(async () => root.render(createElement(AccountSettings, {
           account, open: true, initialTab: 'General', openRequest: 0, onOpenChange() {},
@@ -7564,9 +8633,9 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
         const navigation = [...document.querySelectorAll('.settings-nav-item')];
         assert.deepEqual(navigation.map(item => item.textContent), sectionLabels);
         for (const item of navigation.slice(1)) await act(async () => item.click());
-        assert.deepEqual(settings(), ['general', 'notifications', 'models', 'voice', 'memory', 'privacy']);
+        assert.deepEqual(settings(), ['general', 'notifications', 'models', 'voice', 'memory', 'computer', 'privacy']);
         await act(async () => navigation.at(-1).click());
-        assert.equal(settings().length, 6);
+        assert.equal(settings().length, 7);
         const scroller = document.querySelector('.settings-scroll');
         Object.defineProperties(scroller, { scrollHeight: { value: 2000 }, clientHeight: { value: 400 } });
         document.querySelectorAll('.settings-category > h2').forEach((heading, index) => {
@@ -7584,7 +8653,7 @@ test('analytics follow visible Settings sections, Apps tabs and the Scheduled pa
         consent(true);
         await act(async () => navigation[3].click());
         assert.equal(settings().at(-1), 'voice');
-        for (const path of ['/settings', '/settings/notifications', '/settings/models', '/settings/voice', '/settings/memory', '/settings/privacy']) {
+        for (const path of ['/settings', '/settings/notifications', '/settings/models', '/settings/voice', '/settings/memory', '/settings/computer-use', '/settings/privacy']) {
           window.history.replaceState(null, '', path);
           capturePageview(path);
           assert.equal(events('$pageview').at(-1).properties.route, '/settings');

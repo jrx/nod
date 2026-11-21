@@ -43,6 +43,13 @@
 .schedule-inactive[open] > summary > svg {
   transform: rotate(180deg);
 }
+.schedule-live-line {
+  color: var(--text-secondary);
+  font-size: var(--text-control);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .schedule-inactive > .saved-plan-list {
   margin-top: 12px;
 }

@@ -6,7 +6,11 @@ import type {
   DecisionRequest,
   DecisionSelection,
 } from '../ports/decisions.ts';
-import { trustDecision, type TrustWords } from './trust-basis.ts';
+import {
+  opensContent as opensOwnerContent,
+  trustDecision,
+  type TrustWords,
+} from './trust-basis.ts';
 import { trustFacts, trustTimeZone } from './trust-facts.ts';
 import { jevPolicy } from './trust-jev-policy.ts';
 import model from './trust-jev-model.json' with { type: 'json' };
@@ -49,6 +53,7 @@ const grants = {
   book: 'owner_book',
   event: 'owner_event',
   update: 'owner_update',
+  open: 'owner_open',
   settings: 'owner_settings',
   sign_in: 'owner_sign_in',
   unknown: 'owner_commitment',
@@ -244,7 +249,7 @@ export async function checkJevTrust(
   const opensContent =
     (action?.name === 'NOD_browser' &&
       (action.arguments?.step === 'upload' || action.arguments?.command?.action === 'upload')) ||
-    ['LOCAL_FILES_READ', 'LOCAL_FILES_IMPORT'].includes(action?.name ?? '');
+    opensOwnerContent(action?.name);
   const effect = first.additional.effect?.choice;
   if (typeof effect !== 'string' || !(effect in jevPolicy.effect.choices))
     throw new Error('The trust effects are incomplete.');
@@ -432,7 +437,7 @@ export async function checkJevTrust(
         ...predicate(
           'permission',
           'Judge the complete owner instruction in ownerSourceForThisCheck under serverPolicy. Apply the supplied schedule evidence and later corrections when present. Does this quoted owner instruction itself request or permit this kind of operation? Its kind identifies the original owner field. A lasting rule permission remains a grant without a fresh message. Assistant text only gives the concrete proposal that an owner reply accepts. This check extracts the grant, not final permission. Another check reads all owner constraints and the complete action. ' +
-            jevPolicy.ownerQuestions[grants[kind as keyof typeof grants]],
+            jevPolicy.ownerQuestions[grants[(opensContent ? 'open' : kind) as keyof typeof grants]],
         ),
         choices: [
           {

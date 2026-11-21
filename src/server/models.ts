@@ -8,7 +8,11 @@ import type {
   ModelCredential,
   ModelDefinition,
 } from '../ports/models.ts';
-import { ModelAuthError, ModelWorkspaceSelectionError } from '../ports/models.ts';
+import {
+  ModelAuthError,
+  ModelCatalogError,
+  ModelWorkspaceSelectionError,
+} from '../ports/models.ts';
 import { ModelRequestError } from '../ports/agent.ts';
 import type { CredentialKeyStore } from '../ports/key-store.ts';
 import type {
@@ -37,6 +41,7 @@ import {
   modelSource,
   openAIRegions,
   routeModel,
+  supportsLongCacheWrites,
 } from '../shared/models.ts';
 import { signInPage } from '../shared/sign-in-page.ts';
 import { appPages } from '../shared/app-links.ts';
@@ -77,23 +82,29 @@ export const modelSelectionInput = z
   .strict();
 class ConnectionError extends ModelRequestError {}
 
+const rates = {
+  input: z.number().finite(),
+  output: z.number().finite(),
+  cacheRead: z.number().finite().optional(),
+  cacheWrite: z.number().finite().optional(),
+};
+const modelRates = z.object({
+  ...rates,
+  tiers: z.array(z.object({ ...rates, inputTokensAbove: z.number().nonnegative() })).optional(),
+});
+
 function modelPricing(model: ModelDefinition): ModelChoice['pricing'] {
+  if (model.spec.provider === 'compatible') return undefined;
   if (model.choice.id === 'openrouter/auto') return 'variable';
-  const cost = z
-    .object({
-      input: z.number().finite(),
-      output: z.number().finite(),
-      cacheRead: z.number().finite().optional(),
-      cacheWrite: z.number().finite().optional(),
-    })
-    .safeParse(model.spec.cost).data;
+  const cost = modelRates.safeParse(model.spec.cost).data;
   if (!cost) return undefined;
-  if (Object.values(cost).some((value) => value < 0)) return 'variable';
+  const { tiers, ...rates } = cost;
+  if ([rates, ...(tiers ?? [])].some((rate) => Object.values(rate).some((value) => value < 0)))
+    return 'variable';
   return {
-    input: cost.input,
-    output: cost.output,
-    ...(cost.cacheRead !== undefined ? { cacheRead: cost.cacheRead } : {}),
-    ...(cost.cacheWrite !== undefined ? { cacheWrite: cost.cacheWrite } : {}),
+    ...rates,
+    ...(tiers?.length ? { tiers } : {}),
+    ...(supportsLongCacheWrites(model.spec.api) ? { longCacheWrites: true } : {}),
   };
 }
 
@@ -523,7 +534,7 @@ export function createModelService(options: {
           throw new ConnectionError(
             `${modelProviderNames[row.provider]} failed the last request to ${modelId} (${failure.reason}). Automatic requests to this model are paused until a request succeeds. Check this connection in ${appPages['/settings/models']} or ask again to make a new request.`,
           );
-        return async (error) => {
+        return async (error, status) => {
           if (!tag || closed) return;
           if (
             !error &&
@@ -568,6 +579,8 @@ export function createModelService(options: {
                   .trim()
                   .slice(0, 300),
               };
+              if (status === 401 && !saved.managed && saved.status === 'connected')
+                saved.status = 'reconnect';
             });
             await reload();
           } catch (error) {
@@ -814,10 +827,36 @@ export function createModelService(options: {
       return await backend.catalog(provider, method, value);
     } catch (error) {
       if (error instanceof ModelAuthError && error.requiresReconnect) await rejected?.();
+      let keyPattern: RegExp | undefined;
+      let variants: string[] = [];
+      if (value?.type === 'endpoint' && value.key) {
+        variants = [
+          ...new Set([
+            value.key,
+            encodeURIComponent(value.key),
+            JSON.stringify(value.key).slice(1, -1),
+          ]),
+        ].sort((left, right) => right.length - left.length);
+        keyPattern = new RegExp(
+          variants.map((key) => key.replace(/[.*+?^$()|[\]{}\\]/g, '\\$&')).join('|'),
+          'g',
+        );
+      }
+      const text = createTextRedactor([
+        ...secrets,
+        value?.type === 'endpoint' ? value.url : '',
+        ...variants,
+      ]);
+      const redact = (message: string) => {
+        const safe = text(message);
+        return keyPattern ? safe.replace(keyPattern, '[redacted]') : safe;
+      };
       throw new ConnectionError(
-        createTextRedactor([...secrets])(
-          error instanceof Error ? error.message : String(error),
-        ).slice(0, 2000),
+        error instanceof ModelCatalogError
+          ? new ModelCatalogError(
+              error.failures.map((failure) => ({ ...failure, detail: redact(failure.detail) })),
+            ).message
+          : redact(error instanceof Error ? error.message : String(error)).slice(0, 2000),
       );
     }
   }
@@ -1198,11 +1237,27 @@ export function createModelService(options: {
     },
     light: lightModel,
     unpricedPreparationModel,
+    pricingThresholds() {
+      return rows.flatMap(({ models }) =>
+        models.flatMap((model) => {
+          const pricing = modelPricing(model);
+          return pricing && pricing !== 'variable'
+            ? (pricing.tiers?.map((tier) => tier.inputTokensAbove) ?? [])
+            : [];
+        }),
+      );
+    },
     priceOf(choice: ModelSelection | null | undefined) {
-      const definition = rows
-        .find((row) => row.id === choice?.connectionId)
-        ?.models.find((model) => model.choice.id === choice?.modelId);
-      return definition && { modelId: definition.choice.id, pricing: modelPricing(definition) };
+      const row = rows.find((row) => row.id === choice?.connectionId);
+      const definition = row?.models.find((model) => model.choice.id === choice?.modelId);
+      return (
+        definition && {
+          modelId: definition.choice.id,
+          pricing: modelPricing(definition),
+          audio: definition.choice.audio,
+          plan: row?.method === 'subscription',
+        }
+      );
     },
     pricing(kind: WorkKind, own: ModelSelection | null = null) {
       return service.priceOf(
@@ -1381,9 +1436,9 @@ export function createModelService(options: {
           const connected = await backend.connectKey(provider, value).catch((error) => {
             if (error instanceof ModelWorkspaceSelectionError) throw error;
             throw new ConnectionError(
-              error instanceof ModelAuthError
-                ? error.message
-                : 'The model list couldn’t be loaded. Try again.',
+              createTextRedactor([...secrets])(
+                error instanceof Error ? error.message : String(error),
+              ).slice(0, 2000),
             );
           });
           return save(provider, 'api_key', connected.credential, connected.models);
@@ -1399,11 +1454,7 @@ export function createModelService(options: {
       remember(value);
       return tracked('compatible', 'api_key', async () => {
         await checkStorage();
-        const definitions = await backend.catalog('compatible', 'api_key', value).catch(() => {
-          throw new ConnectionError(
-            'Nod couldn’t list this server’s models. Check the address, the API key and that the server is running.',
-          );
-        });
+        const definitions = await catalog('compatible', 'api_key', value);
         if (!definitions.length)
           throw new ConnectionError(
             'This server has no models Nod can use. Nod needs models with tool support.',

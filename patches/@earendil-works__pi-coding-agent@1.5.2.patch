@@ -1,0 +1,83 @@
+diff --git a/dist/extensions/codemode/execute.js b/dist/extensions/codemode/execute.js
+index 6f1f86f34b7a04a8014ec8803f90ad4d302d6c5c..5e337ac7a55911dec88e42f41842b575c12888cc 100644
+--- a/dist/extensions/codemode/execute.js
++++ b/dist/extensions/codemode/execute.js
+@@ -317,7 +317,7 @@ function joinAdjacentText(items) {
+ function formatCallSummary(calls) {
+     if (calls.length === 0)
+         return "No tool calls were made.";
+-    return `Tool calls made before the failure (they are not undone): ${calls.map((call) => `${call.name} (${call.status})`).join(", ")}`;
++    return `Tool calls made before the failure (they are not undone): ${calls.map((call) => `${call.name} (${call.status === "running" ? "outcome unknown" : call.status})`).join(", ")}`;
+ }
+ function formatError(result, calls) {
+     const { error } = result;
+@@ -431,6 +431,14 @@ export async function executeCodemode(toolCallId, input, signal, onUpdate, ctx,
+     const startedAt = performance.now();
+     const { code, options: sourceOptions } = parseCodemodeSource(input.code);
+     const calls = [];
++    const pendingCalls = new Set();
++    const track = (run) => {
++        const pending = run();
++        pendingCalls.add(pending);
++        const finish = () => pendingCalls.delete(pending);
++        void pending.then(finish, finish);
++        return pending;
++    };
+     // Usage of the script's `models.*` calls. Nested tool calls report theirs through the session.
+     let modelUsage;
+     // Images returned by `models.generateImages()`, to notice a script that never shows them.
+@@ -452,7 +460,7 @@ export async function executeCodemode(toolCallId, input, signal, onUpdate, ctx,
+     const sandboxTools = callable.map((tool) => ({
+         name: tool.name,
+         description: samples.get(tool.name),
+-        execute: async (args, { signal: callSignal }) => {
++        execute: (args, { signal: callSignal }) => track(async () => {
+             const record = {
+                 id: `${toolCallId}/?`,
+                 name: tool.name,
+@@ -469,7 +477,7 @@ export async function executeCodemode(toolCallId, input, signal, onUpdate, ctx,
+             record.id = outcome.toolCall.id;
+             record.durationMs = performance.now() - callStartedAt;
+             if (outcome.isError) {
+-                record.status = callSignal.aborted ? "cancelled" : "error";
++                record.status = signal?.aborted ? "cancelled" : "error";
+                 record.error = truncateText(textOf(outcome.result) || `Tool "${tool.name}" failed`, ERROR_PREVIEW_CHARS);
+             }
+             else {
+@@ -477,7 +485,7 @@ export async function executeCodemode(toolCallId, input, signal, onUpdate, ctx,
+             }
+             publish();
+             return toScriptValue(tool, outcome);
+-        },
++        }),
+     }));
+     // The wait for a worker counts toward the script's deadline.
+     const deadline = sourceOptions.timeoutMs ?? Number.POSITIVE_INFINITY;
+@@ -537,12 +545,23 @@ export async function executeCodemode(toolCallId, input, signal, onUpdate, ctx,
+             releaseCodemodeWorker();
+         }
+     }
+-    // Calls still marked running were cut off by the script ending, a timeout, or an abort.
+-    for (const call of calls) {
+-        if (call.status === "running")
+-            call.status = "cancelled";
++    const remainingMs = deadline - (performance.now() - startedAt);
++    if (pendingCalls.size && !signal?.aborted && remainingMs > 0) {
++        await new Promise((resolve) => {
++            let timer;
++            const finish = () => {
++                clearTimeout(timer);
++                signal?.removeEventListener("abort", finish);
++                resolve();
++            };
++            if (Number.isFinite(remainingMs)) timer = setTimeout(finish, remainingMs);
++            signal?.addEventListener("abort", finish, { once: true });
++            void Promise.allSettled([...pendingCalls]).then(finish);
++        });
+     }
+     const scriptOutput = [...result.output];
++    if (calls.some((call) => call.status === "running"))
++        scriptOutput.push({ type: "text", text: "Some tool results are still unknown. Check the outside state before repeating an action." });
+     if (result.ok) {
+         const { set, delete: deleted } = result.storeWrites;
+         if (Object.keys(set).length > 0 || deleted.length > 0) {

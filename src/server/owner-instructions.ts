@@ -186,8 +186,6 @@ export async function captureOwnerInstructions(
       evidence: OwnerInstructions;
       authorizingIds: string[];
       words: TrustWords;
-      confirmationReply?: { reply: string; confirmation: string; status: string };
-      shortNeedsApproval?: boolean;
     }
   | undefined
 > {
@@ -265,14 +263,6 @@ export async function captureOwnerInstructions(
       ? users[0]
       : users.find((row) => row.can_authorize);
   if (!latest) return undefined;
-  const confirmationReply =
-    current && current.approval_status !== null && current.confirmation !== null
-      ? {
-          reply: current.text,
-          confirmation: current.confirmation,
-          status: current.approval_status,
-        }
-      : undefined;
   const answered = (
     taskId
       ? await pool.query<{ id: string; text: string; presentation: unknown }>(
@@ -286,8 +276,7 @@ export async function captureOwnerInstructions(
                ORDER BY a.created_at DESC,a.id DESC LIMIT 1)
              SELECT id,text,presentation FROM answered WHERE (EXISTS (SELECT 1 FROM turns u WHERE u.owner_id=$1 AND u.id=answered.turn_id AND to_jsonb(u)->>'task_id'=$4::text)
                OR EXISTS (SELECT 1 FROM tasks t WHERE t.id=$4::uuid AND t.owner_id=$1 AND t.message_id=answered.id))
-               AND NOT ${withdrawnSql('answered')}
-               AND NOT EXISTS (SELECT 1 FROM approvals p WHERE p.owner_id=$1 AND p.confirmation_message_id=answered.id)`,
+               AND NOT ${withdrawnSql('answered')}`,
           [ownerId, threadId, latest.id, taskId, since],
         )
       : await pool.query<{ id: string; text: string; presentation: unknown }>(
@@ -301,8 +290,7 @@ export async function captureOwnerInstructions(
                    AND EXISTS (SELECT 1 FROM turns c WHERE c.id=m.turn_id AND c.owner_id=$1 AND c.channel=latest.channel)))
                  AND m.turn_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM turns u WHERE u.owner_id=$1 AND u.id=m.turn_id AND to_jsonb(u)->>'task_id' IS NOT NULL)
                ORDER BY m.created_at DESC,m.id DESC LIMIT 1)
-             SELECT id,text,presentation FROM answered WHERE NOT ${withdrawnSql('answered')}
-               AND NOT EXISTS (SELECT 1 FROM approvals p WHERE p.owner_id=$1 AND p.confirmation_message_id=answered.id)`,
+             SELECT id,text,presentation FROM answered WHERE NOT ${withdrawnSql('answered')}`,
           [ownerId, threadId, latest.id, since],
         )
   ).rows[0];
@@ -334,10 +322,6 @@ export async function captureOwnerInstructions(
       })),
       ...(before ? { assistantMessageBeforeLatestUserMessage: before.text } : {}),
     },
-    ...(confirmationReply ? { confirmationReply } : {}),
-    ...(current && (current.reaction || bareConfirmationAnswer(current.text))
-      ? { shortNeedsApproval: true }
-      : {}),
   };
 }
 

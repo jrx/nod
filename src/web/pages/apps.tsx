@@ -487,6 +487,23 @@ export function Apps({
       if (!request.signal.aborted) setBusy('');
     }
   }
+  async function rename(service: string, name: string) {
+    const renamed = await api<{ name: string }>(`/api/apps/mcp/${encodeURIComponent(service)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name }),
+      signal: AbortSignal.timeout(15000),
+    });
+    update(
+      (current) =>
+        current?.map((connection) =>
+          connection.slug === service && connection.canRename
+            ? { ...connection, name: renamed.name }
+            : connection,
+        ) ?? null,
+    );
+    void refresh();
+  }
+
   function restoreAppFocus() {
     const button = Array.from(
       page.current?.querySelectorAll<HTMLButtonElement>(
@@ -500,7 +517,7 @@ export function Apps({
     setPointerRestoredService(
       !manageKeyboard.current && button?.dataset.manageService ? dialogService.current : null,
     );
-    button?.focus({ preventScroll: true });
+    (button ?? appSearch.current)?.focus({ preventScroll: true });
   }
 
   function cards(items: typeof groups, catalogCards = false) {
@@ -845,6 +862,7 @@ export function Apps({
         onClose={() => setManageService(null)}
         onConnect={(account, addAccount) => void connect(account, 'manage', addAccount)}
         onDisconnect={disconnect}
+        onRename={managed?.service.canRename ? rename : undefined}
         onRestoreFocus={restoreAppFocus}
         onKeyboard={() => {
           manageKeyboard.current = true;

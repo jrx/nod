@@ -164,7 +164,9 @@ const bySlug = (a: Entry, b: Entry) => a.slug.localeCompare(b.slug);
 export const locate = (tree: Tree, target: string) =>
   tree.entries.find((entry) => pathOf(entry) === target);
 export const fold = (value: string) =>
-  value.normalize('NFD').replace(/\p{M}/gu, '').replace(/\s+/g, ' ').toLowerCase();
+  value.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/\s+/g, ' ').toLowerCase();
+export const foldQuote = (value: string) =>
+  fold(value.replace(/[“”«»„‟]/g, '"').replace(/[‘’‚‛‹›]/g, "'"));
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
 const cjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
 const tokens = (value: string) =>
@@ -398,7 +400,7 @@ export function view(
   const sources = (entry: Entry) =>
     entry.sources.map((id) => {
       const found = source(id);
-      return entry.quote && found.text && fold(found.text).includes(fold(entry.quote))
+      return entry.quote && found.text && foldQuote(found.text).includes(foldQuote(entry.quote))
         ? { ...found, quote: entry.quote }
         : found;
     });

@@ -1,8 +1,3 @@
-import {
-  hasOwnerInstructions,
-  validateOwnerInstructions,
-  type OwnerInstructions,
-} from './owner-instructions.ts';
 import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, type BigIntStats, type Stats } from 'node:fs';
@@ -35,6 +30,8 @@ import type { Trash } from '../ports/trash.ts';
 import { fileBytes, fileMimeType } from '../shared/files.ts';
 import { workspaceFileReference } from './integration-files.ts';
 import { IntegrationError } from './integration-connection.ts';
+import { addKeepOut, removeKeepOut } from './keep-out.ts';
+import { assertStartedByOwner as startedByOwner } from './owner-started.ts';
 
 const readBytes = 256 * 1024;
 const writeBytes = 1024 * 1024;
@@ -268,41 +265,12 @@ export function createLocalFiles(
   }
 
   async function assertStartedByOwner(turn: Turn | undefined, database: Query = pool) {
-    const { rows } = turn
-      ? await database.query<{
-          id: string;
-          source: string;
-          message_id: string | null;
-          proactive: boolean;
-        }>(
-          `WITH RECURSIVE lineage AS (
-            SELECT id,parent_turn_id,source,message_id,proactive,0 AS depth FROM turns WHERE id=$1 AND owner_id=$2 AND thread_id=$3
-            UNION ALL SELECT p.id,p.parent_turn_id,p.source,p.message_id,p.proactive,c.depth+1 FROM turns p JOIN lineage c ON c.parent_turn_id=p.id WHERE p.owner_id=$2 AND p.thread_id=$3 AND c.depth<100
-          ) SELECT id,source,message_id,bool_or(proactive) OVER () AS proactive FROM lineage ORDER BY depth DESC LIMIT 1`,
-          [turn.turnId, ownerId, turn.threadId],
-        )
-      : { rows: [] };
-    const root = rows[0];
-    const schedule =
-      root?.source === 'schedule'
-        ? (
-            await database.query<{ authority: OwnerInstructions | null }>(
-              'SELECT authority FROM schedule_runs WHERE turn_id=$1 AND owner_id=$2',
-              [root.id, ownerId],
-            )
-          ).rows[0]
-        : undefined;
-    const owned =
-      root &&
-      !root.proactive &&
-      ((root.source === 'user' && root.message_id) || hasOwnerInstructions(schedule?.authority));
-    if (owned && schedule?.authority)
-      await validateOwnerInstructions(database, ownerId, schedule.authority);
-    if (!owned)
-      throw new IntegrationError(
-        "Local files only open in work the owner started: a message, or a schedule the owner set up. Nod didn't touch any file.",
-        403,
-      );
+    await startedByOwner(
+      database,
+      ownerId,
+      turn,
+      "Local files only open in work the owner started: a message, or a schedule the owner set up. Nod didn't touch any file.",
+    );
   }
 
   async function resolvedAsFarAsItExists(path: string) {
@@ -321,30 +289,11 @@ export function createLocalFiles(
     const input = absolute.safeParse(typeof path === 'string' ? path.trim() : path);
     if (!input.success) throw new IntegrationError('Name the absolute path to keep Nod out of.');
     const real = await resolvedAsFarAsItExists(nodePath.resolve(input.data));
-    const current = await keptOut(database);
-    if (current.includes(real)) return current;
-    if (current.length >= keepOutLimit)
-      throw new IntegrationError(
-        `The keep-out list already has ${keepOutLimit} folders. The owner can remove some in Settings.`,
-        409,
-      );
-    const { rows } = await database.query<{ local_keep_out: string[] }>(
-      `INSERT INTO preferences(owner_id,local_keep_out) VALUES($1,ARRAY[$2]::text[])
-       ON CONFLICT(owner_id) DO UPDATE SET local_keep_out=CASE WHEN $2=ANY(preferences.local_keep_out)
-         THEN preferences.local_keep_out ELSE array_append(preferences.local_keep_out,$2) END
-       RETURNING local_keep_out`,
-      [ownerId, real],
-    );
-    return rows[0]!.local_keep_out;
+    return addKeepOut(database, ownerId, 'local_keep_out', real, keepOutLimit, 'folders');
   }
 
-  async function letIn(path: string) {
-    const { rows } = await pool.query<{ local_keep_out: string[] }>(
-      `UPDATE preferences SET local_keep_out=array_remove(local_keep_out,$2)
-       WHERE owner_id=$1 RETURNING local_keep_out`,
-      [ownerId, path],
-    );
-    return rows[0]?.local_keep_out ?? [];
+  function letIn(path: string) {
+    return removeKeepOut(pool, ownerId, 'local_keep_out', path);
   }
 
   function unavailable() {
@@ -853,7 +802,7 @@ export function createLocalFiles(
       let text: string;
       try {
         if (bytes.includes(0)) throw new Error();
-        text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
       } catch {
         throw new IntegrationError(`${path} is not a UTF-8 text file. Nothing was changed.`);
       }

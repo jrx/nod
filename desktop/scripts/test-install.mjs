@@ -6,7 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { setTimeout as wait } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assetHash, findRuntimeAssets, runtimeRelease } from '../runtime/assets.mjs';
-import { run } from './release-tools.mjs';
+import { copyAgentDesktop, run } from './release-tools.mjs';
 import { verifyApplicationRuntime } from './engine-source.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -179,6 +179,7 @@ async function build(source = '/Applications/Nod.app/Contents/Resources/engine')
   await mkdir(licenses);
   for (const file of ['LICENSE', 'LICENSES.chromium.html'])
     await cp(join(paths[0], file), join(licenses, file));
+  await copyAgentDesktop(built);
   await run(
     '/usr/bin/codesign',
     ['--force', '--deep', '--sign', '-', '--preserve-metadata=entitlements', built],

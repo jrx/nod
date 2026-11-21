@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { basename, resolve, sep } from 'node:path';
-import { loadSkills } from '@earendil-works/pi-coding-agent';
+import { loadSkills, parseFrontmatter } from '@earendil-works/pi-coding-agent';
 import type { SkillLibrary } from '../../ports/agent.ts';
 
 export function createSkillLibrary(
@@ -51,6 +51,15 @@ export function createSkillLibrary(
     );
   const enabled = skills.filter((skill) => !skill.disableModelInvocation);
   const byName = new Map(enabled.map((skill) => [skill.name, skill.baseDir]));
+  const toolsByName = new Map(
+    enabled.map((skill) => {
+      const { tools } = parseFrontmatter(readFileSync(skill.filePath, 'utf8')).frontmatter;
+      return [
+        skill.name,
+        [tools].flat().filter((tool): tool is string => typeof tool === 'string'),
+      ] as const;
+    }),
+  );
   return {
     core: excluded,
     catalog: enabled.map(({ name, description }) => ({ name, description: description.trim() })),
@@ -61,5 +70,6 @@ export function createSkillLibrary(
         throw new Error('Select a skill from the skill library.');
       return { name, file, content: readFileSync(checkedPath(base, file), 'utf8').trim() };
     },
+    tools: (name) => toolsByName.get(name) ?? [],
   };
 }

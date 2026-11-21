@@ -189,9 +189,11 @@ export function createLocalSpeechProvider(options: {
                 ? 'No speech was detected. Please record again.'
                 : reply.reason === 'length'
                   ? 'Keep local voice messages under five minutes.'
-                  : reply.reason === 'format'
-                    ? 'Local speech supports WebM, Ogg, MP3 and WAV recordings.'
-                    : 'Local speech failed. Try again.',
+                  : reply.reason === 'tokens'
+                    ? "This text exceeds the local voice's pronunciation limit. Try a shorter passage or a voice service that supports its language."
+                    : reply.reason === 'format'
+                      ? 'Local speech supports WebM, Ogg, MP3 and WAV recordings.'
+                      : 'Local speech failed. Try again.',
             ),
           );
         }

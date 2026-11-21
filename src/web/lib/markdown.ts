@@ -29,6 +29,13 @@ export function rehypeMessageBreaks() {
   };
 }
 
+export function rehypeDropBlankMessage() {
+  return (tree: Root) => {
+    if (tree.children.every((child) => child.type === 'text' && /^[\t\n\f\r ]*$/.test(child.value)))
+      tree.children = [];
+  };
+}
+
 function unlinkCode(node: Element) {
   node.children = node.children.flatMap((child) => {
     if (child.type !== 'element') return [child];

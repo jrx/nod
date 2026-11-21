@@ -28,6 +28,8 @@ Notes come only from your own messages and what you write or paste in **Settings
 
 Background saves and facts you mention in passing are silent: Nod doesn't post a notice in chat. Only an explicit request to remember gets a short confirmation.
 
+When you ask Nod to save a note or a skill, the memory model can continue while that request is active. A slow reply does not stop at 45 seconds. **Stop** cancels preparation and prevents a late reply from saving anything. The model service still has its own request limits.
+
 ## Skills Nod learns
 
 After a task that took several steps or a workaround, Nod writes down how it did it: the steps on that site or app, the gotchas and what to check at the end. The next time the same job comes up, it follows its own skill instead of working it out again. When a site changes, Nod fixes the skill. Nod saves skills only while **Save new notes** is on, and not for a task you ask it not to remember.

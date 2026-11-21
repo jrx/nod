@@ -37,6 +37,8 @@ flowchart TD
 
 Messages and schedule fires become turns in PostgreSQL with a `thread-drain` job. App events and source checks feed one observer through a saved source queue. The worker picks up the job and asks the runtime to run a turn. The runtime opens a Pi agent session, and Pi calls tools that act in the workspace, the browser and your connected apps.
 
+The web client reads saved chat state after a server update. A new update during a read queues one more read. It does not cancel the active read, so frequent updates cannot keep saved replies or approval cards from appearing. A read stops after 15 seconds and shows a timeout error. A queued read can then run. A conversation reset or account change still blocks old replies.
+
 ## Main ideas
 
 <CardGrid>
@@ -74,7 +76,8 @@ For calendar plans, Pi uses availability tools when available and code for durat
   - providers/ vendor SDKs and protocols, such as Pi, Docker, agent-browser and Composio
   - runtime/ the agent's tools, prompts and turn loop
   - server/ policy, storage and HTTP
-    - composition.ts the only place that selects providers and implementations
+    - composition.ts selects providers and implementations
+    - feedback-delivery.ts selects only feedback delivery for normal startup and startup reports
   - shared/ browser-safe types for the server and the client
   - web/ the React client
 - scripts/
@@ -84,16 +87,20 @@ For calendar plans, Pi uses availability tools when available and code for durat
 
 [`scripts/check-architecture.mjs`](https://github.com/n8n-io/nod/blob/main/scripts/check-architecture.mjs) runs as part of `pnpm run check`. It fails when an import crosses a boundary:
 
-| Folder      | Can import from                                                                            |
-| ----------- | ------------------------------------------------------------------------------------------ |
-| `web`       | `web`, `shared`                                                                            |
-| `shared`    | `shared`                                                                                   |
-| `ports`     | `ports`, `shared`                                                                          |
-| `runtime`   | `runtime`, `ports`, `shared`                                                               |
-| `providers` | `providers`, `ports`, `shared`                                                             |
-| `server`    | `server`, `ports`, `shared`. Only `composition.ts` also imports `runtime` and `providers`. |
+| Folder      | Can import from                                                                                                                                               |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `web`       | `web`, `shared`                                                                                                                                               |
+| `shared`    | `shared`                                                                                                                                                      |
+| `ports`     | `ports`, `shared`                                                                                                                                             |
+| `runtime`   | `runtime`, `ports`, `shared`                                                                                                                                  |
+| `providers` | `providers`, `ports`, `shared`                                                                                                                                |
+| `server`    | `server`, `ports`, `shared`. `composition.ts` also imports `runtime` and `providers`. The startup feedback exception below is limited to one provider import. |
 
-The same check keeps vendor packages (Pi, Composio, chat adapters and agent-browser) inside `providers`. It also stops `runtime`, `ports`, `shared` and `web` from reading `process.env`. Configuration belongs in [`src/server/composition.ts`](https://github.com/n8n-io/nod/blob/main/src/server/composition.ts).
+The same check keeps vendor packages (Pi, Composio, chat adapters and agent-browser) inside `providers`. It also stops `runtime`, `ports`, `shared` and `web` from reading `process.env`. Configuration belongs in [`src/server/composition.ts`](https://github.com/n8n-io/nod/blob/main/src/server/composition.ts), with the feedback-only exception below.
+
+The desktop startup report helper (`desktop/main/feedback.mjs`) uses the same feedback factory as normal composition: `src/server/feedback-delivery.ts`. This factory imports only the n8n feedback provider and its port type. It reads only the `NOD_FEEDBACK_*` values from the environment it receives. It does not load `.env`, the server configuration module, the database, or the runtime. The import check permits this one provider import so a failed engine can still report its startup failure. No other provider selection moves out of `composition.ts`.
+
+Desktop main uses `src/shared/environment-secrets.mjs` and `src/shared/literal-masks.mjs` for local error text. These pure modules take values as input. They do not read configuration files or choose a provider. Exported startup reports use `src/shared/startup-feedback-facts.mjs` instead: a strict projection of fixed states, event choices, error classes and codes, counts and ages. `feedbackTechnicalContext` in `src/server/feedback-context.ts` normalizes app versions and release values. The startup report omits all startup prose. It reads only data properties and does not call getters or serializers. The helper projects the facts again before review. Normal feedback keeps its own redaction flow.
 
 ## In this section
 

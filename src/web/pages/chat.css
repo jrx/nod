@@ -485,6 +485,14 @@
   line-height: 1.5;
   overflow-wrap: anywhere;
 }
+.chat-page .working-text > div:not([hidden]),
+.chat-page .working-text > .live-line-current,
+.chat-page .working-details > .message-work {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  margin: 0;
+}
 .chat-page .working-text .live-line-current {
   background: linear-gradient(
     100deg,
@@ -921,6 +929,13 @@ button.message-work:is(:hover, :focus-visible) {
 .chat-page .message-attachments {
   margin-bottom: 8px;
 }
+.chat-page
+  .message-assistant
+  .message-body
+  > :is(.message-text:not(:empty), .action-card)
+  + .message-attachments {
+  margin-top: 8px;
+}
 .chat-page .message-bubble:has(.audio-player) {
   min-width: min(350px, calc(100% - 40px));
 }
@@ -1279,13 +1294,6 @@ button.message-work:is(:hover, :focus-visible) {
 .artifact-retained[hidden],
 .artifact-drawer[hidden] {
   display: none;
-}
-.artifact-drawer-title select {
-  max-width: 100%;
-  font: inherit;
-  color: inherit;
-  background: transparent;
-  border: 0;
 }
 .inline-name {
   font: inherit;

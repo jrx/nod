@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync, type BigIntStats } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -25,6 +25,7 @@ import { tmpdir } from 'node:os';
 import { PassThrough } from 'node:stream';
 import { basename, join } from 'node:path';
 import test from 'node:test';
+import Fastify from 'fastify';
 import { promisify } from 'node:util';
 import { parse } from 'yaml';
 import type { WorkspaceSession } from '../src/ports/computer.ts';
@@ -48,6 +49,7 @@ import { prepareLocalDirectories } from '../scripts/local-database.ts';
 import { createSandbox } from '../src/providers/pi/sandbox.ts';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createLocalFiles, localFileRules } from '../src/server/local-files.ts';
+import { computerAppRule, createComputerUse, systemShortcut } from '../src/server/computer-use.ts';
 import { fileBytes } from '../src/shared/files.ts';
 import type { Pool } from 'pg';
 
@@ -638,6 +640,42 @@ test('an uncertain command is stopped once and the workspace keeps working', asy
   } finally {
     await docker.workspace.dispose();
     await Promise.allSettled([first, second]);
+  }
+});
+
+test('a command Nod stops at its output limit names the limit, and a Stop stays cancelled', async () => {
+  const docker = fakeDocker(async () => ({ code: 0 }));
+  try {
+    const flooding = docker.session.exec('flood');
+    await docker.launches[0]!.request;
+    const frame =
+      JSON.stringify({ type: 'stdout', data: Buffer.alloc(16384).toString('base64') }) + '\n';
+    for (let sent = 0; sent <= 16 * 1024 * 1024; sent += 16384)
+      docker.launches[0]!.child.stdout.emit('data', frame);
+    await docker.launches[0]!.cancelled;
+    docker.exit(0, -15, 'cancelled');
+    await assert.rejects(flooding, {
+      uncertain: false,
+      message: 'Workspace command output passed its 16 MB limit.',
+    });
+
+    const stop = new AbortController();
+    const stopped = docker.session.exec('stopped', { signal: stop.signal });
+    await docker.launches[1]!.request;
+    stop.abort();
+    await docker.launches[1]!.cancelled;
+    docker.exit(1, -15, 'cancelled');
+    await assert.rejects(stopped, { uncertain: false, message: 'Task cancelled.' });
+
+    const installing = docker.session.exec('install');
+    await docker.launches[2]!.request;
+    docker.exit(2, -15, 'install');
+    await assert.rejects(installing, {
+      uncertain: false,
+      message: 'The connected CLI install ran longer than its 600-second limit.',
+    });
+  } finally {
+    await docker.workspace.dispose();
   }
 });
 
@@ -1894,6 +1932,726 @@ test('local files stay in home, skip secrets and kept-out folders, and never ove
   } finally {
     await rm(base, { recursive: true, force: true });
   }
+});
+
+test('computer use refuses blocked apps, keeps browsers view-only and acts only on refs Nod showed', async () => {
+  for (const bundle of [
+    'com.apple.Terminal',
+    'com.googlecode.iterm2',
+    'com.apple.finder',
+    'com.apple.systempreferences',
+    'com.1password.1password',
+    'dev.nod.desktop',
+  ])
+    assert.equal(computerAppRule(bundle).kind, 'blocked', bundle);
+  for (const bundle of ['com.google.Chrome', 'com.apple.Safari', 'com.microsoft.VSCode'])
+    assert.equal(computerAppRule(bundle).kind, 'view', bundle);
+  for (const bundle of [
+    'C:\\Windows\\System32\\cmd.exe',
+    'CMD.EXE',
+    'powershell',
+    'WindowsTerminal.exe',
+    'explorer.exe',
+    'regedit',
+    'org.gnome.Terminal',
+    'org.gnome.Nautilus.desktop',
+    'gnome-control-center',
+    'io.n8n.Nod',
+  ])
+    assert.equal(computerAppRule(bundle).kind, 'blocked', bundle);
+  for (const bundle of ['msedge.exe', 'firefox', 'org.mozilla.firefox', 'code'])
+    assert.equal(computerAppRule(bundle).kind, 'view', bundle);
+  assert.equal(computerAppRule('notepad.exe').kind, 'use');
+  assert.equal(computerAppRule('C:\\Apps\\Slack\\slack.exe', ['slack']).kind, 'blocked');
+  for (const platform of ['win32', 'linux'])
+    for (const keys of ['win+r', 'super+a', 'alt+tab', 'ctrl+esc', 'ctrl+alt+t', 'ctrl+alt+delete'])
+      assert.equal(systemShortcut(keys, platform), true, `${platform} ${keys}`);
+  assert.equal(systemShortcut('alt+tab', 'darwin'), false);
+  assert.equal(systemShortcut('ctrl+alt+shift+t', 'linux'), true);
+  assert.equal(systemShortcut('alt+print+b', 'linux'), true);
+  assert.equal(systemShortcut('ctrl+shift+t', 'linux'), false);
+  assert.equal(systemShortcut('ctrl+n', 'win32'), false);
+  assert.equal(systemShortcut('cmd+n', 'darwin'), false);
+  assert.equal(systemShortcut('cmd+cmd+space', 'darwin'), true);
+  assert.equal(systemShortcut('ctrl+ctrl+up', 'darwin'), true);
+  assert.equal(systemShortcut('c m d+space', 'darwin'), true);
+  assert.equal(systemShortcut('cmd+shift+space', 'darwin'), true);
+  assert.equal(systemShortcut('cmd+n', 'linux'), true);
+  assert.equal(computerAppRule('com.apple.iWork.Numbers').kind, 'use');
+  assert.equal(
+    computerAppRule('com.apple.iWork.Numbers', ['com.apple.iWork.Numbers']).kind,
+    'blocked',
+  );
+
+  let source = 'user';
+  let proactive = false;
+  let root = 'root-turn';
+  const pool = {
+    query: async (sql: string) => {
+      if (sql.startsWith('SELECT computer_use'))
+        return { rows: [{ computer_use: true, computer_keep_out: [] }] };
+      if (sql.startsWith('WITH RECURSIVE'))
+        return { rows: [{ id: root, source, message_id: 'message', proactive }] };
+      assert.fail(`Unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const calls: Array<Record<string, unknown>> = [];
+  const apps = [
+    {
+      pid: 11,
+      bundle: 'com.apple.TextEdit',
+      name: 'TextEdit',
+      windows: [{ id: 'w-1', title: 'Draft' }],
+    },
+    {
+      pid: 12,
+      bundle: 'com.google.Chrome',
+      name: 'Chrome',
+      windows: [{ id: 'w-2', title: 'Inbox' }],
+    },
+    {
+      pid: 13,
+      bundle: 'com.apple.Terminal',
+      name: 'Terminal',
+      windows: [{ id: 'w-3', title: 'zsh' }],
+    },
+  ];
+  const window: { role: string; name: string; children: Array<Record<string, unknown>> } = {
+    role: 'window',
+    name: 'Draft',
+    children: [
+      { role: 'button', name: 'Send', ref_id: '@sdraft01:e1', available_actions: ['Click'] },
+      { role: 'textfield', name: 'Subject', value: 'Hi', ref_id: '@sdraft01:e2' },
+      { role: 'textfield', ref_id: '@sdraft01:e3', states: ['secure', 'focused'], value: null },
+      { role: 'securetextfield', name: 'PIN', ref_id: '@sdraft01:e4' },
+      { role: 'textarea', name: 'Notes', ref_id: '@sdraft01:e5' },
+      { role: 'textfield', ref_id: '@sdraft01:e6', value: '' },
+      { role: 'textfield', ref_id: '@sdraft01:e7', value: '' },
+    ],
+  };
+  const menuBar = {
+    role: 'menu',
+    children: [
+      {
+        role: 'menuitem',
+        name: 'Apple',
+        children: [{ role: 'menuitem', name: 'Restart…', ref_id: '@smenu001:e1' }],
+      },
+      {
+        role: 'menuitem',
+        name: 'TextEdit',
+        children: [{ role: 'menuitem', name: 'Services', ref_id: '@smenu001:e3' }],
+      },
+      {
+        role: 'menuitem',
+        name: 'File',
+        children: [{ role: 'menuitem', name: 'New', ref_id: '@smenu001:e2' }],
+      },
+    ],
+  };
+  const findings: Array<Record<string, unknown>> = [
+    { role: 'textfield', name: 'Message to Ada', ref_id: '@sfind001:e1', value: '' },
+    { role: 'textfield', name: 'Password', ref_id: '@sfind001:e2', states: ['secure'] },
+  ];
+  const computer = createComputerUse(pool, 'owner', {
+    platform: 'darwin',
+    desktop: {
+      request: async (request) => {
+        calls.push(request);
+        if (request.op === 'apps') return { apps };
+        if (request.op === 'locate') {
+          const found = apps.find((app) => app.bundle === request.bundle);
+          if (!found) throw new Error('No app with that bundle ID is installed.');
+          return { bundle: found.bundle, name: found.name };
+        }
+        if (request.op === 'snapshot' && request.ref)
+          return {
+            tree: [
+              ...window.children,
+              ...findings,
+              ...menuBar.children.flatMap((node) => node.children),
+            ].find((node) => node.ref_id === request.ref),
+          };
+        if (request.op === 'inspect') {
+          const tree = request.menu
+            ? { ...menuBar, children: menuBar.children.slice(2) }
+            : { ...window, children: [...window.children, ...findings] };
+          return {
+            tree,
+            state: createHash('sha256').update(JSON.stringify(tree)).digest('hex'),
+            focus: createHash('sha256').update('synthetic-focus').digest('hex'),
+            focused: [],
+            ...(request.menu ? { incomplete: true } : {}),
+          };
+        }
+        if (request.op === 'snapshot')
+          return {
+            tree: request.menu
+              ? menuBar
+              : request.app === 'Chrome'
+                ? {
+                    role: 'window',
+                    children: [{ role: 'button', name: 'Compose', ref_id: '@schrome1:e1' }],
+                  }
+                : window,
+          };
+        if (request.op === 'screenshot') return { image: 'synthetic' };
+        if (request.op === 'find') return { matches: findings };
+        if (request.text === 'cut off')
+          throw new Error('ACTION_FAILED: the app stopped answering after the text arrived');
+        if (request.op === 'type' || request.op === 'set_value') {
+          const node = [...window.children, ...findings].find(
+            (node) => node.ref_id === request.ref,
+          )!;
+          node.value = (request.op === 'type' ? String(node.value ?? '') : '') + request.text;
+        }
+        return { disposition: { delivery: 'delivered_verified' } };
+      },
+    },
+  });
+  const turn = { turnId: 'turn', threadId: 'thread' };
+
+  source = 'event';
+  await assert.rejects(computer.prepare(turn, 'COMPUTER_APPS', {}), /work the owner started/);
+  source = 'user';
+  proactive = true;
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 11 }),
+    /work the owner started/,
+  );
+  proactive = false;
+  assert.equal(calls.length, 0);
+
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_OPEN', { bundle: 'com.apple.Terminal' }),
+    /never uses it/,
+  );
+  await assert.rejects(computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 11 }), /open \{bundle/);
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' }),
+    /no snapshot with that ref/,
+  );
+  await computer.execute(
+    turn,
+    'COMPUTER_OPEN',
+    await computer.prepare(turn, 'COMPUTER_OPEN', { bundle: 'com.apple.TextEdit' }),
+  );
+  assert.ok(!calls.some((call) => call.op === 'open'));
+  const listed = (await computer.execute(turn, 'COMPUTER_APPS', {})) as {
+    apps: Array<Record<string, unknown>>;
+  };
+  assert.deepEqual(
+    listed.apps.find((app) => app.pid === 13),
+    { pid: 13, bundle: 'com.apple.Terminal', name: 'Terminal', blocked: 'a terminal' },
+  );
+  assert.equal(listed.apps.find((app) => app.pid === 12)?.windows, undefined);
+
+  const snapshot = (await computer.execute(
+    turn,
+    'COMPUTER_SNAPSHOT',
+    await computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 11 }),
+  )) as { tree: string };
+  assert.match(snapshot.tree, /button "Send" @sdraft01:e1/);
+  assert.match(snapshot.tree, /\[password, hidden\]/);
+  assert.doesNotMatch(snapshot.tree, /@sdraft01:e3/);
+  const menu = (await computer.execute(
+    turn,
+    'COMPUTER_SNAPSHOT',
+    await computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 11, menu: true }),
+  )) as { tree: string };
+  assert.doesNotMatch(menu.tree, /Restart/);
+  const windows = apps[0]!.windows;
+  apps[0]!.windows = [];
+  const firstDocument = await computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@smenu001:e2' });
+  assert.equal(firstDocument.windowBinding?.menu, true);
+  assert.doesNotMatch(String(firstDocument.windowContext), /Restart|Services/);
+  assert.equal(computer.checked('COMPUTER_PRESS', firstDocument).windowContextIncomplete, true);
+  assert.deepEqual(calls.findLast((call) => call.op === 'inspect')?.control, {
+    role: 'menuitem',
+    name: 'New',
+  });
+  await computer.execute(turn, 'COMPUTER_PRESS', firstDocument);
+  assert.equal(calls.at(-1)?.menu, true);
+  apps[0]!.windows = windows;
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@smenu001:e1' }),
+    /no snapshot with that ref/,
+  );
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_SET_VALUE', { ref: '@sdraft01:e3', text: 'x' }),
+    /no snapshot with that ref/,
+  );
+  await assert.rejects(
+    computer.execute(
+      turn,
+      'COMPUTER_SCREENSHOT',
+      await computer.prepare(turn, 'COMPUTER_SCREENSHOT', { pid: 11 }),
+    ),
+    /password field has focus/,
+  );
+
+  findings.push({ role: 'statictext', name: 'x'.repeat(25_000) });
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' }),
+    /size limit/,
+  );
+  findings.pop();
+  const press = await computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' });
+  assert.equal(computer.needsCheck('COMPUTER_PRESS', press), true);
+  assert.deepEqual(computer.checked('COMPUTER_PRESS', press), {
+    app: { bundle: 'com.apple.TextEdit', name: 'TextEdit' },
+    control: { role: 'button', name: 'Send', window: 'Draft' },
+    windowContext: press.windowContext,
+    step: 'press',
+  });
+  await computer.execute(turn, 'COMPUTER_PRESS', press);
+  assert.deepEqual(calls.at(-1), {
+    op: 'press',
+    ref: '@sdraft01:e1',
+    app: 'TextEdit',
+    role: 'button',
+    control: { role: 'button', name: 'Send' },
+    expected: press.windowBinding!.state,
+    window: 'w-1',
+  });
+  const found = (await computer.execute(
+    turn,
+    'COMPUTER_FIND',
+    await computer.prepare(turn, 'COMPUTER_FIND', { pid: 11, role: 'textfield' }),
+  )) as { matches: string };
+  assert.match(found.matches, /textfield "Message to Ada" @sfind001:e1/);
+  assert.doesNotMatch(found.matches, /@sfind001:e2/);
+  assert.deepEqual(calls.at(-1), { op: 'find', app: 'TextEdit', window: 'w-1', role: 'textfield' });
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_TYPE', { ref: '@sfind001:e2', text: 'x' }),
+    /no snapshot with that ref/,
+  );
+  await computer.prepare(turn, 'COMPUTER_TYPE', { ref: '@sfind001:e1', text: 'Hi Ada' });
+  const typed = await computer.prepare(turn, 'COMPUTER_SET_VALUE', {
+    ref: '@sdraft01:e2',
+    text: 'Hello',
+  });
+  assert.equal(computer.needsCheck('COMPUTER_SET_VALUE', typed), true);
+  assert.equal(
+    (computer.checked('COMPUTER_SET_VALUE', typed) as Record<string, unknown>).replacesText,
+    true,
+  );
+  const filling = await computer.prepare(turn, 'COMPUTER_SET_VALUE', {
+    ref: '@sfind001:e1',
+    text: 'Hello',
+  });
+  assert.equal(computer.needsCheck('COMPUTER_SET_VALUE', filling), true);
+  findings[0]!.value = 'Ada wrote this';
+  await assert.rejects(
+    computer.execute(turn, 'COMPUTER_SET_VALUE', filling),
+    (error: Error & { notRun?: boolean }) =>
+      error.notRun === true && /window changed/.test(error.message),
+  );
+  findings[0]!.value = '';
+  const line = await computer.prepare(turn, 'COMPUTER_TYPE', {
+    ref: '@sdraft01:e2',
+    text: 'Hello\n',
+  });
+  assert.equal(computer.needsCheck('COMPUTER_TYPE', line), true);
+
+  const subject = window.children[1]!;
+  const intoSubject = await computer.prepare(turn, 'COMPUTER_TYPE', {
+    ref: '@sdraft01:e2',
+    text: 'Hi',
+  });
+  subject.states = ['secure'];
+  await assert.rejects(
+    computer.execute(turn, 'COMPUTER_TYPE', intoSubject),
+    (error: Error & { notRun?: boolean }) =>
+      error.notRun === true && /password fields/.test(error.message),
+  );
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_SET_VALUE', { ref: '@sdraft01:e2', text: 'x' }),
+    /password fields/,
+  );
+  delete subject.states;
+  const before = calls.length;
+  await assert.rejects(
+    computer.execute(
+      turn,
+      'COMPUTER_KEY',
+      await computer.prepare(turn, 'COMPUTER_KEY', { pid: 11, keys: 'cmd+v' }),
+    ),
+    (error: Error & { notRun?: boolean }) =>
+      error.notRun === true && /sent no keys/.test(error.message),
+  );
+  assert.ok(!calls.slice(before).some((call) => call.op === 'key'));
+
+  await computer.execute(
+    turn,
+    'COMPUTER_TYPE',
+    await computer.prepare(turn, 'COMPUTER_TYPE', {
+      ref: '@sfind001:e1',
+      text: 'Ada, see you at 10',
+    }),
+  );
+  const send = await computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' });
+  assert.match(
+    String(computer.checked('COMPUTER_PRESS', send).windowContext),
+    /Ada, see you at 10/,
+  );
+  await computer.execute(
+    turn,
+    'COMPUTER_TYPE',
+    await computer.prepare(turn, 'COMPUTER_TYPE', { ref: '@sfind001:e1', text: ' and bring Bo' }),
+  );
+  await assert.rejects(
+    computer.execute(turn, 'COMPUTER_PRESS', send),
+    (error: Error & { notRun?: boolean }) =>
+      error.notRun === true && /window changed/.test(error.message),
+  );
+  await assert.rejects(
+    computer.execute(
+      turn,
+      'COMPUTER_TYPE',
+      await computer.prepare(turn, 'COMPUTER_TYPE', { ref: '@sdraft01:e2', text: 'cut off' }),
+    ),
+    /stopped answering/,
+  );
+  const body = findings[0]!;
+  body.value = 'a'.repeat(2500);
+  const longSend = await computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' });
+  assert.match(String(computer.checked('COMPUTER_PRESS', longSend).windowContext), /a{2500}/);
+  body.value += ' Changed after approval';
+  await assert.rejects(computer.execute(turn, 'COMPUTER_PRESS', longSend), /window changed/);
+  body.value = 'b'.repeat(24_001);
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' }),
+    /complete window/,
+  );
+  body.value = 'Current message';
+  const recipient = window.children[5]!;
+  recipient.value = 'ana@example.test';
+  const addressed = await computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' });
+  assert.match(
+    String(computer.checked('COMPUTER_PRESS', addressed).windowContext),
+    /ana@example.test/,
+  );
+  recipient.value = 'bo@example.test';
+  await assert.rejects(computer.execute(turn, 'COMPUTER_PRESS', addressed), /window changed/);
+  const replacing = await computer.prepare(turn, 'COMPUTER_TYPE', {
+    ref: '@sfind001:e1',
+    text: 'Replacement',
+  });
+  assert.equal(computer.needsCheck('COMPUTER_TYPE', replacing), true);
+  assert.equal(replacing.replacesText, true);
+  const renamed = await computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' });
+  window.children[0]!.name = 'Delete';
+  await assert.rejects(computer.execute(turn, 'COMPUTER_PRESS', renamed), /control changed/);
+  window.children[0]!.name = 'Send';
+  findings[0]!.role = 'group';
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_TYPE', { ref: '@sfind001:e1', text: 'Hi' }),
+    (error: Error & { notRun?: boolean }) => /control changed/.test(error.message),
+  );
+  findings[0]!.role = 'textfield';
+
+  await computer.execute(
+    turn,
+    'COMPUTER_OPEN',
+    await computer.prepare(turn, 'COMPUTER_OPEN', { bundle: 'com.google.Chrome' }),
+  );
+  await computer.execute(
+    turn,
+    'COMPUTER_SNAPSHOT',
+    await computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 12 }),
+  );
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_KEY', { pid: 12, keys: 'cmd+n' }),
+    /can only look at it/,
+  );
+
+  assert.doesNotMatch(menu.tree, /Services/);
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 11, ref: '@smenu001:e3' }),
+    /no snapshot with that ref/,
+  );
+  assert.doesNotMatch(snapshot.tree, /@sdraft01:e4/);
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_KEY', { pid: 11, keys: 'Command+Space' }),
+    /system shortcut/,
+  );
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_KEY', { pid: 11, keys: 'cmd+opt+escape' }),
+    /system shortcut/,
+  );
+  const chromeSnapshot = (await computer.execute(
+    turn,
+    'COMPUTER_SNAPSHOT',
+    await computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 12 }),
+  )) as { tree: string };
+  const chromeRef = chromeSnapshot.tree.match(/(@[a-z0-9]+:e\d+)/)![1]!;
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 11, ref: chromeRef }),
+    /not part of TextEdit/,
+  );
+  const pressed = await computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' });
+  root = 'other-root';
+  await assert.rejects(
+    computer.execute(turn, 'COMPUTER_PRESS', pressed),
+    (error: Error & { notRun?: boolean }) => error.notRun === true,
+  );
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 11 }),
+    /hasn't opened TextEdit/,
+  );
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_PRESS', { ref: '@sdraft01:e1' }),
+    /no snapshot with that ref/,
+  );
+});
+
+test('turning computer use off cancels input waiting on a read, even if that read ignores cancellation', async () => {
+  let enabled = true;
+  const pool = {
+    query: async (sql: string, values: unknown[] = []) => {
+      if (sql.startsWith('SELECT computer_use'))
+        return { rows: [{ computer_use: enabled, computer_keep_out: [] }] };
+      if (sql.startsWith('WITH RECURSIVE'))
+        return { rows: [{ id: 'root', source: 'user', message_id: 'message', proactive: false }] };
+      if (sql.includes('INSERT INTO preferences')) {
+        enabled = Boolean(values[1]);
+        return { rows: [] };
+      }
+      assert.fail(`Unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const app = {
+    pid: 11,
+    bundle: 'com.example.Notes',
+    name: 'Notes',
+    windows: [{ id: 'w-1', title: 'Notes' }],
+  };
+  const node = { role: 'textfield', name: 'Notes', value: '', ref_id: '@snotes01:e1' };
+  let hold = false;
+  let release!: () => void;
+  let entered!: () => void;
+  const waiting = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const calls: string[] = [];
+  const computer = createComputerUse(pool, 'owner', {
+    platform: 'darwin',
+    desktop: {
+      request: async (request) => {
+        calls.push(request.op);
+        if (request.op === 'apps') return { apps: [app] };
+        if (request.op === 'inspect')
+          return {
+            tree: node,
+            state: createHash('sha256').update(JSON.stringify(node)).digest('hex'),
+          };
+        if (request.op === 'snapshot') {
+          if (hold && request.ref) {
+            entered();
+            await gate;
+          }
+          return { tree: node };
+        }
+        return {};
+      },
+    },
+  });
+  const server = Fastify();
+  computer.registerRoutes(server);
+  const turn = { turnId: 'turn', threadId: 'thread' };
+  try {
+    await computer.execute(
+      turn,
+      'COMPUTER_OPEN',
+      await computer.prepare(turn, 'COMPUTER_OPEN', { bundle: app.bundle }),
+    );
+    await computer.execute(
+      turn,
+      'COMPUTER_SNAPSHOT',
+      await computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: app.pid }),
+    );
+    const prepared = await computer.prepare(turn, 'COMPUTER_SET_VALUE', {
+      ref: node.ref_id,
+      text: 'New note',
+    });
+    hold = true;
+    const pending = computer.execute(turn, 'COMPUTER_SET_VALUE', prepared);
+    const rejected = assert.rejects(pending, /Computer use was turned off/);
+    await waiting;
+    const response = await server.inject({
+      method: 'PATCH',
+      url: '/api/computer-use',
+      payload: { enabled: false },
+    });
+    assert.equal(response.statusCode, 200);
+    release();
+    await rejected;
+    assert.ok(calls.includes('cancel'));
+    assert.ok(!calls.includes('set_value'));
+    await server.inject({ method: 'PATCH', url: '/api/computer-use', payload: { enabled: true } });
+    await assert.rejects(
+      computer.execute(turn, 'COMPUTER_SET_VALUE', prepared),
+      /no snapshot with that ref/,
+    );
+  } finally {
+    release();
+    await server.close();
+  }
+});
+
+test('computer use on Windows keeps an opened app granted however the app list names it, and refuses apps it cannot identify', async () => {
+  const pool = {
+    query: async (sql: string) => {
+      if (sql.startsWith('SELECT computer_use'))
+        return { rows: [{ computer_use: true, computer_keep_out: [] }] };
+      if (sql.startsWith('WITH RECURSIVE'))
+        return {
+          rows: [{ id: 'root-turn', source: 'user', message_id: 'message', proactive: false }],
+        };
+      assert.fail(`Unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const apps: Array<Record<string, unknown>> = [
+    { pid: 31, bundle: '', name: 'Terminal', windows: [{ id: 'w-31', title: 'Terminal' }] },
+    {
+      pid: 32,
+      bundle: 'Command Prompt',
+      program: 'cmd.exe',
+      name: 'Command Prompt',
+      windows: [{ id: 'w-32', title: 'Command Prompt' }],
+    },
+  ];
+  const computer = createComputerUse(pool, 'owner', {
+    platform: 'win32',
+    desktop: {
+      request: async (request) => {
+        if (request.op === 'apps') return { apps };
+        if (request.op === 'locate')
+          return { bundle: 'notepad.exe', name: 'notepad', program: 'notepad.exe' };
+        if (request.op === 'open') {
+          apps.push({
+            pid: 33,
+            bundle: 'Notepad.exe',
+            program: 'Notepad.exe',
+            name: 'Notepad.exe',
+            windows: [{ id: 'w-33', title: 'Untitled - Notepad' }],
+          });
+          return { pid: 33 };
+        }
+        if (request.op === 'snapshot')
+          return { tree: { role: 'window', name: 'Untitled - Notepad', children: [] } };
+        throw new Error(`Unexpected ${request.op}`);
+      },
+    },
+  });
+  const turn = { turnId: 'turn', threadId: 'thread' };
+  await computer.execute(
+    turn,
+    'COMPUTER_OPEN',
+    await computer.prepare(turn, 'COMPUTER_OPEN', { bundle: 'notepad' }),
+  );
+  const snapshot = (await computer.execute(
+    turn,
+    'COMPUTER_SNAPSHOT',
+    await computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 33 }),
+  )) as { tree: string };
+  assert.match(snapshot.tree, /Untitled - Notepad/);
+  const listed = (await computer.execute(
+    turn,
+    'COMPUTER_APPS',
+    await computer.prepare(turn, 'COMPUTER_APPS', {}),
+  )) as { apps: Array<{ pid: number; blocked?: string; opened?: boolean }> };
+  assert.match(listed.apps.find((app) => app.pid === 31)?.blocked ?? '', /can’t identify/);
+  assert.match(listed.apps.find((app) => app.pid === 32)?.blocked ?? '', /terminal/);
+  assert.equal(listed.apps.find((app) => app.pid === 33)?.opened, true);
+  apps.push({ pid: 34, bundle: '', program: 'gjs', name: 'gnome-maps', windows: [] });
+  assert.equal(
+    (
+      (await computer.execute(
+        turn,
+        'COMPUTER_APPS',
+        await computer.prepare(turn, 'COMPUTER_APPS', {}),
+      )) as { apps: Array<{ pid: number; opened?: boolean }> }
+    ).apps.find((app) => app.pid === 34)?.opened,
+    false,
+  );
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_OPEN', { bundle: 'Command Prompt' }),
+    /terminal/,
+  );
+});
+
+test('computer use on Linux grants only the opened process when the app list has no desktop ID', async () => {
+  const pool = {
+    query: async (sql: string) => {
+      if (sql.startsWith('SELECT computer_use'))
+        return { rows: [{ computer_use: true, computer_keep_out: [] }] };
+      if (sql.startsWith('WITH RECURSIVE'))
+        return {
+          rows: [
+            {
+              id: 'root-turn',
+              parent_turn_id: null,
+              source: 'user',
+              message_id: 'message',
+              proactive: false,
+            },
+          ],
+        };
+      assert.fail(`Unexpected query: ${sql}`);
+    },
+  } as unknown as Pool;
+  const apps: Array<Record<string, unknown>> = [
+    {
+      pid: 42,
+      bundle: '',
+      program: 'gjs',
+      name: 'gnome-maps',
+      windows: [{ id: 'w-42', title: 'Maps' }],
+    },
+  ];
+  const computer = createComputerUse(pool, 'owner', {
+    platform: 'linux',
+    desktop: {
+      request: async (request) => {
+        if (request.op === 'apps') return { apps };
+        if (request.op === 'locate')
+          return { bundle: 'org.gnome.Weather', name: 'Weather', program: 'gjs' };
+        if (request.op === 'open') {
+          apps.push({
+            pid: 41,
+            bundle: '',
+            program: 'gjs',
+            name: 'gnome-weather',
+            windows: [{ id: 'w-41', title: 'Weather' }],
+          });
+          return { pid: 41 };
+        }
+        if (request.op === 'snapshot')
+          return { tree: { role: 'window', name: 'Weather', children: [] } };
+        throw new Error(`Unexpected ${request.op}`);
+      },
+    },
+  });
+  const turn = { turnId: 'turn', threadId: 'thread' };
+  await computer.execute(
+    turn,
+    'COMPUTER_OPEN',
+    await computer.prepare(turn, 'COMPUTER_OPEN', { bundle: 'org.gnome.Weather' }),
+  );
+  await computer.execute(
+    turn,
+    'COMPUTER_SNAPSHOT',
+    await computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 41 }),
+  );
+  await assert.rejects(
+    computer.prepare(turn, 'COMPUTER_SNAPSHOT', { pid: 42 }),
+    /hasn't opened gnome-maps/,
+  );
 });
 
 if (process.env.NOD_TEST_WORKSPACE_IMAGE)

@@ -1171,7 +1171,7 @@ export function createComposioProvider(options: {
     },
     async deleteAccount(id, ownerId) {
       if (ownerId) userId(ownerId);
-      if (options.proxy.isPendingAccount(id)) return;
+      if (options.proxy.isPendingAccount(id)) return options.proxy.finishPendingAccount(id);
       if (ownerId) await ownedAccount(id, ownerId, AbortSignal.timeout(10_000));
       await client.connectedAccounts.delete(id);
       for (const key of identities.keys()) if (JSON.parse(key)[1] === id) identities.delete(key);

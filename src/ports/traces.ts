@@ -16,7 +16,7 @@ export interface ModelTrace {
     costUsd: number | null;
   };
   error?: string;
-  metadata: Record<string, string>;
+  metadata: Record<string, string | number>;
 }
 
 export interface ModelTraces {

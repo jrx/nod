@@ -5,7 +5,7 @@ import {
   areaEntries,
   fits,
   factSchema,
-  fold,
+  foldQuote,
   freeSlug,
   line,
   lines,
@@ -82,8 +82,8 @@ export function applyOps(
     ...ops.filter(({ op }) => op === 'add'),
   ]) {
     const cited = op.m.flatMap((n) => messages[n - 1] ?? []);
-    const quoted = cited.filter((m) => fold(m.text).includes(fold(op.quote)));
-    if (cited.length !== op.m.length || !quoted.length || !fold(op.quote).trim()) {
+    const quoted = cited.filter((m) => foldQuote(m.text).includes(foldQuote(op.quote)));
+    if (cited.length !== op.m.length || !quoted.length || !foldQuote(op.quote).trim()) {
       rejected.push('quote');
       continue;
     }

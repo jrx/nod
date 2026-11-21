@@ -19,7 +19,14 @@ export function useAppState(accountId?: string) {
   const active = useRef(false);
   const stateRequest = useRef<AbortController | null>(null);
   const activitySeen = useRef(0);
-  const refreshAfterRequest = useRef(false);
+  const stateRequestDone = useRef<Promise<void> | null>(null);
+  const nextRefresh = useRef<Promise<void> | null>(null);
+  const cancelStateRead = useCallback(() => {
+    stateRequest.current?.abort();
+    stateRequest.current = null;
+    stateRequestDone.current = null;
+    nextRefresh.current = null;
+  }, []);
   const advanceThread = useCallback((next: string) => {
     if (next === threadId.current) return;
     if (threadId.current) {
@@ -45,41 +52,58 @@ export function useAppState(accountId?: string) {
         : current,
     );
   }, []);
-  const refresh = useCallback(async () => {
-    if (!active.current) return;
+  const refresh = useCallback((): Promise<void> => {
+    if (!active.current) return Promise.resolve();
+    if (stateRequest.current) {
+      if (!nextRefresh.current) {
+        const queued = stateRequestDone.current!.then(() => {
+          if (nextRefresh.current !== queued) return;
+          nextRefresh.current = null;
+          return refresh();
+        });
+        nextRefresh.current = queued;
+      }
+      return nextRefresh.current;
+    }
     const version = ++requestVersion.current;
     const seen = activitySeen.current;
-    refreshAfterRequest.current = false;
-    stateRequest.current?.abort();
     const controller = new AbortController();
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]);
     stateRequest.current = controller;
-    try {
-      const next = await api<AppState>('/api/state', { signal: controller.signal });
-      if (!active.current || controller.signal.aborted || version !== requestVersion.current)
-        return;
-      if (retiredThreads.current.has(next.threadId)) return;
-      advanceThread(next.threadId);
-      dispatchStream({
-        type: 'persisted',
-        threadId: next.threadId,
-        streamIds: next.messages.flatMap((message) => (message.streamId ? [message.streamId] : [])),
-        discardedTurnIds: next.turns
-          .filter((turn) => turn.status === 'failed' || turn.status === 'cancelled')
-          .map((turn) => turn.id),
-      });
-      setState((current) =>
-        current && activitySeen.current !== seen ? { ...next, activity: current.activity } : next,
-      );
-      setError('');
-    } catch (cause) {
-      if (active.current && !controller.signal.aborted && version === requestVersion.current)
-        setError(errorMessage(cause));
-    } finally {
-      if (stateRequest.current === controller) {
-        stateRequest.current = null;
-        if (refreshAfterRequest.current) void refresh();
+    const request = (async () => {
+      try {
+        const next = await api<AppState>('/api/state', { signal });
+        if (!active.current || controller.signal.aborted || version !== requestVersion.current)
+          return;
+        if (retiredThreads.current.has(next.threadId)) return;
+        advanceThread(next.threadId);
+        dispatchStream({
+          type: 'persisted',
+          threadId: next.threadId,
+          streamIds: next.messages.flatMap((message) =>
+            message.streamId ? [message.streamId] : [],
+          ),
+          discardedTurnIds: next.turns
+            .filter((turn) => turn.status === 'failed' || turn.status === 'cancelled')
+            .map((turn) => turn.id),
+        });
+        setState((current) =>
+          current && activitySeen.current !== seen ? { ...next, activity: current.activity } : next,
+        );
+        setError('');
+      } catch (cause) {
+        if (active.current && !controller.signal.aborted && version === requestVersion.current)
+          setError(
+            signal.aborted && signal.reason?.name === 'TimeoutError'
+              ? 'The chat update did not finish within 15 seconds.'
+              : errorMessage(cause),
+          );
+      } finally {
+        if (stateRequest.current === controller) stateRequest.current = null;
       }
-    }
+    })();
+    stateRequestDone.current = request;
+    return request;
   }, [advanceThread]);
 
   const resetConversation = useCallback(
@@ -87,6 +111,7 @@ export function useAppState(accountId?: string) {
       if (resetRequest.current) return resetRequest.current;
       const request = (async () => {
         requestVersion.current++;
+        cancelStateRead();
         const result = await post<{ ok: true; threadId: string }>('/api/conversation/reset', {
           threadId: expectedThreadId,
         });
@@ -105,19 +130,19 @@ export function useAppState(accountId?: string) {
         .catch(() => {});
       return request;
     },
-    [advanceThread],
+    [advanceThread, cancelStateRead],
   );
 
   useEffect(() => {
     active.current = true;
     let subscribed = true;
+    let activityWithoutScheduleRuns = '[]';
     void refresh();
     const closeEvents = subscribeAppEvents(accountId, {
       open() {
         if (!subscribed) return;
         setConnected(true);
-        if (stateRequest.current) refreshAfterRequest.current = true;
-        else void refresh();
+        void refresh();
       },
       error() {
         if (!subscribed || !active.current) return;
@@ -139,7 +164,13 @@ export function useAppState(accountId?: string) {
             const activity = data.items;
             setState((current) => (current ? { ...current, activity } : current));
             activitySeen.current++;
-            pageDataCache.revalidateActive('/api/tasks');
+            const taskRelatedActivity = JSON.stringify(
+              activity.filter((item) => item.taskId || !item.runId),
+            );
+            if (taskRelatedActivity !== activityWithoutScheduleRuns) {
+              activityWithoutScheduleRuns = taskRelatedActivity;
+              pageDataCache.revalidateActive('/api/tasks');
+            }
           }
           if (data.type === 'refresh') {
             pageDataCache.revalidateActive();
@@ -174,10 +205,10 @@ export function useAppState(accountId?: string) {
       active.current = false;
       subscribed = false;
       requestVersion.current++;
-      stateRequest.current?.abort();
+      cancelStateRead();
       closeEvents();
     };
-  }, [refresh, advanceThread, accountId]);
+  }, [refresh, advanceThread, cancelStateRead, accountId]);
 
   useEffect(() => {
     feedbackClient.savedMessages = state ? state.messages.length : null;

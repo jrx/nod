@@ -44,6 +44,7 @@ export interface AttemptResult {
   modelCalls: number;
   tokens: number;
   costUsd: number | null;
+  budgetCostUsd?: number;
   toolErrors: number;
   firstReplySeconds: number | null;
   judgeCostUsd: number | null;

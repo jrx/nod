@@ -10,7 +10,14 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 80,
-      "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+      "allOf": [
+        {
+          "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+        },
+        {
+          "pattern": "^[^\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]+$"
+        }
+      ]
     },
     "icon": {
       "type": "string",
@@ -125,6 +132,19 @@
               "items": false,
               "minItems": 1,
               "maxItems": 1
+            },
+            "hints": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "enum": ["token"]
+              },
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+              }
             }
           },
           "required": ["type", "server", "authentication"],
@@ -167,6 +187,19 @@
               "items": false,
               "minItems": 2,
               "maxItems": 2
+            },
+            "hints": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "enum": ["address", "token"]
+              },
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+              }
             }
           },
           "required": ["type", "endpoint", "authentication"],
@@ -317,6 +350,19 @@
             },
             "clientIdRequired": {
               "type": "boolean"
+            },
+            "hints": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "enum": ["clientId"]
+              },
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+              }
             }
           },
           "required": ["type", "url", "authentication"],
@@ -353,6 +399,19 @@
               "items": false,
               "minItems": 1,
               "maxItems": 1
+            },
+            "hints": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "enum": ["token"]
+              },
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+              }
             }
           },
           "required": ["type", "url", "authentication"],
@@ -394,6 +453,19 @@
               "type": "string",
               "maxLength": 100,
               "pattern": "^(?!(?:[hH][oO][sS][tT]|[cC][oO][oO][kK][iI][eE]|[sS][eE][tT]-[cC][oO][oO][kK][iI][eE]|[cC][oO][nN][nN][eE][cC][tT][iI][oO][nN]|[cC][oO][nN][tT][eE][nN][tT]-.*|[tT][rR][aA][nN][sS][fF][eE][rR]-[eE][nN][cC][oO][dD][iI][nN][gG]|[pP][rR][oO][xX][yY]-.*|[aA][cC][cC][eE][pP][tT]|[uU][sS][eE][rR]-[aA][gG][eE][nN][tT]|[uU][pP][gG][rR][aA][dD][eE]|[tT][eE]|[tT][rR][aA][iI][lL][eE][rR])$)[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
+            },
+            "hints": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "enum": ["token"]
+              },
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+              }
             }
           },
           "required": ["type", "url", "authentication"],
@@ -489,6 +561,20 @@
               },
               "minProperties": 1,
               "maxProperties": 16
+            },
+            "hints": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string",
+                "maxLength": 64,
+                "pattern": "^(?=.*(?:TOKEN|KEY|SECRET|PASSWORD|_ID|_SID|USERNAME|USER|EMAIL|URL)$)[A-Z][A-Z0-9_]*$"
+              },
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "pattern": "^\\S(?:[\\s\\S]*\\S)?$"
+              }
             }
           },
           "required": ["type", "command", "source", "authentication", "environment"],

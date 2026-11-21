@@ -47,7 +47,9 @@ You need two things from the model server:
 
 </Steps>
 
-Nod reads each Ollama model's details. When the server reports model capabilities, Nod lists only models that support tools. Models with missing capability data also appear. Nod sends images to vision models, offers the model's thinking levels and uses its context length.
+Nod reads each Ollama model's details. When the server reports model capabilities, Nod lists only models that support tools. Models with missing capability data also appear. Nod sends images to vision models and offers the model's thinking levels.
+
+If a loaded model's name exactly matches its entry in Nod's model list, Nod uses the smaller of its loaded context and the limit in its model details. After you load a model or change its context, refresh the connection's model list. If Ollama does not return a loaded context, Nod uses the model details. These can state the training limit rather than the server's active limit. Set the server context before you load the model.
 
 </TabItem>
 <TabItem label="LM Studio">
@@ -111,6 +113,8 @@ With LM Studio 0.4 or later, Nod reads each model's details. It skips embedding 
 
 Nod checks the address by listing the server's models. The connection shows the server's host, such as `localhost:11434`. If you haven't chosen a model yet, Nod selects the server's first one. To switch, open **Settings → Models** and choose a model.
 
+If the server rejects the model list request, Nod shows its HTTP status and available reason. When both address forms return HTTP errors or invalid model lists, it shows both results. A network or timeout failure keeps its transport reason and stops discovery. Submitted keys and the server address are masked in these errors. An invalid model list is reported without its response body.
+
 After you pull or load another model, or to change a server’s key, open **Manage** beside **OpenAI-compatible** and add the same address again. Nod updates that connection instead of adding a second one.
 
 ## Set the server in `.env`
@@ -147,18 +151,18 @@ If the server offers Ollama model details, Nod uses its capability list to filte
 | Background work     | Memory upkeep and other background work use your selected model. [Automatic preparation](/use/spending/#automatic-preparation-allowance) needs a known price, so it doesn't run on a local or otherwise unpriced model.                                                                         |
 | Slow replies        | A slow first reply is normal. After a quiet minute, the chat shows **Waiting for** and your model's name, with how long it has been quiet. If the server sends nothing at all for 30 minutes, Nod sends the request again, up to three times, and then says it failed. **Stop** ends it sooner. |
 | Where requests go   | Chat and confirmation wording requests go to the address you enter. Trust requests go to the checker connection. Web search, websites, apps and chat channels work as before. See [Your data and privacy](/trust/privacy/).                                                                     |
-| Where your key goes | Keys saved in **Models** are encrypted. Keys from `.env` stay in server configuration and memory. The server adds the key to requests. See [Where your keys go](/connect/models/#where-your-keys-go).                                                                                           |
+| Where your key goes | Keys saved in **Models** are encrypted. Keys from `.env` stay in server configuration and memory. The server adds the key to requests and sends your server key only to the address you entered. See [Where your keys go](/connect/models/#where-your-keys-go).                                 |
 
 ## Troubleshooting
 
 | Problem                                                       | Fix                                                                                                                                                      |
 | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Nod couldn’t list this server’s models**                    | Check that the server is running, and that the address and API key are right. `curl http://localhost:11434/v1/models` should list your models.           |
+| **Model discovery failed**                                    | Read the HTTP status and reason. Check the server's logs for that failure. `curl http://localhost:11434/v1/models` should list your models.              |
 | **This server has no models Nod can use**                     | Nod skips models whose Ollama capability list has no tool support. Pull or load a model with tool support, then try again.                               |
 | Nod ignores your request, forgets its tools or repeats itself | The context is too small. Raise it to 65,536 or more and reload the model.                                                                               |
 | A new model doesn't appear on a server added in Settings      | Open **Manage** next to the connection, choose **Add connection**, then enter the same server address and API key, if used. This updates its model list. |
-| **Can’t load its models** next to a server set in `.env`      | Start the server, open **Manage** next to the connection, then choose **Load models** or **Try again**.                                                  |
-| **Remove it and add the server again**                        | Nod can't read the connection's saved settings. Remove the connection, then add the server again in **Models**.                                          |
+| **Needs attention** next to a server set in `.env`            | Start the server, open **Manage** next to the connection, then choose **Load models** or **Try again**.                                                  |
+| **Needs attention** next to a server added in Settings        | Nod can't read the connection's saved settings. Open **Manage**, remove the connection, then add the server again.                                       |
 | Nod asks before almost everything, or acts without asking     | Check the separate Trust connection and its mode. A failed check requires confirmation in chat and tasks.                                                |
 
 ## Related resources

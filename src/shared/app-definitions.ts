@@ -11,7 +11,14 @@ const text = (max: number) =>
     .min(1)
     .max(max)
     .regex(/^\S(?:[\s\S]*\S)?$/, 'Remove leading and trailing whitespace.');
+const name = (max: number) =>
+  text(max).regex(
+    /^[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+$/u,
+    'Use one line without control or format characters.',
+  );
 const fixedServer = { type: z.literal('mcp'), server: text(80) };
+const hints = <const Field extends string>(...fields: Field[]) =>
+  z.partialRecord(z.enum(fields), text(200)).optional();
 const controlHeaders = [
   'host',
   'cookie',
@@ -117,15 +124,26 @@ export const appOAuthMetadataSchema = z.strictObject({
 });
 export type AppOAuthMetadata = z.output<typeof appOAuthMetadataSchema>;
 
+export const appScopeMaxLength = 500;
+const oauthScopes = z
+  .array(text(100))
+  .max(30)
+  .refine(
+    (scopes) => scopes.join(' ').length <= appScopeMaxLength,
+    `Keep the scopes to ${appScopeMaxLength} characters or fewer when joined with spaces.`,
+  )
+  .optional();
+
 export const appConnectionSchema = z.union([
   z.strictObject({
     ...fixedServer,
     authentication: z.tuple([z.literal('oauth2')]),
-    scopes: z.array(text(100)).max(30).optional(),
+    scopes: oauthScopes,
   }),
   z.strictObject({
     ...fixedServer,
     authentication: z.tuple([z.enum(['bearer', 'x-api-key'])]),
+    hints: hints('token'),
   }),
   z.strictObject({
     type: z.literal('mcp'),
@@ -134,25 +152,29 @@ export const appConnectionSchema = z.union([
       path: z.string().regex(/^\/(?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9_-]+$/),
     }),
     authentication: z.tuple([z.literal('oauth2'), z.literal('bearer')]),
+    hints: hints('address', 'token'),
   }),
   z.strictObject({
     type: z.literal('http'),
     url: httpsUrl,
     authentication: z.tuple([z.literal('oauth2')]),
-    scopes: z.array(text(100)).max(30).optional(),
+    scopes: oauthScopes,
     oauth: appOAuthMetadataSchema.optional(),
     clientIdRequired: z.boolean().optional(),
+    hints: hints('clientId'),
   }),
   z.strictObject({
     type: z.literal('http'),
     url: httpsUrl,
     authentication: z.tuple([z.literal('bearer')]),
+    hints: hints('token'),
   }),
   z.strictObject({
     type: z.literal('http'),
     url: httpsUrl,
     authentication: z.tuple([z.literal('x-api-key')]),
     apiKeyHeader: appApiKeyHeaderSchema.optional(),
+    hints: hints('token'),
   }),
   z.strictObject({
     type: z.literal('cli'),
@@ -163,12 +185,13 @@ export const appConnectionSchema = z.union([
       .record(appEnvironmentNameSchema, text(100))
       .refine((value) => Object.keys(value).length >= 1 && Object.keys(value).length <= 16)
       .meta({ minProperties: 1, maxProperties: 16 }),
+    hints: z.record(appEnvironmentNameSchema, text(200)).optional(),
   }),
 ]);
 
 export const appDefinitionSchema = z.strictObject({
   $schema: z.literal(appSchemaId),
-  displayName: text(80),
+  displayName: name(80),
   icon: z
     .string()
     .regex(/^\.\/io\.n8n\.nod\/(?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9_-]+\.(?:svg|png|webp)$/)

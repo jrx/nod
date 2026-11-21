@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { X } from './icons';
-import { Button, Notice, Switch } from './ui';
+import { KeepOutList } from './keep-out-list';
+import { Notice, Switch } from './ui';
 import { api, errorMessage } from '../lib/api';
 import { usePageData } from '../hooks/use-page-data';
 import { savePreferences } from '../lib/preferences';
@@ -61,30 +61,15 @@ export function LocalFilesSettings() {
         also turn this on or off in chat.
       </p>
       {!!data.paths.length && (
-        <>
-          <div className="account-preference-row">
-            <span>Kept out of local files</span>
-          </div>
-          <p className="field-hint">
-            Nod never opens or changes anything in these folders. Tell Nod to add one; only you can
-            remove it here.
-          </p>
-        </>
+        <KeepOutList
+          title="Kept out of local files"
+          hint="Nod never opens or changes anything in these folders. Tell Nod to add one; only you can remove it here."
+          items={data.paths}
+          removeLabel={(folder) => `Let Nod into ${folder} again`}
+          disabled={busy}
+          onRemove={(folder) => void letIn(folder)}
+        />
       )}
-      {data.paths.map((folder) => (
-        <div key={folder} className="account-preference-row">
-          <span className="local-files-keep-out">{folder}</span>
-          <Button
-            variant="ghost"
-            size="sm"
-            aria-label={`Let Nod into ${folder} again`}
-            disabled={busy}
-            onClick={() => void letIn(folder)}
-          >
-            <X size={14} aria-hidden="true" />
-          </Button>
-        </div>
-      ))}
       {error && <Notice onDismiss={() => setError('')}>{error}</Notice>}
       {loadError && <Notice>{loadError}</Notice>}
     </section>

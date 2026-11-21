@@ -1253,7 +1253,7 @@ test(
                 ],
                 async attachmentFailure(names) {
                   notices++;
-                  assert.deepEqual(names, [file.name]);
+                  assert.deepEqual(names, [{ name: file.name }]);
                   return `The file ${file.name} is available in Nod.`;
                 },
               });
@@ -1292,7 +1292,7 @@ test(
                 attachment('available.png', 'image/png', 'available image'),
               ],
               async attachmentFailure(names) {
-                assert.deepEqual(names, ['missing.png']);
+                assert.deepEqual(names, [{ name: 'missing.png' }]);
                 return 'The missing.png file is available in Nod.';
               },
             });
@@ -1518,6 +1518,98 @@ test(
   },
 );
 
+test('Telegram voice, contact and location replies still send when the message they answer is gone', async () => {
+  const delivered: string[] = [];
+  let nextId = 500;
+  const empty = { rows: [], rowCount: 0 };
+  const pool = {
+    query: async () => empty,
+    connect: async () => ({ query: async () => empty, release() {} }),
+    on() {},
+    end: async () => {},
+  } as unknown as pg.Pool;
+  const fakeFetch: typeof fetch = async (input, init) => {
+    const method = String(input).split('/').at(-1)!;
+    const body = init?.body;
+    const raw =
+      body instanceof FormData
+        ? body.get('reply_parameters')
+        : body
+          ? JSON.parse(String(body)).reply_parameters
+          : undefined;
+    const reply = (typeof raw === 'string' ? JSON.parse(raw) : raw) as
+      { message_id: number; allow_sending_without_reply?: boolean } | undefined;
+    if (reply?.message_id === 41 && !reply.allow_sending_without_reply)
+      return Response.json(
+        { ok: false, error_code: 400, description: 'Bad Request: message to be replied not found' },
+        { status: 400 },
+      );
+    if (method !== 'getMe') delivered.push(method);
+    return Response.json({
+      ok: true,
+      result: { message_id: ++nextId, date: 1, chat: { id: 123456, type: 'private' } },
+    });
+  };
+  const transport = createChatSdkTransport(pool, fixtureEnv, { fetch: fakeFetch });
+  const attachment = (name: string, mimeType: string, text: string) => {
+    const bytes = Buffer.from(text);
+    return { name, mimeType, size: bytes.length, read: async () => new Uint8Array(bytes) };
+  };
+  const send = (text: string, ...attachments: ReturnType<typeof attachment>[]) =>
+    transport.post({
+      channelId: 'telegram',
+      accountId: '987',
+      threadId: 'telegram:123456',
+      replyToMessageId: '123456:41',
+      text,
+      attachments,
+    });
+  const original = globalThis.fetch;
+  globalThis.fetch = fakeFetch;
+  try {
+    for (const [text, file] of [
+      ['hello'],
+      ['', attachment('reply.ogg', 'audio/ogg', 'OggS synthetic voice')],
+      [
+        '',
+        attachment(
+          'contact.vcf',
+          'text/vcard',
+          'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Synthetic Contact\r\nTEL:+34600000000\r\nEND:VCARD',
+        ),
+      ],
+      [
+        '',
+        attachment(
+          'location.json',
+          'application/json',
+          JSON.stringify({ latitude: 41.4, longitude: 2.17 }),
+        ),
+      ],
+      [
+        '',
+        attachment(
+          'location.json',
+          'application/json',
+          JSON.stringify({ latitude: 41.4, longitude: 2.17, name: 'Synthetic park' }),
+        ),
+      ],
+    ] as const) {
+      const sent = await send(text, ...(file ? [file] : []));
+      assert.equal(sent.id, `123456:${nextId}`);
+    }
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.deepEqual(delivered, [
+    'sendMessage',
+    'sendVoice',
+    'sendContact',
+    'sendLocation',
+    'sendVenue',
+  ]);
+});
+
 test('WhatsApp bot mode accepts a confirmed private ID when mapping lookups miss', async (t) => {
   type Factory = NonNullable<Parameters<typeof createWhatsAppLinkedTransport>[0]['createSocket']>;
   const events = new EventEmitter();
@@ -1639,6 +1731,263 @@ test('WhatsApp bot mode accepts a confirmed private ID when mapping lookups miss
     ['from-owner', 'after-reverification'],
   );
 });
+
+test('Telegram approval callbacks accept only taps on the paired bot message', async () => {
+  const acknowledgements: Record<string, unknown>[] = [];
+  const transport = createChatSdkTransport({} as pg.Pool, fixtureEnv, {
+    fetch: async (input, init) => {
+      assert.equal(new URL(String(input)).pathname.split('/').at(-1), 'answerCallbackQuery');
+      acknowledgements.push(JSON.parse(String(init?.body)));
+      return Response.json({ ok: true, result: true });
+    },
+  });
+  const callback = {
+    id: 'synthetic-tap',
+    data: 'nod:approval:yes',
+    from: { id: 123456, is_bot: false },
+    message: {
+      message_id: 42,
+      date: 1,
+      from: { id: 987, is_bot: true },
+      chat: { id: 123456, type: 'private' },
+    },
+  };
+  const receive = (value: unknown, secret = fixtureEnv.TELEGRAM_WEBHOOK_SECRET_TOKEN) =>
+    transport.receive({
+      channelId: 'telegram',
+      method: 'POST',
+      query: {},
+      headers: { 'x-telegram-bot-api-secret-token': secret },
+      body: Buffer.from(JSON.stringify({ update_id: 123, callback_query: value })),
+    });
+  try {
+    const accepted = await receive(callback);
+    assert.deepEqual(accepted.messages, []);
+    assert.equal(accepted.approvals?.length, 1);
+    const { acknowledge, ...approval } = accepted.approvals![0]!;
+    assert.deepEqual(approval, {
+      channelId: 'telegram',
+      accountId: '987',
+      senderId: '123456',
+      threadId: 'telegram:123456',
+      messageId: '123456:42',
+      approved: true,
+    });
+    assert.equal(acknowledgements.length, 0);
+    await acknowledge('recorded');
+    const declined = await receive({
+      ...callback,
+      id: 'synthetic-second-tap',
+      data: 'nod:approval:no',
+    });
+    assert.equal(declined.approvals?.[0]?.approved, false);
+    await declined.approvals?.[0]?.acknowledge('unavailable');
+    assert.deepEqual(
+      acknowledgements.map(({ callback_query_id }) => callback_query_id),
+      ['synthetic-tap', 'synthetic-second-tap'],
+    );
+    assert.notEqual(acknowledgements[0]!.text, acknowledgements[1]!.text);
+    assert.equal((await receive(callback, 'wrong-fixture-secret')).status, 401);
+    for (const change of [
+      { data: 'nod:approval:yes:untrusted' },
+      { from: { id: 654321, is_bot: false } },
+      { from: { id: 123456, is_bot: true } },
+      { message: { ...callback.message, from: { id: 988, is_bot: true } } },
+      { message: { ...callback.message, chat: { id: 654321, type: 'private' } } },
+      { message: { ...callback.message, chat: { id: 123456, type: 'group' } } },
+      { message: { ...callback.message, date: 0 } },
+      { message: undefined, inline_message_id: 'synthetic-inline-message' },
+    ]) {
+      const rejected = await receive({ ...callback, ...change });
+      assert.deepEqual(rejected.messages, []);
+      assert.equal(rejected.approvals, undefined);
+    }
+    assert.equal(acknowledgements.length, 2);
+  } finally {
+    await transport.close();
+  }
+});
+
+test(
+  'Telegram preserves approval text and enables buttons only when callbacks can arrive',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    const schema = `test_telegram_approval_${randomUUID().replaceAll('-', '')}`;
+    const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    const pool = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+      options: `-c search_path=${schema}`,
+    });
+    t.after(async () => {
+      await pool.end();
+      await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+      await admin.end();
+    });
+    const deliveries: Record<string, unknown>[] = [];
+    let webhookChecks = 0;
+    let callbackEnabled = true;
+    let pollingAcknowledged = false;
+    let rejectMarkdown = false;
+    let markdownRefusals = 0;
+    let now = Date.now();
+    t.mock.method(Date, 'now', () => now);
+    t.mock.method(
+      globalThis,
+      'fetch',
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const method = new URL(input instanceof Request ? input.url : String(input)).pathname
+          .split('/')
+          .at(-1);
+        if (method === 'getMe')
+          return Response.json({
+            ok: true,
+            result: { id: 987, is_bot: true, first_name: 'Fixture', username: 'fixture_bot' },
+          });
+        if (method === 'getWebhookInfo') {
+          webhookChecks++;
+          return Response.json({
+            ok: true,
+            result: {
+              url: 'https://example.test/telegram',
+              allowed_updates: callbackEnabled ? ['message', 'callback_query'] : ['message'],
+            },
+          });
+        }
+        const body = JSON.parse(String(init?.body));
+        if (method === 'getUpdates') {
+          const callback = {
+            id: 'synthetic-polling-tap',
+            data: Object(deliveries.at(-1)?.reply_markup).inline_keyboard[0][1].callback_data,
+            from: { id: 123456, is_bot: false },
+            message: {
+              message_id: deliveries.length,
+              date: 1,
+              from: { id: 987, is_bot: true },
+              chat: { id: 123456, type: 'private' },
+            },
+          };
+          return Response.json({
+            ok: true,
+            result: body.allowed_updates.includes('callback_query')
+              ? [{ update_id: 123, callback_query: callback }]
+              : [],
+          });
+        }
+        if (method === 'answerCallbackQuery') {
+          assert.equal(body.callback_query_id, 'synthetic-polling-tap');
+          pollingAcknowledged = true;
+          return Response.json({ ok: true, result: true });
+        }
+        assert.equal(method, 'sendMessage');
+        if (rejectMarkdown && body.parse_mode === 'MarkdownV2') {
+          markdownRefusals++;
+          return Response.json(
+            { ok: false, error_code: 400, description: "Bad Request: can't parse entities" },
+            { status: 400 },
+          );
+        }
+        deliveries.push(body);
+        return Response.json({
+          ok: true,
+          result: {
+            message_id: deliveries.length,
+            date: 1,
+            chat: { id: 123456, type: 'private' },
+            text: body.text,
+          },
+        });
+      },
+    );
+    const env = { ...fixtureEnv, WHATSAPP_ENABLED: 'false', TELEGRAM_MODE: 'webhook' };
+    const transport = createChatSdkTransport(pool, env);
+    const polling = combineMessagingTransports(
+      createChatSdkTransport(pool, { ...env, TELEGRAM_MODE: 'polling' }),
+    );
+    const prompt = 'Review boîte@example.test.\n    Never send email or change the source.';
+    const approval = {
+      channelId: 'telegram',
+      accountId: '987',
+      threadId: 'telegram:123456',
+      replyToMessageId: '123456:7',
+      text: `Schedule instruction:\n\n\`\`\`\n${prompt}\n\`\`\`\n\nCreate this schedule?`,
+      approval: { approve: 'Zeitplan erstellen', decline: 'Abbrechen' },
+    };
+    try {
+      assert.deepEqual(await transport.post(approval), {
+        id: '123456:1',
+        ids: ['123456:1'],
+        approvalButtons: true,
+      });
+      const sent = deliveries[0]!;
+      assert.equal(sent.parse_mode, 'MarkdownV2');
+      assert.ok(String(sent.text).includes(prompt));
+      assert.ok(String(sent.text).includes('Create this schedule?'));
+      assert.equal(Object(sent.reply_parameters).message_id, 7);
+      assert.deepEqual(
+        Object(sent.reply_markup).inline_keyboard[0].map(
+          (button: { text: string; callback_data: string }) => [button.text, button.callback_data],
+        ),
+        [
+          ['Zeitplan erstellen', 'nod:approval:yes'],
+          ['Abbrechen', 'nod:approval:no'],
+        ],
+      );
+      rejectMarkdown = true;
+      const plain = await transport.post(approval);
+      assert.equal(markdownRefusals, 1);
+      assert.equal(plain.approvalButtons, true);
+      assert.equal(deliveries.at(-1)?.parse_mode, undefined);
+      assert.equal(deliveries.at(-1)?.text, markdownToPlainText(approval.text));
+      assert.deepEqual(deliveries.at(-1)?.reply_markup, sent.reply_markup);
+      assert.equal(webhookChecks, 1);
+      callbackEnabled = false;
+      now += 60_001;
+      await transport.post(approval);
+      assert.equal(webhookChecks, 2);
+      const plainApproval = deliveries.at(-1)!;
+      assert.equal(plainApproval.reply_markup, undefined);
+      assert.ok(String(plainApproval.text).startsWith(markdownToPlainText(approval.text)));
+      assert.match(String(plainApproval.text), /reply.*yes.*no/i);
+      const nearLimit = 'a'.repeat(3475);
+      const same = await transport.post({ ...approval, text: nearLimit });
+      assert.equal(same.ids?.length, 2);
+      assert.equal(deliveries.at(-2)?.text, nearLimit);
+      assert.equal(
+        Object(deliveries.at(-1)?.reply_parameters).message_id,
+        Number(same.id.split(':').at(-1)),
+      );
+      assert.match(String(deliveries.at(-1)?.text), /reply.*yes.*no/i);
+      callbackEnabled = true;
+      now += 60_001;
+      await transport.post(approval);
+      assert.equal(webhookChecks, 3);
+      assert.ok(deliveries.at(-1)?.reply_markup);
+      const long = await transport.post({
+        ...approval,
+        text: 'Long fixture sentence. '.repeat(230),
+      });
+      assert.ok(long.ids && long.ids.length > 1);
+      assert.ok(deliveries.slice(-long.ids.length).every((message) => !message.reply_markup));
+      assert.match(String(deliveries.at(-1)?.text), /reply.*yes.*no/i);
+      const polled = await polling.post(approval);
+      assert.equal(webhookChecks, 3);
+      await polling.poll!(
+        async () => assert.fail('An approval tap must not be treated as a message.'),
+        undefined,
+        undefined,
+        async ({ approved, messageId, acknowledge }) => {
+          assert.equal(approved, false);
+          assert.equal(messageId, polled.id);
+          await acknowledge('recorded');
+        },
+      );
+      assert.ok(pollingAcknowledged);
+    } finally {
+      await Promise.all([transport.close(), polling.close()]);
+    }
+  },
+);
 
 test('Telegram media keeps native replies and checks the sender before any download', async () => {
   const bytes = Buffer.from('synthetic image bytes');
@@ -1812,6 +2161,178 @@ test('Telegram media keeps native replies and checks the sender before any downl
   assert.equal(requests.length, 0);
 });
 
+test('Telegram refusing a file still delivers the reply and passes on its reason, while an unclear failure stays unconfirmed', async () => {
+  const sent: { method: string; text?: string }[] = [];
+  let failure: { method: string; status: number } | undefined;
+  const respond = async (input: string | URL | Request, init?: RequestInit) => {
+    const method = String(input).split('/').at(-1)!;
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+    sent.push({ method, text: body.text });
+    if (failure?.method === method)
+      return Response.json(
+        { ok: false, error_code: failure.status, description: 'Bad Request: fixture refusal' },
+        { status: failure.status },
+      );
+    return Response.json({
+      ok: true,
+      result: { message_id: sent.length + 100, date: 1, chat: { id: 123456, type: 'private' } },
+    });
+  };
+  const original = globalThis.fetch;
+  globalThis.fetch = respond as typeof fetch;
+  try {
+    const state = {
+      query: async () => ({ rows: [], rowCount: 0 }),
+      connect: async () => ({ query: async () => ({ rows: [], rowCount: 0 }), release() {} }),
+      on() {},
+      end: async () => {},
+    };
+    const transport = createChatSdkTransport(state as unknown as pg.Pool, fixtureEnv, {
+      fetch: respond,
+    });
+    const file = (name: string, mimeType: string, content: string | Buffer) => ({
+      name,
+      mimeType,
+      size: Buffer.from(content).length,
+      read: async () => new Uint8Array(Buffer.from(content)),
+    });
+    const contact =
+      'BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Synthetic Contact\r\nTEL:+34600000000\r\nEND:VCARD';
+    const cases = [
+      ['sendPhoto', file('page.png', 'image/png', Buffer.from('89504e470d0a1a0a', 'hex'))],
+      ['sendVoice', file('reply.ogg', 'audio/ogg', 'OggS fixture voice')],
+      ['sendContact', file('contact.vcf', 'text/vcard', contact)],
+    ] as const;
+    for (const [method, attachment] of cases) {
+      for (const status of [400, 401, 403, 429, 502]) {
+        failure = { method, status };
+        sent.length = 0;
+        const notices: { name: string; reason?: string }[][] = [];
+        const post = transport.post({
+          channelId: 'telegram',
+          accountId: '987',
+          threadId: 'telegram:123456',
+          text: 'Here is the answer.',
+          attachments: [attachment],
+          async attachmentFailure(names) {
+            notices.push(names);
+            return `The file ${names[0].name} is in Nod.`;
+          },
+        });
+        if (status === 400) {
+          const result = await post;
+          const messages = sent.filter((call) => call.method === 'sendMessage');
+          assert.ok(
+            messages.some((call) => call.text?.includes('Here is the answer')),
+            method,
+          );
+          assert.ok(
+            messages.some((call) => call.text?.includes('is in Nod')),
+            method,
+          );
+          assert.deepEqual(
+            notices,
+            [[{ name: attachment.name, reason: 'Bad Request: fixture refusal' }]],
+            method,
+          );
+          assert.equal(result.ids?.length, messages.length, method);
+        } else {
+          await assert.rejects(post, /delivery was not confirmed/, method);
+          assert.deepEqual(notices, [], method);
+          assert.ok(
+            sent.every((call) => call.method !== 'sendMessage' || !call.text?.includes('in Nod')),
+            method,
+          );
+        }
+      }
+    }
+    failure = undefined;
+    sent.length = 0;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('/sendPhoto')) throw new TypeError('fetch failed');
+      return respond(input, init);
+    }) as typeof fetch;
+    await assert.rejects(
+      transport.post({
+        channelId: 'telegram',
+        accountId: '987',
+        threadId: 'telegram:123456',
+        text: 'Here is the answer.',
+        attachments: [cases[0][1]],
+        attachmentFailure: async () => 'The file is in Nod.',
+      }),
+      /delivery was not confirmed/,
+    );
+    assert.ok(sent.every((call) => call.method !== 'sendMessage'));
+  } finally {
+    globalThis.fetch = original;
+  }
+});
+
+test('WhatsApp Cloud API never posts an empty text body before a file or a failed-file notice', async (t) => {
+  const png = Buffer.from('89504e470d0a1a0a', 'hex');
+  const bodies: { type: string; text?: { body: string } }[] = [];
+  t.mock.method(globalThis, 'fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (!String(input).startsWith('https://graph.facebook.com/'))
+      throw new Error('Unexpected fixture provider call.');
+    if (String(input).endsWith('/media')) return Response.json({ id: 'fixture-media' });
+    bodies.push(JSON.parse(String(init?.body)));
+    return Response.json({ messages: [{ id: `wamid.fixture-${bodies.length}` }] });
+  });
+  const idle = { rows: [], rowCount: 0 };
+  const pool = {
+    query: async () => idle,
+    connect: async () => ({ query: async () => idle, release() {} }),
+    on() {},
+    end: async () => {},
+  } as unknown as pg.Pool;
+  const transport = createChatSdkTransport(pool, fixtureEnv);
+  const target = {
+    channelId: 'whatsapp',
+    accountId: '555000',
+    threadId: 'whatsapp:555000:351910000000',
+  };
+  const image = {
+    name: 'chart.png',
+    mimeType: 'image/png',
+    size: png.length,
+    read: async () => new Uint8Array(png),
+  };
+  const recording = {
+    name: 'reply.wav',
+    mimeType: 'audio/wav',
+    size: 10,
+    read: async () => new Uint8Array(10),
+  };
+  await transport.post({ ...target, text: '', attachments: [image] });
+  assert.deepEqual(
+    bodies.map((body) => body.type),
+    ['image'],
+  );
+  bodies.length = 0;
+  await assert.rejects(
+    transport.post({
+      ...target,
+      text: '',
+      attachments: [recording],
+      attachmentFailure: async () => undefined,
+    }),
+    /Channel delivery was not confirmed/,
+  );
+  assert.equal(bodies.length, 0);
+  bodies.length = 0;
+  await transport.post({
+    ...target,
+    text: '',
+    attachments: [recording],
+    attachmentFailure: async () => 'The file is in Nod.',
+  });
+  assert.deepEqual(
+    bodies.map((body) => body.text?.body),
+    ['The file is in Nod.'],
+  );
+});
+
 test('Telegram downloads stop at 20 MB whatever size the sender, Bot API or file server reports', async () => {
   const limit = 20 * 1024 * 1024;
   const message = telegramMessage.parse({
@@ -1860,6 +2381,10 @@ test('Telegram downloads stop at 20 MB whatever size the sender, Bot API or file
   assert.equal(
     (await download(undefined, () => new Response(new Uint8Array(limit)))).byteLength,
     limit,
+  );
+  await assert.rejects(
+    download(undefined, () => new Response('Not Found', { status: 404, statusText: 'Not Found' })),
+    (error: Error) => error.message === 'Telegram file download failed (HTTP 404): Not Found',
   );
   const refused = (description: string) =>
     telegramAttachments(message, 'token', async () =>
@@ -3116,6 +3641,133 @@ test('on-device speech decodes a real WAV into bounded mono samples and refuses 
       message: 'format',
     });
   });
+});
+
+test('local speech distinguishes tokenizer overflow before inference from waveform duration failures', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'nod-speech-limits-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const harness = join(root, 'worker.mjs');
+  await writeFile(
+    harness,
+    `import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import { createRequire, stripTypeScriptTypes } from 'node:module';
+import { SourceTextModule, SyntheticModule, createContext } from 'node:vm';
+import { pathToFileURL } from 'node:url';
+const workerPath = process.argv[2];
+const cache = process.argv[3];
+const require = createRequire(workerPath);
+const hf = await import(pathToFileURL(require.resolve('@huggingface/transformers')));
+const { phonemizeSpeech } = await import(new URL('./phonemizer.ts', pathToFileURL(workerPath)));
+const tokenizer = new hf.PreTrainedTokenizer({
+  model: { type: 'WordLevel', vocab: { '[UNK]': 0 }, unk_token: '[UNK]' },
+  added_tokens: [], normalizer: null, post_processor: null, decoder: null,
+  pre_tokenizer: { type: 'Split', pattern: { Regex: '.' }, behavior: 'Isolated', invert: false },
+}, { unk_token: '[UNK]' });
+await fs.mkdir(path.join(cache, 'kokoro', 'voices'), { recursive: true });
+await fs.writeFile(path.join(cache, 'kokoro', 'voices', 'af_heart.bin'), Buffer.alloc(522240));
+let inferenceCalls = 0;
+let sampleCount = 24000;
+let modelFailure = false;
+let sent;
+const handlers = new Map();
+const context = createContext({
+  process: { argv: ['node', 'worker', cache], send: (value) => { sent = value; }, on: (name, fn) => handlers.set(name, fn), exit: () => { throw Error('unexpected exit'); } },
+  Float32Array, Uint8Array, BigInt, AbortSignal, fetch,
+});
+const source = await fs.readFile(workerPath, 'utf8');
+const worker = new SourceTextModule(stripTypeScriptTypes(source), { context });
+const modules = {
+  'node:crypto': { createHash }, 'node:fs/promises': fs, 'node:path': path,
+  '@huggingface/transformers': {
+    env: { backends: { onnx: {} } }, pipeline: async () => ({}),
+    RawAudio: hf.RawAudio, Tensor: hf.Tensor,
+    AutoTokenizer: { from_pretrained: async () => tokenizer },
+    StyleTextToSpeech2Model: { from_pretrained: async () => async () => {
+      inferenceCalls++;
+      if (modelFailure) throw new Error('synthetic model failure');
+      return { waveform: { data: new Float32Array(sampleCount) } };
+    } },
+  },
+  '@pedrobef/vozz/g2p': { phonemize: () => { throw new Error('unused language'); } },
+  './phonemizer.ts': { phonemizeSpeech }, './models.ts': { localSpeechModels: [] },
+  './audio.ts': { decodeLocalAudio: () => { throw new Error('unused decoder'); } },
+  './cache.ts': { localSpeechCacheMarker: '{}', localTranscriptionCacheMarker: '{}', matchesSpeechFile: async () => true, verifySpeechCache: async () => true },
+};
+await worker.link(async (specifier) => {
+  const exports = modules[specifier];
+  assert.ok(exports, specifier);
+  return new SyntheticModule(Object.keys(exports), function () {
+    for (const [key, value] of Object.entries(exports)) this.setExport(key, value);
+  }, { context });
+});
+await worker.evaluate();
+let id = 0;
+async function synthesize(text) {
+  sent = undefined;
+  inferenceCalls = 0;
+  await handlers.get('message')({ id: ++id, method: 'synthesize', voice: 'af_heart', text });
+  return sent;
+}
+const overflow = '1234567890 '.repeat(27).trim();
+for (const text of [overflow, 'Это короткая проверка речи. Сегодня ясный день и тихая погода. Мы читаем небольшой текст для простой проверки. Проверка завершена успешно.']) {
+  const reply = await synthesize(text);
+  assert.equal(reply.type, 'failed');
+  assert.equal(inferenceCalls, 0);
+  assert.equal(reply.reason, 'tokens');
+}
+assert.equal((await synthesize('red fox '.repeat(37))).type, 'audio');
+assert.equal(inferenceCalls, 1);
+sampleCount = 24000 * 301;
+assert.equal((await synthesize('red fox')).reason, 'length');
+assert.equal(inferenceCalls, 1);
+const { createLocalSpeechProvider } = await import(new URL('./index.ts', pathToFileURL(workerPath)));
+const { SpeechProviderError } = await import(new URL('../../ports/speech.ts', pathToFileURL(workerPath)));
+const child = new EventEmitter();
+child.send = (message, callback) => {
+  handlers.get('message')(message).then(() => child.emit('message', sent));
+  callback();
+};
+child.kill = () => true;
+const provider = createLocalSpeechProvider({ cacheDir: cache, fork: () => child });
+async function failure(text) {
+  let error;
+  try { await provider.synthesize(text); } catch (caught) { error = caught; }
+  assert.ok(error instanceof SpeechProviderError);
+  assert.equal(error.statusCode, 400);
+  return error;
+}
+try {
+  await provider.prepare();
+  modelFailure = true;
+  const generic = await failure('red fox');
+  modelFailure = false;
+  const duration = await failure('red fox');
+  sampleCount = 24000;
+  inferenceCalls = 0;
+  const tokens = await failure(overflow);
+  assert.equal(inferenceCalls, 0);
+  assert.notEqual(tokens.message, duration.message);
+  assert.notEqual(tokens.message, generic.message);
+} finally { await provider.close(); }
+`,
+  );
+  const result = await runProcess(
+    process.execPath,
+    [
+      '--experimental-vm-modules',
+      '--import',
+      import.meta.resolve('tsx'),
+      harness,
+      fileURLToPath(new URL('../src/providers/local-speech/worker.ts', import.meta.url)),
+      join(root, 'models'),
+    ],
+    { timeoutMs: 30_000 },
+  );
+  assert.equal(result.exitCode, 0, result.stderr);
 });
 
 test('local speech exports chunked audio as WAV and finds the silence token without loading a model', async () => {
@@ -4971,12 +5623,8 @@ test(
             pool,
             ownerId: 'local-development',
             canDeliverLiteral: channels.canDeliverLiteral,
-            review: async (_instructions, value) => {
+            review: async () => {
               wordingCalls++;
-              if (Object(value).purpose === 'confirmation_review') {
-                assert.ok(Object(value).text.includes(prompt));
-                return { valid: true };
-              }
               return { text: 'Create this schedule?', action: 'Create schedule' };
             },
           });
@@ -5027,14 +5675,14 @@ test(
             ).rows[0],
             { state: 'sent', provider_message_ids: [`123456:${before + 101}`] },
           );
-          assert.equal(wordingCalls, 2);
+          assert.equal(wordingCalls, 1);
           definition.title = '{{emoji:smile}}';
           proposal.args.title = definition.title;
           await assert.rejects(
             communication.describe(proposal),
             /cannot show the complete schedule confirmation in this channel/,
           );
-          assert.equal(wordingCalls, 2);
+          assert.equal(wordingCalls, 1);
           assert.equal(sent.length, before + 1);
         },
       );

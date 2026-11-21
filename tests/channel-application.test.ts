@@ -1235,6 +1235,8 @@ test(
     await seedApp.close();
     const applied: Record<string, string>[] = [];
     const sent: string[] = [];
+    const approvalMessages = new Map<string, string>();
+    const acknowledgements: string[] = [];
     const whatsapp = new EventEmitter();
     const whatsappReplies: { jid: string; text: string }[] = [];
     const allowedNumber = '12025550101';
@@ -1377,6 +1379,25 @@ test(
             ],
             receive: async (request) => {
               const body = JSON.parse(Buffer.from(request.body).toString());
+              if (body.tap) {
+                return {
+                  status: 200,
+                  body: { ok: true },
+                  approvals: [
+                    {
+                      channelId: 'telegram',
+                      accountId: '42',
+                      senderId: '123',
+                      threadId: 'telegram:123',
+                      messageId: body.tap.messageId,
+                      approved: body.tap.approved,
+                      acknowledge: async (result) => {
+                        acknowledgements.push(result);
+                      },
+                    },
+                  ],
+                };
+              }
               return {
                 status: 200,
                 body: { ok: true },
@@ -1397,7 +1418,9 @@ test(
             },
             post: async (message) => {
               sent.push(message.text);
-              return { id: 'fixture-sent-' + sent.length };
+              const id = 'fixture-sent-' + sent.length;
+              if (message.approval) approvalMessages.set(message.text, id);
+              return { id, ...(message.approval ? { approvalButtons: true as const } : {}) };
             },
             close: async () => {},
           };
@@ -1604,13 +1627,14 @@ test(
         assert.ok(application.app.hasRoute({ method: method as 'GET', url }), route);
       }
       assert.equal(applied[0].TELEGRAM_BOT_TOKEN, '42:private-fixture');
-      const send = async (id: number, text: string, replyTo?: string) =>
+      const telegram = (payload: object) =>
         application.app.inject({
           method: 'POST',
           url: '/api/webhooks/telegram',
           headers: { host: headers.host, 'content-type': 'application/json' },
-          payload: { id, text, replyTo },
+          payload,
         });
+      const send = (id: number, text: string, replyTo?: string) => telegram({ id, text, replyTo });
       assert.equal((await send(1, 'Fixture request')).statusCode, 200);
       await application.channels!.drain();
       const first = (await pool.query('SELECT id,thread_id,channel FROM turns')).rows[0];
@@ -1743,6 +1767,99 @@ test(
         assert.equal(voiceCalls, 1);
       }
       incomingFile = undefined;
+      await t.test('Telegram approval taps answer the exact saved question once', async () => {
+        assert.equal((await send(12, 'Review two synthetic changes')).statusCode, 200);
+        await application.channels!.drain();
+        const channelSource = 'channel:telegram:42:12';
+        const request = (
+          await pool.query('SELECT turn_id,message_id FROM channel_inbox WHERE source_id=$1', [
+            channelSource,
+          ])
+        ).rows[0];
+        const proposals = [];
+        for (const draft of ['first', 'second']) {
+          const turnId = randomUUID();
+          const messageId = randomUUID();
+          const approvalId = randomUUID();
+          const question = `Apply the ${draft} synthetic change?`;
+          await pool.query(
+            `WITH proposal_turn AS (
+               INSERT INTO turns(id,owner_id,thread_id,parent_turn_id,source,prompt,status,waiting_reason,background,channel,channel_source_id)
+               SELECT $1,owner_id,thread_id,id,'task',$2,'waiting','question',true,channel,$3 FROM turns WHERE id=$4
+               RETURNING id,owner_id,thread_id
+             ), confirmation AS (
+               INSERT INTO messages(id,owner_id,role,text,thread_id,turn_id)
+               SELECT $5,owner_id,'assistant',$6,thread_id,id FROM proposal_turn
+               RETURNING id,owner_id,thread_id,turn_id
+             )
+             INSERT INTO approvals(id,owner_id,thread_id,turn_id,action,args,source_message_id,confirmation_message_id)
+             SELECT $7,owner_id,thread_id,turn_id,'NOD_notification_preferences_update',$8,$9,id FROM confirmation`,
+            [
+              turnId,
+              `Review the ${draft} change`,
+              channelSource,
+              request.turn_id,
+              messageId,
+              question,
+              approvalId,
+              { notificationRule: draft },
+              request.message_id,
+            ],
+          );
+          proposals.push({ approvalId, messageId, question });
+        }
+        await application.channels!.drain();
+
+        const [first, second] = proposals;
+        const firstProviderId = approvalMessages.get(first.question);
+        const secondProviderId = approvalMessages.get(second.question);
+        assert.ok(firstProviderId);
+        assert.ok(secondProviderId);
+        const tap = async (messageId: string, approved: boolean) => {
+          const response = await telegram({ tap: { messageId, approved } });
+          assert.equal(response.statusCode, 200, response.body);
+        };
+        const answers = async () =>
+          (
+            await pool.query(
+              `SELECT a.status,m.reply_to_message_id,m.approval_answer,r.id=a.execution_turn_id AS exact_resume
+               FROM approvals a
+               LEFT JOIN turns r ON r.parent_turn_id=a.turn_id AND r.source='resume'
+               LEFT JOIN messages m ON m.id=r.message_id
+               WHERE a.id=ANY($1::uuid[]) ORDER BY array_position($1::uuid[],a.id)`,
+              [[first.approvalId, second.approvalId]],
+            )
+          ).rows;
+        const accepted = {
+          status: 'confirmed',
+          reply_to_message_id: first.messageId,
+          approval_answer: true,
+          exact_resume: true,
+        };
+        await tap(firstProviderId, true);
+        await tap(firstProviderId, false);
+        assert.deepEqual(await answers(), [
+          accepted,
+          {
+            status: 'pending',
+            reply_to_message_id: null,
+            approval_answer: null,
+            exact_resume: null,
+          },
+        ]);
+        await tap(secondProviderId, false);
+        await tap(secondProviderId, true);
+        assert.deepEqual(await answers(), [
+          accepted,
+          {
+            status: 'declined',
+            reply_to_message_id: second.messageId,
+            approval_answer: false,
+            exact_resume: true,
+          },
+        ]);
+        assert.deepEqual(acknowledgements, ['recorded', 'unavailable', 'recorded', 'unavailable']);
+      });
       const disabled = await application.app.inject({
         method: 'DELETE',
         url: '/api/channel-settings/telegram',

@@ -11,6 +11,7 @@ const apps: Record<string, string> = {
   SLACK: 'Slack',
   NOTION: 'Notion',
   LINEAR: 'Linear',
+  COMPUTER: 'Computer use',
 };
 
 export function actionTitle(action: string) {
@@ -397,12 +398,14 @@ const tools: Record<string, string> = {
   'get search content': 'Read search results',
   'source check': 'Checked a source',
   'read source': 'Read a source',
+  flights: 'Searched flights',
   browser: 'Used the browser',
   'sign in': 'Signed in',
   pay: 'Entered a card',
   'browser session': 'Opened a saved session',
   apps: 'Used a connected app',
   files: 'Handled local files',
+  computer: 'Used an app',
   'manage apps': 'Checked connected apps',
   'manage personal context': 'Checked schedules or memory',
   skills: 'Used a skill',
@@ -416,10 +419,27 @@ const tools: Record<string, string> = {
   'create audio': 'Made audio',
 };
 
+const computerSteps: Record<string, string> = {
+  apps: 'Checked open apps',
+  open: 'Opened the app',
+  snapshot: 'Read the window',
+  find: 'Looked for a control',
+  screenshot: 'Looked at the window',
+  press: 'Pressed a control',
+  set_value: 'Filled in a field',
+  type: 'Typed text',
+  select: 'Chose an option',
+  focus: 'Selected a field',
+  key: 'Used a shortcut',
+  keep_out: 'Kept an app out',
+};
+
 export function toolTitle(summary: string) {
   if (tools[summary]) return tools[summary];
   const browser = /^browser ([a-z_]+)$/.exec(summary)?.[1];
   if (browser) return `Browser: ${browser.replaceAll('_', ' ')}`;
+  const computer = /^computer ([a-z_]+)$/.exec(summary)?.[1];
+  if (computer) return computerSteps[computer] ?? 'Used an app';
   const server = /^mcp {2}(.+?) {2}.+$/.exec(summary)?.[1];
   return server ? `Used ${server}` : (tools[summary] ?? summary);
 }
@@ -516,6 +536,25 @@ export function actionTarget(
         .join(', ');
     if (action === 'NOD_notification_preferences_update')
       return [...new Set(Object.keys(args).map((key) => settingNames[key] ?? key))].join(', ');
+    if (action.startsWith('COMPUTER_')) {
+      const app = (args.app as { name?: unknown } | undefined)?.name;
+      const control = args.control as { role?: unknown; name?: unknown } | undefined;
+      const what =
+        typeof args.keys === 'string'
+          ? args.keys
+          : typeof control?.name === 'string' && control.name
+            ? quoted(control.name)
+            : typeof control?.role === 'string'
+              ? control.role
+              : '';
+      return [
+        what,
+        typeof args.option === 'string' && `→ ${quoted(args.option)}`,
+        typeof app === 'string' && `in ${app}`,
+      ]
+        .filter(Boolean)
+        .join(' ');
+    }
     if (action.startsWith('LOCAL_FILES_'))
       return listed([
         ...words(args.path),

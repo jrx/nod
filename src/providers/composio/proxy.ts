@@ -290,6 +290,7 @@ export function createComposioProxy(options: {
           signal.throwIfAborted();
           return undefined;
         });
+      refused({ status: response.status, error: refusal });
       throw new IntegrationConnectionError(
         connectionReason(response.status, false, false) ?? 'unavailable',
         'link',
@@ -547,5 +548,8 @@ export function createComposioProxy(options: {
       };
     },
     isPendingAccount: (id: string) => id.startsWith(pendingPrefix),
+    finishPendingAccount(id: string) {
+      if (id.startsWith(pendingPrefix)) options.browser?.finish(id.slice(pendingPrefix.length));
+    },
   };
 }

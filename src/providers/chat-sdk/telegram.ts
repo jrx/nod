@@ -5,6 +5,8 @@ import { modelServiceError } from '../model-error.ts';
 import { contactAttachment, locationAttachment, telegramContactCard } from './content.ts';
 import { sharedLocation } from '../../shared/channel-content.ts';
 
+export const telegramUpdateTypes = ['message', 'message_reaction', 'callback_query'];
+
 const telegramFile = z.object({
   file_id: z.string().min(1).max(512),
   file_size: z.number().int().nonnegative().optional(),
@@ -169,7 +171,14 @@ export function telegramAttachments(
           `https://api.telegram.org/file/bot${token}/${segments.map(encodeURIComponent).join('/')}`,
           { signal: operation, redirect: 'error' },
         );
-        if (!response.ok || !response.body) throw new Error('The Telegram file is unavailable.');
+        if (!response.ok)
+          throw await modelServiceError(
+            response,
+            'Telegram file download',
+            [token, encodeURIComponent(token)],
+            ['description', 'error_code'],
+          );
+        if (!response.body) throw new Error('The Telegram file is unavailable.');
         if (Number(response.headers.get('content-length') ?? 0) > 20 * 1024 * 1024) {
           await response.body.cancel().catch(() => {});
           throw new MessagingAttachmentError(20 * 1024 * 1024);

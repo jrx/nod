@@ -18,7 +18,10 @@ function feedbackUrl(value: unknown) {
       throw new Error();
     return url;
   } catch {
-    throw new Error('Feedback URLs must use HTTPS without credentials, queries or fragments.');
+    throw Object.assign(
+      new Error('Feedback URLs must use HTTPS without credentials, queries or fragments.'),
+      { code: 'FEEDBACK_URL_INVALID' },
+    );
   }
 }
 
@@ -35,7 +38,10 @@ export function createN8nFeedback(options: {
   const receiptPrefix =
     endpoint && options.receiptUrlPrefix ? feedbackUrl(options.receiptUrlPrefix) : undefined;
   if (receiptPrefix && (receiptPrefix.pathname === '/' || !receiptPrefix.pathname.endsWith('/')))
-    throw new Error('The feedback receipt prefix must name an issue collection ending in /.');
+    throw Object.assign(
+      new Error('The feedback receipt prefix must name an issue collection ending in /.'),
+      { code: 'FEEDBACK_RECEIPT_PREFIX_INVALID' },
+    );
   const receiptPath = receiptPrefix?.pathname;
   async function send(
     input: FeedbackEnvelope | { action: 'status'; submissionId: string; payloadHash: string },
@@ -53,11 +59,15 @@ export function createN8nFeedback(options: {
         body: JSON.stringify(input),
         signal: AbortSignal.timeout(80_000),
       });
+      if (Number.isInteger(response.status) && response.status >= 100 && response.status <= 599)
+        unknown.httpStatus = response.status;
       if (response.status === 429 && !('action' in input))
         return {
           submissionId: input.submissionId,
           status: 'rejected',
           message: 'Please try again in a minute.',
+          reason: 'rate_limited',
+          httpStatus: response.status,
         };
       if ((!response.ok && response.status !== 400) || !response.body) return unknown;
       const reader = response.body.getReader();
@@ -102,6 +112,7 @@ export function createN8nFeedback(options: {
       return {
         submissionId: input.submissionId,
         status: receipt.status,
+        ...(unknown.httpStatus && { httpStatus: unknown.httpStatus }),
         ...(issueUrl && { issueUrl }),
         ...(message && { message }),
       };

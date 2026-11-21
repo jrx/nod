@@ -11,7 +11,7 @@ import {
   area,
   areaEntries,
   find,
-  fold,
+  foldQuote,
   freeSlug,
   id,
   indexLayout,
@@ -497,7 +497,10 @@ export function createMemoryService(options: {
           const source = found.get(id) ?? { id, text: null, at: null, channel: null };
           return {
             ...source,
-            text: quote && source.text && fold(source.text).includes(fold(quote)) ? quote : null,
+            text:
+              quote && source.text && foldQuote(source.text).includes(foldQuote(quote))
+                ? quote
+                : null,
           };
         }),
       };

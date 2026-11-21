@@ -658,9 +658,15 @@ export function createAgentBrowserComputer(options: {
     try {
       return await command(state, request, options);
     } catch (error) {
-      if (error instanceof DaemonCommandError)
-        throw new BrowserActionError('browser_observation_failed');
-      throw error;
+      if (!(error instanceof DaemonCommandError)) throw error;
+      const scope = request.action === 'snapshot' ? request.selector : undefined;
+      if (typeof scope === 'string') {
+        if (error.detail === `Selector '${scope}' did not match any element`)
+          throw new BrowserActionError('browser_snapshot_scope_missing');
+        if (error.detail?.startsWith(`Invalid selector '${scope}': SyntaxError:`))
+          throw new BrowserActionError('browser_snapshot_scope_invalid');
+      }
+      throw new BrowserActionError('browser_observation_failed');
     }
   }
 
@@ -1077,7 +1083,7 @@ export function createAgentBrowserComputer(options: {
             [input.text, input.url, input.load].filter(Boolean).length !== 1 ||
             (input.load && !['load', 'domcontentloaded', 'networkidle'].includes(input.load))
           )
-            throw new Error('Wait for one of text, url or load.');
+            throw new BrowserActionError('browser_wait_condition_required');
           try {
             await command(
               state,
@@ -1929,17 +1935,19 @@ export function createAgentBrowserComputer(options: {
   ) {
     signal?.throwIfAborted();
     if (browserUrl(origin).origin !== origin || !methods.length || methods.length > 10)
-      throw new BrowserActionError('browser_target_changed');
+      throw new BrowserActionError('browser_target_changed', undefined, 'invalid_request');
     const state = await recoverBrowser(id);
-    if (!state?.started || state.saved.navigationFailed)
-      throw new BrowserActionError('browser_target_changed');
+    if (!state?.started)
+      throw new BrowserActionError('browser_target_changed', undefined, 'browser_unavailable');
+    if (state.saved.navigationFailed)
+      throw new BrowserActionError('browser_target_changed', undefined, 'navigation_failed');
     return serialize(state, async () => {
       state.signInMethods = undefined;
       signal?.throwIfAborted();
       if (state.injecting || (await privateDocumentOpen(state, signal)))
         throw new BrowserLockedError();
       if (originOf(await currentUrl(state, signal)) !== origin)
-        throw new BrowserActionError('browser_target_changed');
+        throw new BrowserActionError('browser_target_changed', undefined, 'origin_changed');
       const devtools = await inspector(state, signal);
       try {
         const document = await checkout(state, devtools);
@@ -1950,27 +1958,29 @@ export function createAgentBrowserComputer(options: {
           const target = selector(method.selector);
           const ref = referenceOf(target);
           const observed = ref ? state.refs.get(ref) : undefined;
-          if (ref && !observed) throw new BrowserActionError('browser_target_changed');
-          const refused = () =>
+          if (ref && !observed)
+            throw new BrowserActionError('browser_target_changed', undefined, 'reference_missing');
+          const refused = (guard: BrowserActionError['signInGuard']) =>
             new BrowserActionError(
               'browser_sign_in_choice',
               `Choice ${index + 1} of ${methods.length}.`,
+              guard,
             );
           const control = await (async () =>
             devtools.signInControl(ref ? await pointOf(state, ref) : { selector: target }))().catch(
             (error: unknown) => {
               throw error instanceof BrowserActionError && error.code === 'browser_sign_in_choice'
-                ? refused()
+                ? refused(error.signInGuard)
                 : error;
             },
           );
-          if (control.origin !== origin) throw refused();
+          if (control.origin !== origin) throw refused('choice_foreign_origin');
           if (
             [...controls.values()].some(
               (previous) => previous.backendNodeId === control.backendNodeId,
             )
           )
-            throw new BrowserActionError('browser_target_changed');
+            throw new BrowserActionError('browser_target_changed', undefined, 'choice_duplicate');
           const methodId = randomUUID();
           controls.set(methodId, control);
           const page: BrowserPage = {
@@ -1991,11 +2001,11 @@ export function createAgentBrowserComputer(options: {
           };
           const bound = page.controls![0]!;
           if (observed && (observed.role !== bound.role || observed.name !== bound.name))
-            throw new BrowserActionError('browser_target_changed');
+            throw new BrowserActionError('browser_target_changed', undefined, 'control_changed');
           choices.push({ id: methodId, label: bound.name, page });
         }
         if ((await devtools.document()) !== document)
-          throw new BrowserActionError('browser_target_changed');
+          throw new BrowserActionError('browser_target_changed', undefined, 'document_changed');
         state.signInMethods = { document, origin, controls };
         return { document, methods: choices };
       } finally {
@@ -2011,29 +2021,39 @@ export function createAgentBrowserComputer(options: {
   ) {
     signal?.throwIfAborted();
     const state = browsers.get(threadIdentity(id));
-    if (!state?.started) throw new BrowserActionError('browser_target_changed');
+    if (!state?.started)
+      throw new BrowserActionError('browser_target_changed', undefined, 'browser_unavailable');
     await serialize(state, async () => {
       signal?.throwIfAborted();
       const batch = state.signInMethods;
       state.signInMethods = undefined;
       const control = batch?.controls.get(input.methodId);
-      if (
-        !batch ||
-        !control ||
-        batch.origin !== input.origin ||
-        batch.document !== input.document ||
-        state.saved.navigationFailed
-      )
-        throw new BrowserActionError('browser_target_changed');
+      if (!batch)
+        throw new BrowserActionError('browser_target_changed', undefined, 'selection_missing');
+      if (!control)
+        throw new BrowserActionError('browser_target_changed', undefined, 'selection_unknown');
+      if (batch.origin !== input.origin)
+        throw new BrowserActionError(
+          'browser_target_changed',
+          undefined,
+          'selection_origin_changed',
+        );
+      if (batch.document !== input.document)
+        throw new BrowserActionError(
+          'browser_target_changed',
+          undefined,
+          'selection_document_changed',
+        );
+      if (state.saved.navigationFailed)
+        throw new BrowserActionError('browser_target_changed', undefined, 'navigation_failed');
       if (state.injecting || (await privateDocumentOpen(state, signal)))
         throw new BrowserLockedError();
       const devtools = await inspector(state, signal);
       try {
-        if (
-          (await checkout(state, devtools)) !== batch.document ||
-          originOf(await currentUrl(state, signal)) !== batch.origin
-        )
-          throw new BrowserActionError('browser_target_changed');
+        if ((await checkout(state, devtools)) !== batch.document)
+          throw new BrowserActionError('browser_target_changed', undefined, 'document_changed');
+        if (originOf(await currentUrl(state, signal)) !== batch.origin)
+          throw new BrowserActionError('browser_target_changed', undefined, 'origin_changed');
         signal?.throwIfAborted();
         await devtools.selectSignInControl(control);
       } finally {

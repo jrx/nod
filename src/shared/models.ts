@@ -83,6 +83,8 @@ export interface ModelPricing {
   output: number;
   cacheRead?: number;
   cacheWrite?: number;
+  longCacheWrites?: boolean;
+  tiers?: Array<Omit<ModelPricing, 'tiers'> & { inputTokensAbove: number }>;
 }
 
 export interface ModelSelection {
@@ -106,9 +108,21 @@ export interface WorkUsage {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  cacheWrite1h?: number;
   agentUsd: number;
   otherUsd: number;
   models: string[];
+  pricingSignatures?: Array<string | null>;
+  tokensAbove?: Array<
+    [
+      threshold: number,
+      input: number,
+      output: number,
+      cacheRead: number,
+      cacheWrite: number,
+      cacheWrite1h: number,
+    ]
+  >;
 }
 
 export interface WorkUsageResponse {
@@ -149,16 +163,75 @@ export function boundedPrice(cost: ModelChoice['pricing']) {
   return prices.every((price) => Number.isFinite(price) && price >= 0) && Math.max(...prices) > 0;
 }
 
-export function repriceUsd(usage: WorkUsage, pricing: ModelChoice['pricing']) {
-  if (!pricing || pricing === 'variable' || pricing.input + pricing.output <= 0) return null;
+export function supportsLongCacheWrites(api: unknown) {
+  return api === 'anthropic-messages' || api === 'bedrock-converse-stream';
+}
+
+export function modelPricingSignature(
+  pricing: ModelChoice['pricing'],
+  api?: unknown,
+): string | undefined {
+  if (!pricing || pricing === 'variable' || !boundedPrice(pricing)) return undefined;
+  const rates = (value: Omit<ModelPricing, 'tiers'>) => [
+    value.input,
+    value.output,
+    value.cacheRead ?? value.input,
+    value.cacheWrite ?? value.input,
+  ];
+  const tiers = (pricing.tiers ?? []).map((tier) => [tier.inputTokensAbove, ...rates(tier)]);
+  if (tiers.some((tier) => tier.some((value) => !Number.isFinite(value) || value < 0)))
+    return undefined;
+  const longCacheWrites = pricing.longCacheWrites ?? supportsLongCacheWrites(api);
+  return JSON.stringify([...rates(pricing), ...tiers, ...(longCacheWrites ? ['1h'] : [])]);
+}
+
+export function canReuseWorkCost(
+  usage: WorkUsage,
+  modelId: string,
+  pricing: ModelChoice['pricing'],
+) {
+  const signature = modelPricingSignature(pricing);
   return (
-    usage.otherUsd +
-    (usage.input * pricing.input +
-      usage.output * pricing.output +
-      usage.cacheRead * (pricing.cacheRead ?? pricing.input) +
-      usage.cacheWrite * (pricing.cacheWrite ?? pricing.input)) /
-      1e6
+    signature !== undefined &&
+    usage.models.length === 1 &&
+    usage.models[0] === modelId &&
+    usage.pricingSignatures?.length === 1 &&
+    usage.pricingSignatures[0] === signature
   );
+}
+
+export function repriceUsd(usage: WorkUsage, pricing: ModelChoice['pricing'], audio = false) {
+  if (audio || !pricing || pricing === 'variable') return null;
+  const charge = (
+    [input, output, cacheRead, cacheWrite, cacheWrite1h]: [number, number, number, number, number],
+    rates: ModelPricing,
+  ) => {
+    const longWrites = pricing.longCacheWrites ? cacheWrite1h : 0;
+    return (
+      input * rates.input +
+      output * rates.output +
+      cacheRead * (rates.cacheRead ?? rates.input) +
+      (cacheWrite - longWrites) * (rates.cacheWrite ?? rates.input) +
+      longWrites * rates.input * 2
+    );
+  };
+  let total = charge(
+    [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.cacheWrite1h ?? 0],
+    pricing,
+  );
+  let rates: ModelPricing = pricing;
+  let previousThreshold: number | undefined;
+  for (const tier of pricing.tiers?.toSorted((a, b) => a.inputTokensAbove - b.inputTokensAbove) ??
+    []) {
+    if (tier.inputTokensAbove === previousThreshold) continue;
+    const above = usage.tokensAbove?.find(([threshold]) => threshold === tier.inputTokensAbove);
+    if (!above) return null;
+    const [, ...tokens] = above;
+    total += charge(tokens, tier) - charge(tokens, rates);
+    rates = tier;
+    previousThreshold = tier.inputTokensAbove;
+  }
+  return usage.otherUsd + total / 1e6;
 }
 
 export interface ModelConnection {

@@ -1,3 +1,4 @@
+import type { FlightSearch } from '../ports/flights.ts';
 import { presentationInputSchema, type Presentation } from '../shared/presentation.ts';
 import { proactiveUpdateSchema, sourceReadSchema } from '../shared/proactivity.ts';
 import { appPages } from '../shared/app-links.ts';
@@ -22,7 +23,13 @@ import type {
   RuntimeResult,
   SkillLibrary,
 } from '../ports/agent.ts';
-import { appConfirmation, ContextLimitError, ModelRequestError } from '../ports/agent.ts';
+import {
+  appConfirmation,
+  ContextLimitError,
+  ModelRequestError,
+  OutputLimitError,
+  ToolFailureError,
+} from '../ports/agent.ts';
 import type { Computer, Workspace } from '../ports/computer.ts';
 import { BrowserActionError } from '../ports/computer.ts';
 import { threadIdentity } from '../ports/thread-identity.ts';
@@ -78,6 +85,7 @@ const inlineChars = 40_000;
 const imageBudget = 16 * 1024 * 1024;
 const imageTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
 const parentTools = new Set([
+  'computer',
   'sign_in',
   'pay',
   'browser_session',
@@ -89,6 +97,7 @@ const parentTools = new Set([
 ]);
 const parallelTools = new Set([
   'nod_docs',
+  'flights',
   'delegate',
   'share_file',
   'create_audio',
@@ -100,6 +109,7 @@ const parallelTools = new Set([
 const orderedTools = new Set([
   'apps',
   'files',
+  'computer',
   'manage_personal_context',
   'skills',
   'read_source',
@@ -121,6 +131,7 @@ const delimitedTools = new Set([
   'proactive_issue',
   'apps',
   'files',
+  'computer',
   'delegate',
   'browser',
   'browser_session',
@@ -130,7 +141,31 @@ const delimitedTools = new Set([
   'get_search_content',
   'source_check',
   'codemode',
+  'flights',
 ]);
+export function webTarget(name: string, params: unknown, redact: (text: string) => string) {
+  const input = (params ?? {}) as Record<string, unknown>;
+  const first = (one: unknown, many: unknown) =>
+    [one, ...(Array.isArray(many) ? many : [])].find(
+      (value): value is string => typeof value === 'string' && value.trim() !== '',
+    );
+  if (name === 'web_search') {
+    const query = first(input.query, input.queries);
+    if (!query) return {};
+    const text = redact(query)
+      .replace(/(^|\s)-?(?:[a-z]+:|site\.)\S+/gi, ' ')
+      .replace(/["“”]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!text) return {};
+    return { detail: text.length > 40 ? `${text.slice(0, 39).trimEnd()}…` : text };
+  }
+  if (name !== 'fetch_content') return {};
+  const url = first(input.url, input.urls);
+  if (!url || !URL.canParse(url)) return {};
+  return { site: new URL(url).hostname.replace(/^www\./, '') };
+}
+
 function textResult(value: unknown): AgentToolResult {
   return {
     content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }],
@@ -180,6 +215,7 @@ export function createAgentRuntime(dependencies: {
   workspace: Workspace;
   skills?: SkillLibrary;
   documentation?: Documentation;
+  flights?: FlightSearch;
   redactError?(text: string): string;
   redactCommand?(text: string): string;
   observe?(turnId: string, event: RuntimeObservation): void;
@@ -403,9 +439,37 @@ export function createAgentRuntime(dependencies: {
         server.name,
       ]),
     );
+    const computerApps = new Map<string, string>();
+    const refSnapshot = (ref: unknown) => /^@?([^:\s]+):/.exec(String(ref ?? ''))?.[1];
+    const learnComputerApps = (params: unknown, output: unknown) => {
+      const { action, pid } = (params ?? {}) as { action?: unknown; pid?: unknown };
+      const found = (output ?? {}) as {
+        apps?: { pid?: unknown; bundle?: unknown; name?: unknown }[];
+        pid?: unknown;
+        bundle?: unknown;
+        name?: unknown;
+      };
+      for (const app of action === 'apps' ? (found.apps ?? []) : action === 'open' ? [found] : [])
+        if (typeof app.name === 'string') {
+          computerApps.set(`pid:${app.pid}`, app.name);
+          computerApps.set(`bundle:${app.bundle}`, app.name);
+        }
+      const app = computerApps.get(`pid:${pid}`);
+      if (app && (action === 'snapshot' || action === 'find'))
+        for (const [, snapshot] of JSON.stringify(output ?? '').matchAll(/@([a-z0-9]+):e\d/gi))
+          computerApps.set(`ref:${snapshot}`, app);
+    };
     const appName = (name: string, params: unknown) => {
       if (name.startsWith('mcp__')) return servers.get(name.split('__')[1]);
       if (name === 'files') return 'local files';
+      if (name === 'computer') {
+        const { pid, bundle, ref } = (params ?? {}) as Record<string, unknown>;
+        return (
+          computerApps.get(`ref:${refSnapshot(ref)}`) ??
+          computerApps.get(`pid:${pid}`) ??
+          computerApps.get(`bundle:${bundle}`)
+        );
+      }
       if (name !== 'apps') return undefined;
       const { action, args } = (params ?? {}) as {
         action?: unknown;
@@ -467,14 +531,14 @@ export function createAgentRuntime(dependencies: {
         ) {
           if (source === execution) checkInBlocked = true;
           throw new Error(
-            `This work has used ${checkInUsed()} since the owner's last message, past the ${dollars(context.checkIn!.budgetUsd)} check-in.${checkInPlan >= 0.005 ? ' Plan usage costs the owner nothing extra.' : ''} Do no more work now. Call ask_user to state the cost and what continuing would do, then ask whether to keep going. Follow the shared reporting rules for any result you include.`,
+            `This work has passed the ${dollars(context.checkIn!.budgetUsd)} check-in since the owner's last message.${checkInPlan >= 0.005 ? ' Some of it is ChatGPT plan usage counted at API prices, which costs the owner nothing extra; write {plan} where you state that part.' : ''} Do no more work now. Call ask_user to state the cost and what continuing would do, then ask whether to keep going. Write {spent} exactly where the question states what this work has used; Nod puts in the current amount when it asks. Follow the shared reporting rules for any result you include.`,
           );
         }
         const id = randomUUID();
         const started = performance.now();
-        const app = appName(name, params);
         const eventLabel =
-          name === 'browser' && typeof (params as { action?: unknown })?.action === 'string'
+          (name === 'browser' || name === 'computer') &&
+          typeof (params as { action?: unknown })?.action === 'string'
             ? `${label} ${(params as { action: string }).action}`
             : label;
         const redactCommand = name === 'bash' ? dependencies.redactCommand : undefined;
@@ -483,16 +547,20 @@ export function createAgentRuntime(dependencies: {
           redactCommand && typeof commandLine === 'string'
             ? redactCommand(commandLine).slice(0, 4000)
             : undefined;
-        const event = (record?: WorkspaceCommandRecord) => ({
-          execution: source,
-          callId: id,
-          ...(browserTools.has(name) && sites.has(source.browserId)
-            ? { site: sites.get(source.browserId) }
-            : app
-              ? { site: app }
-              : {}),
-          ...(record && command !== undefined ? { command: record } : {}),
-        });
+        const event = (record?: WorkspaceCommandRecord) => {
+          const web = webTarget(name, params, dependencies.redactError ?? String);
+          const site =
+            browserTools.has(name) && sites.has(source.browserId)
+              ? sites.get(source.browserId)
+              : (appName(name, params) ?? web.site);
+          return {
+            execution: source,
+            callId: id,
+            ...(site ? { site } : {}),
+            ...(web.detail ? { detail: web.detail } : {}),
+            ...(record && command !== undefined ? { command: record } : {}),
+          };
+        };
         const end = (fields: {
           status: 'succeeded' | 'failed' | 'cancelled';
           output?: unknown;
@@ -526,6 +594,7 @@ export function createAgentRuntime(dependencies: {
           assertActive();
           const output = await untilAborted(execute(), signal);
           signal.throwIfAborted();
+          if (name === 'computer') learnComputerApps(params, output);
           if (
             name === 'send_message' &&
             (params as { intent?: unknown } | null)?.intent === 'final'
@@ -575,6 +644,7 @@ export function createAgentRuntime(dependencies: {
               name,
               result,
               name === 'apps' ||
+                name === 'computer' ||
                 name === 'read_source' ||
                 name === 'proactive_issue' ||
                 name === 'codemode' ||
@@ -738,27 +808,7 @@ export function createAgentRuntime(dependencies: {
                   (typeof input.timeout !== 'number' || !Number.isFinite(input.timeout)))
               )
                 throw new Error('The workspace command or timeout is invalid.');
-              if (!context.checkWorkspaceCommand)
-                throw new Error(
-                  'Workspace command checks are unavailable. The command did not run.',
-                );
-              const checked = await context.checkWorkspaceCommand(
-                {
-                  command: input.command,
-                  cwd,
-                  timeoutSeconds: Math.max(
-                    1,
-                    Math.ceil((input.timeout as number | undefined) ?? 3540),
-                  ),
-                },
-                signal,
-              );
-              assertActive();
-              const operation = checked.signal ? AbortSignal.any([signal, checked.signal]) : signal;
-              operation.throwIfAborted();
-              const result = await untilAborted(run(operation), operation);
-              await checked.record();
-              return result;
+              return untilAborted(run(signal), signal);
             },
             { ...options, execution: source },
           );
@@ -766,7 +816,7 @@ export function createAgentRuntime(dependencies: {
         };
       const bind = (turn: Turn, take: () => Promise<unknown>): AgentTool[] =>
         [
-          ...nodTools(turn, skills, dependencies.documentation),
+          ...nodTools(turn, skills, dependencies.documentation, dependencies.flights),
           ...(context.proactivity ? [] : connectedTools(turn)),
         ]
           .filter(
@@ -809,7 +859,7 @@ export function createAgentRuntime(dependencies: {
               description,
               parameters,
               ...(tool.eager ? { eager: true } : {}),
-              ...(tool.companions?.length ? { companions: tool.companions } : {}),
+              ...(tool.companions ? { companions: tool.companions } : {}),
               ...(deferred ? { deferred } : {}),
               parallel: Boolean(deferred) || parallelTools.has(name),
               execute: async (params, options) => {
@@ -903,6 +953,13 @@ export function createAgentRuntime(dependencies: {
           return reply(text, id, replyToMessageId, presentation, handoff);
         },
         pause,
+        checkInCost: () =>
+          overBudget()
+            ? {
+                spent: dollars(checkInSpent),
+                plan: dollars(Math.min(checkInPlan, checkInSpent)),
+              }
+            : undefined,
         confirm,
         visited: (browserId: string, url: string) => {
           const host = URL.parse(url)?.host;
@@ -968,7 +1025,7 @@ export function createAgentRuntime(dependencies: {
             [],
           );
           if (childProgress.error)
-            throw new Error((dependencies.redactError ?? String)(childProgress.error));
+            throw new ToolFailureError((dependencies.redactError ?? String)(childProgress.error));
           if (failure) throw new Error(`The subagent model request failed: ${failure}`);
           if (incomplete) throw new Error('The subagent response was incomplete.');
           assertActive();
@@ -1301,7 +1358,8 @@ export function createAgentRuntime(dependencies: {
       );
       await pendingReplies;
       signal.throwIfAborted();
-      if (progress.error) throw new Error((dependencies.redactError ?? String)(progress.error));
+      if (progress.error)
+        throw new ToolFailureError((dependencies.redactError ?? String)(progress.error));
       const paused = () =>
         `Paused at the ${dollars(context.checkIn!.budgetUsd)} check-in. Reply to keep going.`;
       if (modelError)
@@ -1313,7 +1371,9 @@ export function createAgentRuntime(dependencies: {
           `The model response was cut off because its context is full. Choose a model with a larger context in ${appPages['/settings/models']}.`,
         );
       if (modelIncomplete && status === 'succeeded')
-        throw new Error('The model response was incomplete. Say continue to try again.');
+        throw new OutputLimitError(
+          `The model response was cut off at its output limit. Say continue to pick up where it stopped, or choose a model with a larger output limit in ${appPages['/settings/models']}.`,
+        );
       if (stopped && status === 'succeeded') throw new Error('The turn was stopped.');
       if (status === 'succeeded' && (context.proactivity ? overBudget() : checkInStopped)) {
         status = 'waiting_user';

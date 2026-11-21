@@ -10,6 +10,8 @@ import { SetupActions } from '../src/web/components/setup-link.tsx';
 import { messageSetupLinks } from '../src/web/lib/message-links.ts';
 import { paymentInvitation } from '../src/runtime/communication.ts';
 import { PrivateEntryWorkspace, usePrivateEntry } from '../src/web/components/private-entry.tsx';
+import { VaultItemForm } from '../src/web/components/vault-item-form.tsx';
+import { VaultDetails } from '../src/web/components/vault-details.tsx';
 import { pageDataCache } from '../src/web/lib/page-data-cache.ts';
 import { Composio } from '@composio/core';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -3900,6 +3902,169 @@ test('Vault does not open or prefill a login from arbitrary query data', async (
     }
   }
 });
+
+test(
+  'Vault forms keep the service reason when a save is refused',
+  { skip: !process.env.TEST_DATABASE_URL },
+  async (t) => {
+    for (const kind of ['login', 'card'] as const) {
+      for (const operation of ['create', 'update'] as const) {
+        await t.test(`${operation} ${kind}`, async (t) => {
+          const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
+          const schema = `test_vault_form_${randomUUID().replaceAll('-', '')}`;
+          await admin.query(`CREATE SCHEMA ${schema}`);
+          const pool = new pg.Pool({
+            connectionString: process.env.TEST_DATABASE_URL,
+            options: `-c search_path=${schema}`,
+          });
+          const app = Fastify();
+          let closeView: (() => Promise<void>) | undefined;
+          t.after(async () => {
+            await closeView?.();
+            await app.close();
+            await pool.end();
+            await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+            await admin.end();
+          });
+          await seedTurns(pool);
+          const key = randomBytes(32);
+          let unavailable = operation === 'create';
+          const privateFailure = 'Synthetic private key-store detail';
+          const vault = await createVault(pool, {
+            requestKey: Buffer.alloc(32, 42),
+            keyStore: {
+              id: 'fixture',
+              configured: true,
+              getKey: async () => {
+                if (unavailable) throw new Error(privateFailure);
+                return key;
+              },
+            },
+            page: async () => assert.fail('Unexpected website inspection.'),
+            inject: async () => assert.fail('Unexpected private website entry.'),
+            resume: async () => assert.fail('Unexpected task resume.'),
+            retry: async () => assert.fail('Unexpected credential retry.'),
+          });
+          vault.registerRoutes(app);
+          const secret = kind === 'login' ? 'Synthetic saved password' : '4242424242424242';
+          const payload =
+            kind === 'login'
+              ? {
+                  kind,
+                  label: 'Synthetic login',
+                  origin: 'https://vault-form.example.test',
+                  username: 'synthetic-user',
+                  password: secret,
+                }
+              : {
+                  kind,
+                  label: 'Synthetic card',
+                  cardholder: 'Synthetic cardholder',
+                  cardNumber: secret,
+                  expiryMonth: 12,
+                  expiryYear: 2035,
+                };
+          let saved = 0;
+          const onSaved = () => {
+            saved++;
+          };
+          let entry: VaultLoginEntry | VaultCardEntry | undefined;
+          if (operation === 'update') {
+            const created = await app.inject({ method: 'POST', url: '/api/vault', payload });
+            assert.equal(created.statusCode, 200, created.body);
+            entry = created.json();
+          }
+          let failure: { status: number; reason: string } | undefined;
+          let writes = 0;
+          const view = await vaultPage(
+            entry
+              ? createElement(VaultDetails, {
+                  entry,
+                  backLabel: 'Vault',
+                  onClose() {},
+                  onSaved,
+                  onDeleted: () => assert.fail('Unexpected item deletion.'),
+                })
+              : createElement(VaultItemForm, { kind, onSaved, onCancel() {} }),
+            async (path, init) => {
+              const result = await app.inject({
+                method: (init.method ?? 'GET') as 'GET' | 'POST' | 'PATCH',
+                url: path,
+                headers: init.body ? { 'content-type': 'application/json' } : {},
+                payload: init.body ? String(init.body) : undefined,
+              });
+              if (path === '/api/vault' || init.method === 'PATCH') {
+                writes++;
+                if (result.statusCode >= 400)
+                  failure = { status: result.statusCode, reason: result.json().error };
+              }
+              return new Response(result.body, {
+                status: result.statusCode,
+                headers: { 'content-type': 'application/json' },
+              });
+            },
+            'http://localhost:4310/vault',
+          );
+          closeView = () => view.close();
+          const settle = async (ready: () => boolean) => {
+            for (let attempt = 0; attempt < 100 && !ready(); attempt++)
+              await act(async () => new Promise((resolve) => setTimeout(resolve, 10)));
+            assert.ok(ready());
+          };
+          const field = (name: string) =>
+            view.document.querySelector<HTMLInputElement>(`input[name="${name}"]`)!;
+          if (operation === 'update') {
+            await settle(
+              () =>
+                view.document.querySelector<HTMLButtonElement>('[data-vault-edit]')?.disabled ===
+                false,
+            );
+            await act(async () =>
+              view.document.querySelector<HTMLButtonElement>('[data-vault-edit]')!.click(),
+            );
+            await pool.query(`DELETE FROM ${kind === 'login' ? 'vault_entries' : 'vault_cards'}`);
+          }
+          field('label').value = 'Synthetic changed item';
+          if (kind === 'login') {
+            if (operation === 'create') field('origin').value = payload.origin!;
+            field('username').value = 'synthetic-user';
+            field('password').value = secret;
+          } else {
+            field('cardholder').value = 'Synthetic cardholder';
+            field('cardNumber').value = secret;
+            field('expiry').value = '12 / 2035';
+          }
+          const submit = () =>
+            act(async () => {
+              const form = view.document.querySelector('form')!;
+              form.dispatchEvent(new Event('input', { bubbles: true }));
+              form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            });
+          await submit();
+          await settle(() => Boolean(failure));
+          assert.equal(failure!.status, operation === 'create' ? 503 : 404);
+          assert.ok(view.document.body.textContent?.includes(failure!.reason));
+          assert.equal(view.document.body.textContent?.includes(privateFailure), false);
+          assert.equal(field(kind === 'login' ? 'password' : 'cardNumber').value, '');
+          assert.equal(saved, 0);
+          assert.equal(writes, 1);
+          const table = kind === 'login' ? 'vault_entries' : 'vault_cards';
+          assert.equal((await pool.query(`SELECT 1 FROM ${table}`)).rowCount, 0);
+          if (operation === 'create') {
+            unavailable = false;
+            field(kind === 'login' ? 'password' : 'cardNumber').value = secret;
+            await submit();
+            await settle(() => saved === 1);
+            assert.equal(writes, 2);
+            const rows = (await pool.query(`SELECT * FROM ${table}`)).rows;
+            assert.equal(rows.length, 1);
+            assert.equal(JSON.stringify(rows).includes(secret), false);
+          }
+        });
+      }
+    }
+  },
+);
 
 test(
   'beside-chat private entry clears closed fields and follows owned server submission without replay',

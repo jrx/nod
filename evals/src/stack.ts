@@ -18,6 +18,7 @@ import { integrationDatabaseUrl } from '../../scripts/local-database.ts';
 import { accessCookie, accessKey } from '../../src/server/access.ts';
 import { createCapture, type Observation } from './capture.ts';
 import { collectUsage, type Run } from './trace.ts';
+import { estimateAnthropicRequestUsd } from './spend.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 export const repository = resolve(here, '../..');
@@ -136,6 +137,7 @@ export async function startStack(options: {
   model: Model;
   backgroundModel?: string;
   integrations: IntegrationProvider;
+  desktop?: import('../../src/ports/desktop.ts').DesktopControl;
   observations?: import('../../src/ports/proactivity.ts').ObservationProvider[];
   proactiveBaseline?: boolean;
   siteHosts: string[];
@@ -207,7 +209,10 @@ export async function startStack(options: {
     const closedBeforeRead = closed;
     if (databasePool) {
       finalUsage = await collectUsage(databasePool).catch(() => undefined);
-      if (finalUsage && !closedBeforeRead) finalUsage.costUsd = null;
+      if (finalUsage && !closedBeforeRead) {
+        finalUsage.costUsd = null;
+        delete finalUsage.budgetCostUsd;
+      }
     }
     if (browserStarted) {
       const logs = await runProcess('docker', ['logs', '--tail', '200', browserContainer]).catch(
@@ -510,6 +515,7 @@ export async function startStack(options: {
           provider: model.provider,
           resolve: () => models.resolve(true),
           configured: () => models.configured,
+          estimateAnthropicRequestUsd,
         }),
         onboardingCurator: createPiMemoryCurator({
           provider: model.provider,
@@ -520,6 +526,7 @@ export async function startStack(options: {
           lightest: true,
         }),
         linkPreviews: createPublicLinkPreviewProvider(),
+        ...(options.desktop ? { desktop: options.desktop } : {}),
         model: { provider: model.provider, name: model.name, configured: true },
         ...(home
           ? {

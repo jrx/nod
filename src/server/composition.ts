@@ -19,6 +19,7 @@ import {
   modelProviderNames,
   modelProviders,
   modelSource,
+  canReuseWorkCost,
   repriceUsd,
   type ModelIssue,
   type ModelSelection,
@@ -54,7 +55,9 @@ import { createMailCheck } from './mail-check.ts';
 import type { CredentialKeyStore } from '../ports/key-store.ts';
 import type { PasswordManager } from '../ports/password-manager.ts';
 import type { Trash } from '../ports/trash.ts';
+import type { DesktopControl } from '../ports/desktop.ts';
 import { desktopTrash } from '../providers/trash.ts';
+import { desktopControl } from '../providers/desktop.ts';
 import type { KeepAwake } from '../ports/keep-awake.ts';
 import { desktopKeepAwake } from '../providers/keep-awake.ts';
 import type { MemoryCurator } from '../ports/memory-curator.ts';
@@ -66,7 +69,7 @@ import type { MessagingTransport } from '../ports/messaging.ts';
 import type { ChannelSetupVerifier } from '../ports/channel-settings.ts';
 import type { LinkPreviewProvider } from '../ports/link-preview.ts';
 import type { FeedbackDelivery } from '../ports/feedback.ts';
-import { createN8nFeedback } from '../providers/n8n/feedback.ts';
+import { createFeedbackDelivery } from './feedback-delivery.ts';
 import { createN8nTraces } from '../providers/n8n/traces.ts';
 import { createOtlpTelemetry } from '../providers/otlp/telemetry.ts';
 import type { UsageTelemetry } from '../ports/provider-usage.ts';
@@ -93,6 +96,7 @@ import { createDiscoveredOAuth } from '../providers/discovered/oauth.ts';
 import { createDiscoveredConnections } from './discovered-connections.ts';
 import { bundledApps } from './app-catalog.ts';
 import { createLocalFiles, isLocalFilesAction } from './local-files.ts';
+import { createComputerUse, isComputerAction } from './computer-use.ts';
 import { createAppGrantVault } from './vault-app-grants.ts';
 import { createDockerWorkspace } from '../providers/docker/index.ts';
 import { createEnvironmentKeyStore } from '../providers/environment/key-store.ts';
@@ -119,10 +123,12 @@ import { createFeedbackRedactor } from './feedback-redaction.ts';
 import { withFailureLog, type FailureLogSink } from './failure-log.ts';
 import { createPiMemoryCurator } from '../providers/pi/memory-curator.ts';
 import { createPublicLinkPreviewProvider } from '../providers/public-web/link-preview.ts';
+import { createGoogleFlights } from '../providers/google-flights.ts';
+import type { FlightSearch } from '../ports/flights.ts';
 import { createAgentRuntime } from '../runtime/index.ts';
 import { coreSkills } from '../runtime/prompt.ts';
 import { createApp } from './app.ts';
-import { credentialRequestKey } from './access.ts';
+import { credentialRequestKey, traceKey } from './access.ts';
 import { createWorkAdmission, createWorkConsumers } from './work-admission.ts';
 import { createWritingStyleLearning } from './writing-style.ts';
 import { createChatVerification } from './chat-verification.ts';
@@ -218,7 +224,7 @@ import {
 import type { VaultActivityReason } from '../shared/contracts.ts';
 import { createTriage, getPreferences } from './triage.ts';
 import { createTasks } from './tasks.ts';
-import { createActivity } from './activity.ts';
+import { createActivity, createActivityLine } from './activity.ts';
 import {
   checkedKeyStore,
   createVault,
@@ -249,6 +255,7 @@ export interface ApplicationAdapters {
   keyStore: CredentialKeyStore;
   passwordManager?: PasswordManager;
   trash?: Trash;
+  desktop?: DesktopControl;
   keepAwake?: KeepAwake;
   localFilesHome?: string;
   memoryCurator?: MemoryCurator;
@@ -261,6 +268,7 @@ export interface ApplicationAdapters {
   trustCurator?: MemoryCurator;
   messaging?: MessagingTransport;
   linkPreviews?: LinkPreviewProvider;
+  flights?: FlightSearch;
   feedback?: FeedbackDelivery;
   traces?: ModelTraceGate;
   telemetry?: UsageTelemetry;
@@ -334,16 +342,6 @@ export function modelEnvironment(
 export function createDefaultAdapters(
   env: Record<string, string | undefined> = process.env,
 ): ApplicationAdapters {
-  const defaultFeedbackUrl = 'https://internal.users.n8n.cloud/webhook/nod/feedback';
-  const feedbackUrl = env.NOD_FEEDBACK_URL ?? defaultFeedbackUrl;
-  const feedbackEnabled = env.NOD_FEEDBACK_ENABLED !== 'false';
-  if (
-    feedbackEnabled &&
-    feedbackUrl &&
-    feedbackUrl !== defaultFeedbackUrl &&
-    !env.NOD_FEEDBACK_RECEIPT_URL_PREFIX
-  )
-    throw new Error('Set NOD_FEEDBACK_RECEIPT_URL_PREFIX when using a custom feedback intake.');
   const bootstrap = modelEnvironment(env);
   const { provider } = bootstrap;
   const model = bootstrap.model || agentModels[provider];
@@ -523,6 +521,7 @@ export function createDefaultAdapters(
       open: desktopMode ? desktopOnePassword() : forkedOnePassword(env.NOD_APP_VERSION || 'source'),
     }),
     trash: desktopMode ? desktopTrash() : undefined,
+    desktop: desktopMode ? desktopControl() : undefined,
     keepAwake: desktopMode ? desktopKeepAwake() : undefined,
     workspace: createDockerWorkspace({
       container: env.WORKSPACE_CONTAINER || 'nod-workspace',
@@ -673,19 +672,13 @@ export function createDefaultAdapters(
       },
     },
     linkPreviews: createPublicLinkPreviewProvider(),
+    flights: createGoogleFlights(),
     onboardingEmail: createN8nOnboardingEmail({
       url:
         env.NOD_ONBOARDING_EMAIL_URL ??
         'https://internal.users.n8n.cloud/webhook/nod/onboarding-updates',
     }),
-    feedback: createN8nFeedback({
-      enabled: feedbackEnabled,
-      url: feedbackUrl,
-      token: env.NOD_FEEDBACK_TOKEN,
-      receiptUrlPrefix:
-        feedbackUrl === defaultFeedbackUrl ? undefined : env.NOD_FEEDBACK_RECEIPT_URL_PREFIX,
-      recipient: feedbackUrl === defaultFeedbackUrl ? 'n8n' : undefined,
-    }),
+    feedback: createFeedbackDelivery(env),
     traces,
     get model() {
       return models.current;
@@ -761,12 +754,28 @@ async function initializeApplication(
     failure: FailureLogSink;
   },
 ) {
+  let traceKeyFailure: unknown;
+  if (adapters.traces) {
+    try {
+      adapters.traces.configure({
+        conversationKey: Buffer.from(await traceKey(dataRoot), 'base64url'),
+      });
+    } catch (error) {
+      traceKeyFailure = error;
+    }
+  }
   const analytics = await createAnalytics({
     provider: adapters.analytics,
     environment: analyticsEnvironment(process.env),
     dataRoot,
     installationId: process.env.NOD_ANALYTICS_ID,
     appVersion: process.env.NOD_APP_VERSION,
+    withTraceContext:
+      adapters.traces &&
+      ((operation) => {
+        const turnId = randomUUID();
+        return adapters.traces!.withTurn({ sessionId: turnId, turnId }, operation);
+      }),
   });
   let observeConnections: ((only?: 'apps' | 'models') => Promise<void>) | undefined;
   let observeChannels: (() => Promise<void>) | undefined;
@@ -885,6 +894,7 @@ async function initializeApplication(
     ownerId,
     analytics: captureAnalytics,
     telemetry: adapters.telemetry,
+    pricingThresholds: () => adapters.models?.pricingThresholds() ?? [],
   });
   await ledger.initialize();
   adapters.models?.setRequestBudget?.(ledger.reserve);
@@ -910,7 +920,7 @@ async function initializeApplication(
     ),
   );
   const decisions = adapters.decisions && ledger.decisions(adapters.decisions);
-  const review: ModelReview = async (instructions, input, signal, question) => {
+  const review: ModelReview = async (instructions, input, signal, question, responseSchema) => {
     if (question) {
       const result = await decisions?.check({ instructions, input, question }, signal);
       if (result !== undefined) return result;
@@ -918,7 +928,7 @@ async function initializeApplication(
       instructions += `\nReply with only JSON with one property, ${JSON.stringify(question.name)}. Its value must be one of: ${values.map((value) => JSON.stringify(value)).join(', ')}.`;
     }
     return onboardingCurator.configured
-      ? onboardingCurator.curate({ task: 'review', instructions, input }, signal)
+      ? onboardingCurator.curate({ task: 'review', instructions, input, responseSchema }, signal)
       : undefined;
   };
   const mailCheck = createMailCheck({ curator, decisions });
@@ -944,6 +954,7 @@ async function initializeApplication(
     documentation: createDocumentation(
       fileURLToPath(new URL('../../docs/src/content/docs/', import.meta.url)),
     ),
+    flights: adapters.flights,
     computer,
     workspace,
     redactError: createErrorRedactor(secrets),
@@ -1140,15 +1151,14 @@ async function initializeApplication(
           : (model ?? models.workModel(origin).selection),
       );
       if (!target) return null;
-      const withChoiceUsd =
-        spent.models.length === 1 && spent.models[0] === target.modelId
-          ? last30Usd
-          : repriceUsd(spent, target.pricing);
+      const withChoiceUsd = canReuseWorkCost(spent, target.modelId, target.pricing)
+        ? last30Usd
+        : repriceUsd(spent, target.pricing, target.audio);
       return { last30Usd, withChoiceUsd };
     },
     sessionCosts: ledger.sessionCosts,
     sessionUsage: ledger.sessionUsage,
-    recentTurnCost: ledger.recentTurnCost,
+    recentTurnUsage: ledger.recentTurnUsage,
     ...(adapters.models
       ? {
           validateModel: (choice: ModelSelection) => adapters.models!.validateChoice(choice),
@@ -1305,6 +1315,7 @@ async function initializeApplication(
   let browserConnections!: Awaited<ReturnType<typeof createBrowserConnections>>;
   const previews = adapters.linkPreviews;
   const icon = previews ? cachedIcons((origin) => previews.icon(origin)) : undefined;
+  const computerUse = createComputerUse(pool, ownerId, { desktop: adapters.desktop });
   const localFiles = createLocalFiles(pool, ownerId, {
     dataRoot,
     home: adapters.localFilesHome,
@@ -1442,7 +1453,7 @@ async function initializeApplication(
   };
   const replayBrowserStep = async (
     args: Record<string, unknown>,
-    provenance: { threadId: string; turnId: string },
+    provenance: { threadId: string; turnId: string; signal?: AbortSignal },
   ) => {
     const command = args.command as Omit<BrowserAction, 'action'> & {
       action: BrowserAction['action'] | 'upload';
@@ -1479,27 +1490,36 @@ async function initializeApplication(
       formSent(current.submits) !== formSent(args.submits)
     )
       throw notRun();
+    if (provenance.signal?.aborted) throw notRun();
     try {
       const page =
         command.action === 'upload'
-          ? await computer.upload(browserId, {
-              selector: String(command.selector),
-              name: basename(String(command.path)),
-              bytes: await workspace.readArtifact(
-                provenance.threadId,
-                String(command.path),
-                fileBytes,
-              ),
-              expectOrigin,
-              expectUrl: String(args.page),
-              ...(args.target ? { expectTarget: String(args.target) } : {}),
-            })
-          : await computer.act(browserId, {
-              ...(command as BrowserAction),
-              expectOrigin,
-              expectUrl: String(args.page),
-              ...(args.target ? { expectTarget: String(args.target) } : {}),
-            });
+          ? await computer.upload(
+              browserId,
+              {
+                selector: String(command.selector),
+                name: basename(String(command.path)),
+                bytes: await workspace.readArtifact(
+                  provenance.threadId,
+                  String(command.path),
+                  fileBytes,
+                ),
+                expectOrigin,
+                expectUrl: String(args.page),
+                ...(args.target ? { expectTarget: String(args.target) } : {}),
+              },
+              provenance.signal,
+            )
+          : await computer.act(
+              browserId,
+              {
+                ...(command as BrowserAction),
+                expectOrigin,
+                expectUrl: String(args.page),
+                ...(args.target ? { expectTarget: String(args.target) } : {}),
+              },
+              provenance.signal,
+            );
       return { url: page.url, page: page.text };
     } catch (error) {
       if (error instanceof BrowserActionError && error.code === 'browser_target_changed')
@@ -1532,6 +1552,21 @@ async function initializeApplication(
           ),
           { notRun: true },
         );
+      if (isComputerAction(action)) {
+        const result = await computerUse.execute(
+          { threadId: provenance.threadId, turnId: provenance.turnId },
+          action,
+          args,
+          provenance.signal,
+        );
+        await ledger.action(
+          provenance.turnId,
+          action,
+          provenance.basis ?? { kind: 'approved' },
+          actionTarget(action, args, provenance.details),
+        );
+        return result;
+      }
       const turnLock = provenance.signal
         ? { turnId: provenance.turnId, signal: provenance.signal }
         : provenance.turnId;
@@ -1891,7 +1926,8 @@ async function initializeApplication(
       if (
         ['NOD_browser', 'NOD_vault_allow', 'NOD_bug_report_send', 'NOD_workspace_command'].includes(
           action,
-        )
+        ) ||
+        isComputerAction(action)
       )
         return;
       if (action === 'NOD_limits_update') limitsInput.parse(args);
@@ -2089,8 +2125,11 @@ async function initializeApplication(
     name: 'failures',
     sanitize: sanitizeDiagnostics,
   });
+  if (traceKeyFailure !== undefined)
+    logFailure('trace_conversation_key_unavailable', traceKeyFailure);
   adapters.traces?.configure({
     enabled: (await localAccounts.read(ownerId)).traces,
+    userId: analytics.distinctId,
     secrets,
     profile: ownerProfile,
   });
@@ -2390,23 +2429,47 @@ async function initializeApplication(
       },
       desktopRuntime: desktopMode,
       taskClassification: true,
-      observeTurn: (turnId, operation) =>
-        analytics
-          .withRun(ownerId, async () => {
-            try {
-              await operation();
-            } finally {
-              const consent = analytics.currentRun(ownerId)?.consent;
+      ...(adapters.classificationCurator
+        ? {
+            activityLine: (() => {
+              const line = createActivityLine(
+                ledger.curator(adapters.classificationCurator),
+                createTextRedactor(secrets),
+              );
+              return (
+                turnId: string,
+                input: { text: string; question?: string },
+                signal: AbortSignal,
+              ) => ledger.withTurn(turnId, () => line(input, signal));
+            })(),
+          }
+        : {}),
+      observeTurn: (turnId, operation, sessionId) => {
+        const observe = (ids?: { thread_id: string; turn_id: string }) =>
+          analytics
+            .withRun(
+              ownerId,
+              async () => {
+                try {
+                  await operation();
+                } finally {
+                  const consent = analytics.currentRun(ownerId)?.consent;
+                  void admission
+                    .run(() =>
+                      ledger.withTurn(turnId, () => taskClassification.run(turnId, consent)),
+                    )
+                    ?.catch(() => {});
+                }
+              },
+              ids,
+            )
+            .finally(() => {
               void admission
-                .run(() => ledger.withTurn(turnId, () => taskClassification.run(turnId, consent)))
-                ?.catch(() => {});
-            }
-          })
-          .finally(() => {
-            void admission
-              .run(() => proactivity.due())
-              ?.catch((error) => logFailure('proactivity_wake', error));
-          }),
+                .run(() => proactivity.due())
+                ?.catch((error) => logFailure('proactivity_wake', error));
+            });
+        return adapters.traces?.withTurn({ turnId, sessionId }, observe) ?? observe();
+      },
       consumers,
       artifacts,
       writeArtifact: workspace.writeArtifact.bind(workspace),
@@ -2490,48 +2553,6 @@ async function initializeApplication(
           );
         }
         return tasks.execute(turn, raw, sourceMessageId, priorMessageId, priorHandoff);
-      },
-      checkWorkspaceCommand: async (turn, input, signal) => {
-        signal = AbortSignal.any([signal, closing.signal]);
-        signal.throwIfAborted();
-        const verdict = await trust
-          .check(turn, 'NOD_workspace_command', input, signal)
-          .catch((error: unknown) => {
-            signal.throwIfAborted();
-            throw Object.assign(
-              new Error(
-                `The workspace command did not run because its Trust check failed: ${safeIntegrationFailure(error)}`,
-              ),
-              { notRun: true },
-            );
-          });
-        signal.throwIfAborted();
-        if (verdict.confirm)
-          throw Object.assign(
-            new Error(
-              'The workspace command did not run. Trust could not verify permission for all of its effects. Use a connected app or browser action when an approval is needed.',
-            ),
-            { notRun: true },
-          );
-        const allowed = await approvals.request(turn, 'NOD_workspace_command', input, {
-          allowed: true,
-          basis: verdict.basis,
-          expectedChatRevision: verdict.basis.kind === 'read' ? undefined : verdict.chatRevision,
-          signal,
-          run: async () => true,
-        });
-        if (allowed !== true)
-          throw Object.assign(
-            new Error(
-              'The workspace command did not run because its permission is no longer current.',
-            ),
-            { notRun: true },
-          );
-        signal.throwIfAborted();
-        return {
-          signal,
-          record: () => ledger.action(turn.turnId, 'NOD_workspace_command', verdict.basis),
-        };
       },
       startTurn: async (turn) => {
         const origin = await turnOrigin(turn.turnId);
@@ -2636,7 +2657,6 @@ async function initializeApplication(
             admit: async (asks) => {
               if (asks && request.subagent) throw new Error('A subagent cannot ask the owner.');
             },
-            expectedChatRevision: verdict.chatRevision,
             signal,
             run: async () => 'run',
           });
@@ -2649,7 +2669,6 @@ async function initializeApplication(
         if (request.subagent) return 'refused';
         const result = await approvals.request(turn, 'NOD_browser', args, {
           signal,
-          expectedChatRevision: verdict.chatRevision,
           details: { reason: verdict.reason },
           prepareConfirmation,
         });
@@ -2720,7 +2739,6 @@ async function initializeApplication(
             signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             details: verdict.confirm ? { reason: verdict.reason } : {},
           });
@@ -2733,7 +2751,6 @@ async function initializeApplication(
             signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             details: {
               current: await ledger.limits(),
@@ -2798,7 +2815,6 @@ async function initializeApplication(
             signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             instructionChange: verdict.instructionChange,
             expectedRevision: prepared?.revision,
@@ -2839,7 +2855,6 @@ async function initializeApplication(
             signal,
             allowed: !verdict.confirm,
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
-            expectedChatRevision: verdict.chatRevision,
             admit,
             details: verdict.confirm ? { reason: verdict.reason } : {},
           });
@@ -2852,8 +2867,11 @@ async function initializeApplication(
               'Only work the owner started, in chat, a task or a schedule, can save a skill.',
             );
           await admit?.(false);
-          return learnedSkills.learn(args, turn.turnId, (write) =>
-            withTurnLock(turn.turnId, write),
+          return learnedSkills.learn(
+            args,
+            turn.turnId,
+            (write) => withTurnLock({ turnId: turn.turnId, signal }, write),
+            signal,
           );
         }
         await admit?.(false);
@@ -2861,8 +2879,11 @@ async function initializeApplication(
           const origin = await turnOrigin(turn.turnId);
           if (!origin || !['user', 'task'].includes(origin.source))
             throw new Error('Only work the owner started, in chat or a task, can save to memory.');
-          return learning.remember(args, provenance.sourceMessageId, (write) =>
-            withTurnLock(turn.turnId, write),
+          return learning.remember(
+            args,
+            provenance.sourceMessageId,
+            (write) => withTurnLock({ turnId: turn.turnId, signal }, write),
+            signal,
           );
         }
         if (action === 'usage_get')
@@ -2968,8 +2989,47 @@ async function initializeApplication(
         return vault.request(turn, ownerId, request);
       },
       localFiles: localFiles.available,
+      computerUse: computerUse.available,
       integration: async (turn, action, args, options) => {
         if (action === 'CONNECTED_HTTP') args = structuredClone(args);
+        if (isComputerAction(action)) {
+          if (action === 'COMPUTER_KEEP_OUT') {
+            await options.admit?.(false);
+            return withTurnLock(
+              { turnId: turn.turnId, signal: options.signal },
+              async (client) => ({
+                keptOut: await computerUse.keepOut(turn, String(args.bundle ?? ''), client),
+              }),
+            );
+          }
+          const prepared = await computerUse.prepare(turn, action, args, options.signal);
+          if (!computerUse.needsCheck(action, prepared)) {
+            await options.admit?.(false);
+            return computerUse.execute(turn, action, prepared, options.signal);
+          }
+          const verdict = await trust.check(
+            turn,
+            action,
+            computerUse.checked(action, prepared),
+            options.signal,
+          );
+          await options.admit?.(verdict.confirm);
+          return approvals.request(turn, action, prepared, {
+            allowed: !verdict.confirm,
+            signal: options.signal,
+            run: async () => {
+              const result = await computerUse.execute(turn, action, prepared, options.signal);
+              await ledger.action(
+                turn.turnId,
+                action,
+                verdict.confirm ? { kind: 'approved' } : verdict.basis,
+                actionTarget(action, prepared),
+              );
+              return result;
+            },
+            details: verdict.confirm ? { reason: verdict.reason } : {},
+          });
+        }
         if (action === 'LOCAL_FILES_KEEP_OUT') {
           await options.admit?.(false);
           return withTurnLock({ turnId: turn.turnId, signal: options.signal }, async (client) => ({
@@ -2999,7 +3059,6 @@ async function initializeApplication(
             ...(verdict.confirm ? {} : { basis: verdict.basis }),
             signal: options.signal,
             admit: options.admit,
-            expectedChatRevision: verdict.chatRevision,
             details: {
               ...(typeof args.path === 'string' ? { requestedPath: args.path } : {}),
               accessScope:
@@ -3163,8 +3222,6 @@ async function initializeApplication(
         const result = await approvals.request(turn, action, prepared, {
           allowed: !verdict.confirm,
           admit: options.admit,
-          expectedChatRevision:
-            verdict.confirm || verdict.basis.kind !== 'read' ? verdict.chatRevision : undefined,
           signal: options.signal,
           validate: async (client) => {
             if (verifiedInstructionRevision)
@@ -3314,6 +3371,7 @@ async function initializeApplication(
   adapters.integrationBrowser?.registerRoutes(app);
   integrations.registerRoutes(app);
   localFiles.registerRoutes(app);
+  computerUse.registerRoutes(app);
   personal.registerRoutes(app);
   onboardingSuggestions.registerRoutes(app);
   onboardingProfile.registerRoutes(app);
@@ -3476,6 +3534,17 @@ async function initializeApplication(
       messageAccepted: ownerMessageAccepted,
       answer: (text, channel, replyToMessageId) =>
         userMessages.answer(text, { channel, replyToMessageId }),
+      acceptApproval: async (client, input) => {
+        const { threadId, messageId, approvalId, approved, channel, label, stopSignal } = input;
+        await userMessages.submit(label ?? (approved ? 'Approve' : 'Cancel'), [], {
+          client,
+          threadId,
+          channel,
+          replyToMessageId: messageId,
+          approvalAnswer: { approvalId, approved },
+          stopSignal,
+        });
+      },
     });
     channels.registerRoutes(app);
     await channelSettings?.recover();

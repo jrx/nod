@@ -887,7 +887,7 @@ test('an uncertain effect needs a strong separate check before it can become pri
   }
 });
 
-test('every checker must quote owner words for Nod settings, sign-in and uploads', () => {
+test('every checker must quote owner words for Nod settings, sign-in, uploads and opening apps or files', () => {
   const words = {
     userMessages: [{ at: '2033-06-20T18:30:00Z', text: 'Perform the synthetic action now.' }],
   };
@@ -900,6 +900,9 @@ test('every checker must quote owner words for Nod settings, sign-in and uploads
     'NOD_browser_session',
     'NOD_vault_allow',
     'NOD_browser',
+    'COMPUTER_OPEN',
+    'LOCAL_FILES_READ',
+    'LOCAL_FILES_IMPORT',
   ]) {
     const input = {
       ...words,

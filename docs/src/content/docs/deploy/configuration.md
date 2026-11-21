@@ -162,10 +162,10 @@ Set `TELEGRAM_MODE=webhook` and `TELEGRAM_WEBHOOK_SECRET_TOKEN`, then [apply the
 | ---------------------- | ------------------------------------------------------------- |
 | `url`                  | Your public HTTPS origin followed by `/api/webhooks/telegram` |
 | `secret_token`         | The same value as `TELEGRAM_WEBHOOK_SECRET_TOKEN`             |
-| `allowed_updates`      | `["message", "message_reaction"]`                             |
+| `allowed_updates`      | `["message", "message_reaction", "callback_query"]`           |
 | `drop_pending_updates` | `false`                                                       |
 
-Nod does not register environment-managed webhooks for you. Check [getWebhookInfo](https://core.telegram.org/bots/api#getwebhookinfo) for the saved URL, update types, and delivery errors. Register again after changing the public URL or webhook secret, or to enable reactions on an existing webhook.
+For an existing environment-managed webhook, register it again after changing the public URL or webhook secret. Include `message_reaction` for reactions and `callback_query` for approval buttons. Until you enable `callback_query`, answer approvals by replying directly to the question. Check the saved URL, update types, and delivery errors with [getWebhookInfo](https://core.telegram.org/bots/api#getwebhookinfo).
 
 To switch to polling, remove the webhook with Telegram's [deleteWebhook method](https://core.telegram.org/bots/api#deletewebhook), keeping `drop_pending_updates=false`. Set `TELEGRAM_MODE=polling` and apply the configuration. Telegram does not allow polling while a webhook is registered.
 
@@ -241,6 +241,8 @@ The self-hosting stack sets these names to `nod-workspace-<project>` and `nod-br
 In **Settings → Voice & audio**, choose **Free voices**, then **Set up → Download voices**, or enable local speech from chat. Nod downloads pinned Whisper and Kokoro models into its data directory and runs them in a separate process on the runtime host. Audio is processed in memory. The worker receives no provider keys or connected account credentials. Local voices speak English, Spanish, French, Hindi, Italian or Brazilian Portuguese. With **Assistant voice** on **Automatic**, Nod uses the current speech service and chooses a matching language-specific voice when available. It keeps the service's default when the language is unclear or unsupported. Downloading audio models alone doesn't change a saved voice choice; explicitly choosing **Free voices** selects local speech once the download finishes. If you connect to a remote Nod server, inference runs on that server.
 
 The default voice uses OpenRouter, then OpenAI, then ElevenLabs, then local speech, depending on which connection is available. Selecting a local voice explicitly uses local speech for both transcription and replies. Nod does not change providers automatically after a failed paid request.
+
+Local audio has a five-minute limit. A short passage can also exceed a local voice's pronunciation limit, especially with numbers or an unsupported language. Nod reports that limit separately. Try shorter text or choose a voice service that supports the language, such as Russian, that you need.
 
 ## Docker stack settings
 

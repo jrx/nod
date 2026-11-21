@@ -1,10 +1,10 @@
 {
-  "version": "0.8.4",
-  "previousTag": "nod-v0.8.3",
-  "source": "cc81434d87b2ad15f7c2d0934c4ac6824c4db0fb",
-  "highlights": "## 🧩 Bring your app to Nod\n\nBuild a connector from an MCP server, an HTTP API or a CLI. The [contributor guide](https://nod.n8n.io/docs/contribute/apps/) and AI builder skill help you create an app folder, follow the standard and add the required tests. Then open a pull request for review. Approved connectors get an Apps entry, a public page and a social image.\n\nAlready have an MCP server on your computer or network? Enter its local or private address in **Apps → Connect MCP**.\n\n## 👀 See Nod's last few steps\n\nSelect the activity line in chat or a task to see up to four recent operations, newest first. Close the list when you want a quieter view. It stays closed while the work continues.\n\n## Also in this release\n\n- **Bug reports:** **Report bug** is easier to find. Nod offers a report when something in Nod itself fails. You review what gets sent.\n- **File previews:** Right-click an image in the preview panel to save or open it.\n- **Memory:** Nod follows references in requests to remember earlier details. Notes you write keep their line breaks.\n- **Sign-in:** MCP setup shows the service's reason when sign-in cannot start. ChatGPT sign-in works when its usual local port is busy.\n- **Long chats:** Earlier tools stay available on later turns. Context errors no longer leave the chat stuck.",
+  "version": "0.9.1",
+  "previousTag": "nod-v0.9.0",
+  "source": "71a46bf5499efd6e24a5a8d33dd2d4b8a92f3079",
+  "highlights": "## ✋ Nod asks less\n\nNod now aims to ask only before steps that commit you to something. That means sending, posting, booking, paying, deleting or changing your account. Searching, comparing, picking dates or passengers and filling in forms go ahead without a question.\n\nTry telling Nod: “Find the cheapest flight from Berlin to Lisbon next Friday for two adults. Don’t book anything.” Nod searches and reports back. It asks before it books or pays.\n\nWant a check first? Say “ask me before you send it.” Nod shows you the exact action and waits for your yes.\n\n## 📅 See what your schedules are doing\n\nOpen a scheduled run to see its current activity and completed steps. Each completed step appears once.\n\n## Also in this release\n\n- **Telegram:** Approve or decline requests with buttons in Telegram.\n- **Models:** When a provider rejects your key, Nod asks you to reconnect. Failed connections keep the service’s reason.\n- **Connections:** Rename custom MCP connections.\n- **Chat:** Paste a link over selected text to turn it into a link.\n- **Startup help:** Send a startup report even when chat cannot open.\n- **Privacy:** Bug reports mask more personal details. Review the report before you send it.\n- **Mac updates:** Update checks wait until an update already in progress finishes.",
   "video": {
-    "url": "https://github.com/user-attachments/assets/6bfc3d71-6de3-4593-8fad-b7e56d2af262",
-    "releaseSha256": "0fd4ab5fb690428c253131fd7b17d06b0d25821e56100b29738d600c4e68e3fa"
+    "url": "https://github.com/user-attachments/assets/18835c1c-118f-41a8-91c5-f93cac6cc871",
+    "releaseSha256": "c080d28500d1d3a8be116dd54383bf93adb8ebbad0d23df165743e1a59e18d55"
   }
 }

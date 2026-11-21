@@ -18,10 +18,12 @@ export interface MemoryCurator {
         | 'brief'
         | 'vision'
         | 'classify'
+        | 'activity'
         | 'attention'
         | 'check';
       instructions: string;
       input: object;
+      responseSchema?: Record<string, unknown>;
       images?: AgentImage[];
       automatic?: boolean;
     },

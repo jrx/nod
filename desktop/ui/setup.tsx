@@ -6,6 +6,7 @@ import { Welcome, WelcomeNote } from '../../src/web/pages/onboarding/steps/welco
 import { OnboardingFrame } from '../../src/web/pages/onboarding/frame';
 import { startupMessage, type StartupStage } from '../../src/shared/desktop-startup';
 import { initializeFocusVisibility } from '../../src/web/lib/focus';
+import { StartupFeedback, type StartupFeedbackDesktop } from './feedback';
 import '../../src/web/theme.css';
 import '../../src/web/components/motion.css';
 import '../../src/web/components/setup-progress.css';
@@ -44,7 +45,7 @@ type Preferences = {
 
 type WelcomeChoice = { usageData: boolean; continued: boolean };
 
-type Desktop = {
+type Desktop = StartupFeedbackDesktop & {
   ready?(): Promise<void>;
   getSettings(): Promise<{ welcome?: WelcomeChoice }>;
   saveSettings(change: { welcome: WelcomeChoice }): Promise<{ welcome?: WelcomeChoice }>;
@@ -55,7 +56,7 @@ type Desktop = {
   openConnectionSettings(): Promise<void>;
   closeConnectionSettings(): Promise<void>;
   continueOnboarding(): Promise<void>;
-  prepare(options?: { retry: boolean; report?: boolean }): Promise<Status>;
+  prepare(options?: { retry: boolean }): Promise<Status>;
   warmup?(): Promise<void>;
   installWsl(): Promise<Status>;
   showStartupLog(): Promise<void>;
@@ -285,6 +286,7 @@ function Startup() {
   );
   const [busy, setBusy] = useState(false);
   const [recovering, setRecovering] = useState(false);
+  const [reportError, setReportError] = useState('');
   const [settingsError, setSettingsError] = useState('');
   const [welcome, setWelcome] = useState<WelcomeChoice | null>(null);
   const currentWelcome = useRef<WelcomeChoice | null>(null);
@@ -339,7 +341,12 @@ function Startup() {
   }, []);
 
   useEffect(() => {
-    if (welcomeStep !== 'waiting' || !status.engineReady || !currentWelcome.current) return;
+    if (
+      welcomeStep !== 'waiting' ||
+      !status.engineReady ||
+      currentWelcome.current?.continued !== false
+    )
+      return;
     void saveWelcome({ ...currentWelcome.current, continued: true }).catch(() => {});
   }, [welcomeStep, status.engineReady]);
 
@@ -496,7 +503,7 @@ function Startup() {
         : active.message ||
           (firstSetup ? 'Preparing your workspace and browser.' : 'Opening your saved workspace.');
 
-  const retry = (report = false) =>
+  const retry = () =>
     run(async () => {
       if (!desktop) return;
       if (failure?.needsServerConnection) {
@@ -516,7 +523,7 @@ function Startup() {
         setSettingsError('');
       }
       if (firstSetup && !localChoiceSaved.current) return;
-      return desktop.prepare(report ? { retry: true, report } : { retry: true });
+      return desktop.prepare({ retry: true });
     });
 
   return (
@@ -556,7 +563,20 @@ function Startup() {
                   : 'Try again'}
             </button>
             {!failure.needsServerConnection && (
-              <button type="button" disabled={working} onClick={() => void retry(true)}>
+              <button
+                type="button"
+                disabled={working}
+                onClick={() => {
+                  setReportError('');
+                  void desktop
+                    .openStartupFeedback()
+                    .catch((cause) =>
+                      setReportError(
+                        cause instanceof Error ? cause.message : 'The report form could not open.',
+                      ),
+                    );
+                }}
+              >
                 Report bug
               </button>
             )}
@@ -592,21 +612,37 @@ function Startup() {
             )}
           </div>
         )}
+        {reportError && (
+          <p className="ob-native-error" role="alert">
+            {reportError}
+          </p>
+        )}
       </SetupProgress>
     </>
   );
 }
 
 function Setup() {
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
   useEffect(() => {
     void desktop?.ready?.();
+    return desktop?.onStartupFeedback?.(() => setFeedbackOpen(true));
   }, []);
-  return parameters.get('server') === 'true' ? (
-    <ConnectionSetup />
-  ) : parameters.get('onboarding') === 'true' ? (
-    <OnboardingSetup />
-  ) : (
-    <Startup />
+  const page =
+    parameters.get('server') === 'true' ? (
+      <ConnectionSetup />
+    ) : parameters.get('onboarding') === 'true' ? (
+      <OnboardingSetup />
+    ) : (
+      <Startup />
+    );
+  return (
+    <>
+      {page}
+      {feedbackOpen && desktop && (
+        <StartupFeedback desktop={desktop} onClose={() => setFeedbackOpen(false)} />
+      )}
+    </>
   );
 }
 

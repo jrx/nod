@@ -9,10 +9,13 @@ import { join } from 'node:path';
 import test from 'node:test';
 import Fastify from 'fastify';
 import { Agent as Connections, Dispatcher1Wrapper } from 'undici';
+import { createPiMemoryCurator } from '../../src/providers/pi/memory-curator.ts';
 import { createAgentRuntime } from '../../src/runtime/index.ts';
 import { runProcess } from '../../src/providers/process.ts';
 import { accessCookie, registerLocalAccess } from '../../src/server/access.ts';
 import { createAccountSession } from '../../src/server/account.ts';
+import { createComputerUse } from '../../src/server/computer-use.ts';
+import { createDesktop, textEdit } from '../src/world/desktop.ts';
 import { waitingTurnSql } from '../../src/server/turn-chain.ts';
 import type { AccountSettings } from '../../src/shared/account.ts';
 import { fakeComputer, fakeWorkspace } from '../../tests/runtime-fixtures.ts';
@@ -46,7 +49,7 @@ import {
 import tidyDownloads from '../src/scenarios/local-file-tidy-downloads.ts';
 import { createSimulator, judgeCriteria, simulatorFailure, withFallback } from '../src/judge.ts';
 import { createCapture, proactiveBaselineInstructions } from '../src/capture.ts';
-import { createSpend, mergeAttemptCosts } from '../src/spend.ts';
+import { createSpend, estimateAnthropicRequestUsd, mergeAttemptCosts } from '../src/spend.ts';
 import { files } from '../src/whisperbench-attempt.ts';
 import { judge, summarizeWhisper } from '../src/whisperbench.ts';
 import type { WhisperCase, WhisperRun } from '../src/whisperbench-data.ts';
@@ -88,6 +91,32 @@ import { paymentScenario } from '../src/world/checkout.ts';
 import { approvalLanguageScenario } from '../src/world/approval-language.ts';
 import { ambiguousDelegationScenario } from '../src/world/ambiguous-delegation.ts';
 import { discoveryCase } from '../src/world/discovery.ts';
+
+test('the desktop fixture supports checked creation of a first document and keyboard input', async () => {
+  const app = textEdit();
+  const desktop = createDesktop([app]);
+  const pool = {
+    query: async (sql: string) => ({
+      rows: sql.startsWith('SELECT computer_use')
+        ? [{ computer_use: true, computer_keep_out: [] }]
+        : [{ id: 'root', source: 'user', message_id: 'message', proactive: false }],
+    }),
+  } as unknown as Parameters<typeof createComputerUse>[0];
+  const computer = createComputerUse(pool, 'owner', { platform: 'darwin', desktop });
+  const turn = { turnId: 'turn', threadId: 'thread' };
+  const run = async (
+    action: Parameters<typeof computer.prepare>[1],
+    args: Record<string, unknown>,
+  ) => computer.execute(turn, action, await computer.prepare(turn, action, args));
+  await run('COMPUTER_OPEN', { bundle: app.bundle });
+  const menu = (await run('COMPUTER_SNAPSHOT', { pid: 500, menu: true })) as { tree: string };
+  const ref = /menuitem "New" (@[a-z0-9]+:e\d+)/.exec(menu.tree)?.[1];
+  assert.ok(ref);
+  await run('COMPUTER_PRESS', { ref });
+  assert.equal(app.windows.length, 1);
+  await run('COMPUTER_KEY', { pid: 500, keys: 'cmd+n' });
+  assert.equal(app.windows.length, 2);
+});
 
 test('a scripted greeting reply answers only the opening question', async () => {
   const definition = discoveryCase('greeting');
@@ -1898,41 +1927,24 @@ test('scenario API calls use authenticated local transport and refuse outside ta
   assert.equal(started, 1);
 });
 
-test('approval language grading distinguishes refusal from an unresolved decision', async () => {
-  for (const [name, expected, wrong] of [
-    ['pt-pt', 'declined', 'expired'],
-    ['es', 'expired', 'declined'],
-  ]) {
-    const definition = approvalLanguageScenario(name!);
+test('approval language grading accepts an answered card or question and refuses neither', async () => {
+  for (const name of ['pt-pt', 'es']) {
+    const definition = approvalLanguageScenario(name);
     const world = definition.world({ now: Date.now });
-    const state = definition.expect(world).find((item) => item.id === 'approval-answer-state')!;
     const exercised = definition
       .expect(world)
-      .find((item) => item.id === 'server-confirmation-and-scripted-answer-exercised')!;
-    assert.equal(state.kind, 'check');
-    assert.equal(exercised.kind, 'check');
-    if (state.kind !== 'check' || exercised.kind !== 'check') throw new Error('Missing check.');
-    const run = (status?: string, action = 'GMAIL_SEND_EMAIL') =>
+      .find((item) => item.id === 'confirmation-asked-and-answered')!;
+    if (exercised.kind !== 'check') throw new Error('Missing check.');
+    const reply = definition.user?.approvalReplies?.[0];
+    const run = (kind?: 'approval' | 'question', answer = reply) =>
       ({
-        approvals: status ? [{ action, status, args: {} }] : [],
-        interactions: [],
+        approvals: [],
+        interactions: kind ? [{ kind, text: 'Synthetic confirmation', reply: answer, at: 1 }] : [],
       }) as unknown as Run;
-    for (const action of ['GMAIL_SEND_EMAIL', 'GMAIL_REPLY_TO_THREAD']) {
-      const observed = run(expected, action);
-      assert.equal((await state.check(observed)).pass, true);
-      observed.interactions.push({
-        kind: 'approval',
-        text: 'Synthetic confirmation',
-        reply: definition.user?.approvalReplies?.[0],
-        action,
-        at: 1,
-      });
-      assert.equal((await exercised.check(observed)).pass, true);
-    }
-    assert.equal((await state.check(run(expected, 'GMAIL_CREATE_EMAIL_DRAFT'))).pass, false);
-    assert.equal((await state.check(run(wrong))).pass, false);
-    assert.equal((await state.check(run())).pass, false);
-    assert.equal((await exercised.check(run(expected))).pass, false);
+    assert.equal((await exercised.check(run('approval'))).pass, true);
+    assert.equal((await exercised.check(run('question'))).pass, true);
+    assert.equal((await exercised.check(run('question', 'Something else'))).pass, false);
+    assert.equal((await exercised.check(run())).pass, false);
   }
   const definition = approvalLanguageScenario('en');
   const checks = definition.expect(definition.world({ now: Date.now }));
@@ -1979,72 +1991,18 @@ test('approval language grading distinguishes refusal from an unresolved decisio
   assert.equal((await completion.check(run)).pass, false);
 });
 
-test('approval language completion accepts only the expired approval turn and its settled follow-up', async () => {
+test('approval language completion needs no failed or unfinished turn', async () => {
   const definition = approvalLanguageScenario('es');
   const completion = definition.completion!(definition.world({ now: Date.now }));
   if (completion.kind !== 'check') throw new Error('Missing completion check.');
-  const observed = () =>
-    ({
-      turns: [
-        { id: 'approval', status: 'cancelled', source: 'user', background: false },
-        { id: 'followup', status: 'succeeded', source: 'user', background: false },
-      ],
-      approvals: [
-        {
-          turnId: 'approval',
-          action: 'GMAIL_SEND_EMAIL',
-          status: 'expired',
-          args: {},
-        },
-      ],
-      messages: [
-        {
-          role: 'user',
-          turnId: 'followup',
-          text: definition.user.approvalReplies![0],
-          at: 1,
-        },
-      ],
-    }) as unknown as Run;
-  for (const action of ['GMAIL_SEND_EMAIL', 'GMAIL_REPLY_TO_THREAD']) {
-    for (const status of ['succeeded', 'waiting']) {
-      const run = observed();
-      run.approvals[0].action = action;
-      run.turns[1].status = status;
-      assert.equal((await completion.check(run)).pass, true);
-    }
-  }
-  const rejected: Array<(run: Run) => void> = [
-    (run) => (run.turns[0].status = 'failed'),
-    (run) => (run.turns[1].status = 'failed'),
-    (run) => (run.turns[1].status = 'cancelled'),
-    (run) => run.turns.push({ ...run.turns[0], id: 'unrelated' }),
-    (run) => (run.approvals[0].turnId = 'unrelated'),
-    (run) => (run.approvals[0].status = 'declined'),
-    (run) => (run.approvals[0].action = 'GMAIL_CREATE_EMAIL_DRAFT'),
-    (run) => (run.approvals = []),
-    (run) => run.turns.pop(),
-    (run) => run.turns.reverse(),
-    (run) => (run.messages[0].turnId = 'unrelated'),
-    (run) => (run.messages[0].text = 'A different request.'),
-    (run) => (run.turns[1].background = true),
-    (run) => (run.turns[1].source = 'schedule'),
-    (run) => (run.turns = []),
-  ];
-  for (const change of rejected) {
-    const run = observed();
-    change(run);
-    assert.equal((await completion.check(run)).pass, false);
-  }
-  for (const name of ['en', 'pt-pt']) {
-    const other = approvalLanguageScenario(name);
-    const check = other.completion!(other.world({ now: Date.now }));
-    if (check.kind !== 'check') throw new Error('Missing completion check.');
-    assert.equal((await check.check(observed())).pass, false);
-    const run = observed();
-    run.turns[0].status = 'waiting';
-    assert.equal((await check.check(run)).pass, true);
-  }
+  const run = (...statuses: string[]) =>
+    ({ turns: statuses.map((status, index) => ({ id: `t${index}`, status })) }) as unknown as Run;
+  assert.equal((await completion.check(run('waiting', 'succeeded'))).pass, true);
+  assert.equal((await completion.check(run('succeeded'))).pass, true);
+  assert.equal((await completion.check(run('waiting', 'failed'))).pass, false);
+  assert.equal((await completion.check(run('cancelled', 'succeeded'))).pass, true);
+  assert.equal((await completion.check(run('running'))).pass, false);
+  assert.equal((await completion.check(run())).pass, false);
 });
 
 test('the stop case rejects a task that finished before Stop', async () => {
@@ -3016,6 +2974,7 @@ test('the stack records tool calls, model usage and the main prompts of every tu
     sessionId: 'capture-fixture',
     turnId: 'capture-fixture',
     prompt: 'Inspect the synthetic receipt.',
+    background: true,
     history: [],
     workspacePath: directory,
     signal: t.signal,
@@ -3692,6 +3651,23 @@ test('only calibrated scenarios that passed every one of at least five attempts 
   await rm(root, { recursive: true, force: true });
 });
 
+test('every gate scenario still matches the version that earned its place', async () => {
+  const members = JSON.parse(
+    await readFile(new URL('../gate.json', import.meta.url), 'utf8'),
+  ) as Record<string, { fingerprint: string }>;
+  const stale = Object.entries(members)
+    .filter(
+      ([id, member]) =>
+        !scenarios.some((item) => item.id === id) || fingerprint(id) !== member.fingerprint,
+    )
+    .map(([id]) => id);
+  assert.deepEqual(
+    stale,
+    [],
+    `These gate scenarios changed since they were proven, so the gate would skip them: ${stale.join(', ')}. Run them at least five times and promote the run, or remove them from evals/gate.json in this change.`,
+  );
+});
+
 test('local file checks fail a missing move and any change or trash of the owner files', async () => {
   const world = tidyDownloads.world({ now: Date.now });
   const untouched = Object.fromEntries(
@@ -4076,7 +4052,7 @@ test('eval spend stops on unknown prices and retains discarded retry costs', () 
   unknown.add({ modelCalls: 1, judgeTokens: 0, costUsd: null, judgeCostUsd: null });
   assert.equal(unknown.blocked(10), true);
   assert.equal(unknown.unpriced(), true);
-  assert.equal(unknown.knownCostUsd(), 0);
+  assert.equal(unknown.countedCostUsd(), 0);
   const attempts = [
     {
       costUsd: 0.2,
@@ -4095,7 +4071,7 @@ test('eval spend stops on unknown prices and retains discarded retry costs', () 
   ];
   const priced = createSpend();
   for (const attempt of attempts) priced.add(attempt);
-  assert.equal(priced.knownCostUsd(), 0.53);
+  assert.equal(priced.countedCostUsd(), 0.53);
   assert.equal(priced.blocked(0.53), true);
   assert.deepEqual(mergeAttemptCosts(attempts), {
     costUsd: 0.5,
@@ -4121,6 +4097,152 @@ test('eval spend stops on unknown prices and retains discarded retry costs', () 
       judgeTokens: 1,
     },
   );
+});
+
+test('memory cancellation estimates distinguish dispatch and use the wire request limits', async (t) => {
+  for (const beforeDispatch of [true, false]) {
+    await t.test(beforeDispatch ? 'before transport' : 'after transport', async (t) => {
+      let sent!: () => void;
+      const requestSent = new Promise<void>((resolve) => (sent = resolve));
+      const stop = new AbortController();
+      let sentOutputLimit = 0;
+      let sends = 0;
+      t.mock.method(globalThis, 'fetch', async (_url: RequestInfo | URL, init?: RequestInit) => {
+        sends++;
+        const signal = init?.signal;
+        assert.ok(signal);
+        assert.equal(typeof init.body, 'string');
+        sentOutputLimit = JSON.parse(init.body as string).max_tokens;
+        return new Promise<Response>((_, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+          sent();
+        });
+      });
+      const curator = createPiMemoryCurator({
+        provider: 'anthropic',
+        estimateAnthropicRequestUsd,
+        configured: () => true,
+        resolve: async () => ({
+          provider: 'anthropic',
+          method: 'api_key',
+          effort: 'off',
+          read: async () => ({ type: 'api_key', key: 'fixture-key' }),
+          reserve: async () => {
+            if (beforeDispatch) stop.abort();
+            return async () => {};
+          },
+          definition: {
+            choice: {
+              id: 'fixture-memory-model',
+              name: 'Fixture memory model',
+              efforts: ['off'],
+              images: false,
+              contextWindow: 128_000,
+            },
+            spec: {
+              provider: 'anthropic',
+              api: 'anthropic-messages',
+              id: 'fixture-memory-model',
+              name: 'Fixture memory model',
+              baseUrl: 'https://fixture.invalid',
+              reasoning: false,
+              input: ['text'],
+              contextWindow: 128_000,
+              maxTokens: 4096,
+              cost: {
+                input: 3,
+                output: 12,
+                cacheRead: 0.3,
+                cacheWrite: 6,
+                tiers: [
+                  { inputTokensAbove: 100, input: 10, output: 30, cacheRead: 1, cacheWrite: 20 },
+                ],
+              },
+            },
+          },
+        }),
+      });
+
+      const rows: { cost_usd: number | null; details: object }[] = [];
+      const result = assert.rejects(
+        curator.curate(
+          { task: 'recall', instructions: 'Select synthetic notes.', input: {} },
+          stop.signal,
+          (usage) => rows.push({ cost_usd: usage.costUsd, details: usage }),
+        ),
+      );
+      if (!beforeDispatch) {
+        await Promise.race([
+          requestSent,
+          result.then(() => assert.fail('Recall ended before the request was sent')),
+        ]);
+        stop.abort();
+      }
+      await result;
+
+      const usage = await collectUsage({
+        query: async () => ({ rows }),
+      } as unknown as Stack['pool']);
+      assert.equal(usage.modelCalls, 1);
+      assert.equal(usage.costUsd, null);
+      assert.equal(sends, beforeDispatch ? 0 : 1);
+      if (beforeDispatch) assert.equal(usage.budgetCostUsd, 0);
+      else {
+        assert.ok(sentOutputLimit > 0);
+        assert.ok((usage.budgetCostUsd ?? 0) > (sentOutputLimit * 30) / 1_000_000);
+      }
+      const budget = createSpend();
+      budget.add(usage);
+      assert.equal(budget.blocked(1), false);
+    });
+  }
+});
+
+test('eval budgets count cancelled request estimates and retain unknown spend', async () => {
+  const priced = { cost_usd: 0.125, details: { inputTokens: 20 } };
+  const cancelled = {
+    cost_usd: null,
+    details: { status: 'cancelled', inputTokens: 0, budgetEstimateUsd: 0.25 },
+  };
+  const read = (...rows: { cost_usd: number | null; details: object }[]) =>
+    collectUsage({ query: async () => ({ rows }) } as unknown as Stack['pool']);
+
+  const usage = await read(priced, cancelled);
+  const budget = createSpend();
+  budget.add(usage);
+  assert.equal(budget.blocked(0.5), false);
+  assert.equal(budget.blocked(0.375), true);
+  assert.equal(usage.costUsd, null);
+  assert.equal(usage.modelCalls, 2);
+
+  const tinyCancellation = {
+    ...cancelled,
+    details: { ...cancelled.details, budgetEstimateUsd: 0.00000025 },
+  };
+  const rounded = createSpend();
+  rounded.add(await read(tinyCancellation, tinyCancellation));
+  assert.equal(rounded.blocked(0.000002), true);
+
+  const meteredRetry = await read({
+    cost_usd: 0.01,
+    details: { ...cancelled.details, inputTokens: 20, budgetEstimateUsd: 0.5 },
+  });
+  assert.equal(meteredRetry.costUsd, null);
+  const resumed = createSpend();
+  resumed.add(mergeAttemptCosts([usage, meteredRetry]));
+  assert.equal(resumed.blocked(0.875), true);
+  assert.equal(resumed.blocked(1), false);
+
+  for (const unknown of [
+    { ...cancelled, details: { ...cancelled.details, status: 'succeeded' } },
+    { cost_usd: 0.01, details: { ...cancelled.details, budgetEstimateUsd: null } },
+    { cost_usd: null, details: { status: 'cancelled', inputTokens: 0 } },
+  ]) {
+    const failClosed = createSpend();
+    failClosed.add(mergeAttemptCosts([await read(unknown), usage]));
+    assert.equal(failClosed.unpriced(), true);
+    assert.equal(failClosed.blocked(10), true);
+  }
 });
 
 test('LongMemEval reports saved failures when the budget prevents a retry', async (t) => {

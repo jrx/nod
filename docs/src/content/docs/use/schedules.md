@@ -61,6 +61,7 @@ flowchart TD
 ```
 
 - **It runs next to your chat.** A schedule doesn't wait for the conversation, and the conversation doesn't wait for it.
+- **Follow a run in Scheduled.** The schedule shows what Nod is doing, such as reading files or using an app. Open the live line to see recent completed activity when it is available.
 - **What you asked to get arrives every time.** A summary, brief or reminder comes on every run. A watch or check-in messages you only when something needs you, such as a real price drop, a problem or a question. Routine checks stay quiet.
 - **A failed run tells you.** If a run stops on an error, Nod sends a short message that names the schedule and says what stopped it, so a missing summary never goes unnoticed.
 - **It replies where you asked.** A schedule you set up on Telegram sends its messages to Telegram.
@@ -77,13 +78,13 @@ Each run shows its status. When a saved web reply is available, select **See det
 
 ## Work Nod starts on its own
 
-Nod reads every app you connect on its own, prepares useful work privately and messages you only when it's worth it. See [Nudges](/use/nudges/). There's nothing to turn on. At any time, you can say what's worth interrupting you for, such as "tell me when a client emails", and Nod uses it to choose what to flag.
+Nod watches Gmail and Google Calendar on its own, prepares useful work privately and messages you only when it's worth it. See [Nudges](/use/nudges/). Turn on **Automatic preparation** in **Settings → Notifications**. New profiles start with it off. At any time, you can say what's worth interrupting you for, such as "tell me when a client emails", and Nod uses it to choose what to flag.
 
 How Nod checks:
 
 - **Gmail.** Nod checks for new inbox mail every 15 minutes. If a check is temporarily unavailable, it keeps the messages already found and schedules another check one to five minutes later. Each new message starts a quiet private run that decides whether there's useful work, such as preparing a reply.
 - **Google Calendar.** Nod checks for changed events every 30 minutes without a model call.
-- **Other connected apps.** Every 30 minutes, one quiet private run reads them through their own read tools.
+- **Other connected apps.** No periodic check. An app event starts preparation. You can still ask Nod to read them in chat or in a schedule.
 
 Work Nod starts on its own reads and drafts. It sends, deletes or changes something only when you've told it to do that on its own, such as "whenever Ana sends an invoice, forward it to accounting@acme.com". Anything else waits for your yes. [Your rules](/trust/approvals/#your-rules) can change both: a rule to go ahead lets an action run without asking, and a rule to ask first makes Nod ask even when your standing instruction covers the action. See [Standing instructions](/trust/approvals/#standing-instructions). To change or stop it, tell Nod, for example "stop flagging Slack messages".
 

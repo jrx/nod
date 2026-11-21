@@ -155,7 +155,9 @@ export function createMemoryLearning(options: {
     raw: unknown,
     sourceMessageId: string | null,
     commit: <T>(write: () => Promise<T>) => Promise<T> = (write) => write(),
+    signal?: AbortSignal,
   ) {
+    signal?.throwIfAborted();
     const input = rememberInput.parse(raw);
     if (!sourceMessageId) throw new Error('Only a message from the owner can save to memory.');
     if (!options.curator.configured) throw new Error('Saving to memory needs the memory model.');
@@ -197,19 +199,24 @@ export function createMemoryLearning(options: {
     const said = numbered(ordered);
     const ask = async () =>
       answer.safeParse(
-        await options.curator.curate({
-          task: 'remember',
-          instructions: rememberInstructions(tree.sensitive),
-          input: {
-            today: new Date().toISOString().slice(0, 10),
-            memory: JSON.stringify(indexLayout(tree, { tentative: true })),
-            current: said.at(-1),
-            earlier: said.slice(0, -1),
+        await options.curator.curate(
+          {
+            task: 'remember',
+            instructions: rememberInstructions(tree.sensitive),
+            input: {
+              today: new Date().toISOString().slice(0, 10),
+              memory: JSON.stringify(indexLayout(tree, { tentative: true })),
+              current: said.at(-1),
+              earlier: said.slice(0, -1),
+            },
           },
-        }),
+          signal,
+        ),
       );
     let reply = await ask();
+    signal?.throwIfAborted();
     if (!reply.success) reply = await ask();
+    signal?.throwIfAborted();
     if (!reply.success)
       throw new Error('The memory model gave no usable answer. Nothing was saved.');
     const changes = await commit(() =>

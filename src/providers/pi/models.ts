@@ -19,7 +19,11 @@ import { Agent, Dispatcher1Wrapper } from 'undici';
 import { z } from 'zod';
 import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
 import { logFailure } from '../../ports/failure-log.ts';
-import { ModelAuthError, ModelWorkspaceSelectionError } from '../../ports/models.ts';
+import {
+  ModelAuthError,
+  ModelCatalogError,
+  ModelWorkspaceSelectionError,
+} from '../../ports/models.ts';
 import { appPages } from '../../shared/app-links.ts';
 import { ElevenLabsConnectionError, readElevenLabsVoices } from '../elevenlabs/speech.ts';
 import { openAIBaseUrl, openAIRequestError } from '../openai/api.ts';
@@ -28,10 +32,12 @@ import type {
   ModelBackend,
   ModelCredential,
   ModelDefinition,
+  ModelCatalogFailure,
 } from '../../ports/models.ts';
 import {
   bedrockRegionPattern,
   boundedPrice,
+  modelPricingSignature,
   modelProviders,
   modelProviderNames,
   type ModelProvider,
@@ -49,6 +55,7 @@ import { modelServiceError } from '../model-error.ts';
 import {
   antLingModel,
   nativeAudioModel,
+  openAIModels,
   assistantModelId,
   assistantModels,
   cloudflareCredential,
@@ -265,6 +272,12 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
     const headers: Record<string, string> = credential.key
       ? { Authorization: `Bearer ${credential.key}` }
       : {};
+    const secrets = [credential.url, credential.key ?? ''].flatMap((value) => [
+      value,
+      encodeURIComponent(value),
+      JSON.stringify(value).slice(1, -1),
+    ]);
+    const failures: ModelCatalogFailure[] = [];
     let found: { url: string; data: unknown[] } | undefined;
     for (const url of credential.url.endsWith('/v1')
       ? [credential.url]
@@ -274,15 +287,26 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         redirect: 'error',
         signal: AbortSignal.timeout(15000),
       });
+      const path = url === credential.url ? '/models' : '/v1/models';
+      if (!response.ok) {
+        const error = await modelServiceError(response, 'Model discovery', secrets);
+        failures.push({ path, status: error.status, detail: error.details ?? '' });
+        continue;
+      }
       const list = z
         .object({ data: z.array(z.unknown()) })
-        .safeParse(response.ok ? await response.json().catch(() => undefined) : undefined);
+        .safeParse(await response.json().catch(() => undefined));
       if (list.success) {
         found = { url, data: list.data.data };
         break;
       }
+      failures.push({
+        path,
+        status: response.status,
+        detail: 'The server returned an invalid model list.',
+      });
     }
-    if (!found) throw new Error('The server’s model list could not be loaded.');
+    if (!found) throw new ModelCatalogError(failures);
     const size = z.number().int().positive().optional().catch(undefined);
     const listed = entries(
       found.data,
@@ -308,6 +332,15 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
       serverJson('/api/v1/models'),
     ]);
     const ollama = z.object({ version: z.string() }).safeParse(version).success;
+    const running = ollama ? await serverJson('/api/ps') : undefined;
+    const loadedModels = entries(
+      z.object({ models: z.array(z.unknown()) }).safeParse(running).data?.models ?? [],
+      z.object({
+        name: z.string().min(1).max(200).optional(),
+        model: z.string().min(1).max(200).optional(),
+        context_length: z.number().int().positive(),
+      }),
+    );
     const studioModels = entries(
       z.object({ models: z.array(z.unknown()) }).safeParse(studio).data?.models ?? [],
       lmStudioModelSchema,
@@ -333,12 +366,20 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
               ? ollamaModel(shown.data)
               : undefined;
           if (known?.usable === false) return [];
-          const contextWindow =
+          const reportedContext =
             known?.contextWindow ??
             entry.context_length ??
             entry.context_window ??
             entry.max_model_len ??
             128_000;
+          const contextWindow = Math.min(
+            reportedContext,
+            ...(studioModel
+              ? []
+              : loadedModels
+                  .filter((model) => model.name === entry.id || model.model === entry.id)
+                  .map((model) => model.context_length)),
+          );
           return [
             definition({
               id: entry.id,
@@ -426,11 +467,13 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         signal: AbortSignal.timeout(15000),
       },
     );
-    await response.body?.cancel();
-    if ([400, 401, 403].includes(response.status))
+    if ([400, 401, 403].includes(response.status)) {
+      await response.body?.cancel();
       throw new ModelAuthError('Google Vertex AI didn’t accept this API key.');
+    }
     if (!response.ok && response.status !== 404)
-      throw new Error('The model service is temporarily unavailable. Try again.');
+      throw await modelServiceError(response, 'Google Vertex AI model discovery', [credential.key]);
+    await response.body?.cancel();
     return local.map(definition);
   }
   async function azureCatalog(local: readonly Model<Api>[], credential: ModelCredential) {
@@ -831,6 +874,12 @@ export function createPiModelBackend(options: { fetch?: typeof fetch } = {}): Mo
         const ids = new Set(
           list.filter((m) => !m.visibility || m.visibility === 'list').map((m) => m.slug ?? m.id),
         );
+        if (provider === 'openai')
+          local.push(
+            ...openAIModels(credential.type === 'api_key' ? credential.region : undefined).filter(
+              (model) => !local.some(({ id }) => id === model.id),
+            ),
+          );
         return local.filter((m) => ids.has(m.id)).map(definition);
       }
       const list = entries(
@@ -1181,7 +1230,7 @@ export async function createPiModelRuntime(
     let phase: ModelRequestFacts['requestPhase'] = 'prepare';
     let status: number | undefined;
     let transportCause: string | undefined;
-    let completeRequest: ((error?: string) => Promise<void>) | undefined;
+    let completeRequest: ((error?: string, status?: number) => Promise<void>) | undefined;
     let settleBudget: ((spentUsd: number | null) => Promise<void>) | undefined;
     const silence = new AbortController();
     let silenceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1264,6 +1313,8 @@ export async function createPiModelRuntime(
                 }
                 throw error;
               });
+              phase = 'response';
+              status = response.status;
               return usage ? usage.response(response) : response;
             },
           }
@@ -1408,6 +1459,7 @@ export async function createPiModelRuntime(
           )
             await completeRequest?.(
               message.stopReason === 'error' ? message.errorMessage : undefined,
+              status,
             );
         }
         if (event.type === 'done' || event.type === 'error') {
@@ -1446,6 +1498,7 @@ export async function createPiModelRuntime(
           costUsd: null,
           pricing: 'unavailable',
           ...piUsageMetrics(message?.usage),
+          pricingSignature: modelPricingSignature(target.cost, target.api),
         });
       };
       const cancel = () => report();

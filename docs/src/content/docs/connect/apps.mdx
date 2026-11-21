@@ -53,17 +53,22 @@ The trust check protects requests made through Nod. It cannot block someone who 
 
 Browse [custom connections](/connect/community-apps/) for apps that use their own MCP servers. To add a community or partner app, follow [Creating your own connectors](/contribute/apps/).
 
+These steps apply to apps connected through Composio, such as Gmail and Outlook. For Notion, Linear, n8n and other MCP apps, follow [MCP servers, APIs and CLIs](/connect/mcp-api-cli/).
+
 <Steps>
 
 1. Open **Apps**, find an app and select **Connect**.
-2. Sign in on the app's consent screen and choose what Nod can access. The screen may show Composio, the service that connects the app, instead of Nod.
-3. Return to Nod when the app is connected.
+2. Read the data handling notice, then select **Continue to sign in**. No remote connection starts before this step.
+3. Sign in on the app's consent screen and choose what Nod can access. The screen may show Composio, the service that connects the app, instead of Nod.
+4. Return to Nod when the app is connected.
 
 </Steps>
 
 You can also ask Nod in chat. It searches the same catalog with your saved account status, so it can use an existing connection or explain the available recovery steps when an account is unavailable. When you need a new connection, it sends you a private connection link, shown as a connect button in Nod. Sign-in links never go through Telegram or WhatsApp: there, Nod asks you to open Nod, where the button waits in the chat.
 
 Use **Ask Nod** in the **Connect another tool** card below the catalog to get help connecting a tool. It opens chat with your search included, so Nod can guide the setup. If you already have an MCP server address, use **Connect MCP** at the top of the page.
+
+For Composio apps, the data handling notice appears in the desktop app and on a self-hosted server. This includes installs that use a custom connection service. It also appears for connection links from chat, onboarding and reconnection. App content, including email messages, passes through the connection service and Composio when Nod reads or sends it. Both services can read this content. See [data handling and retention](/trust/privacy/#composio-zero-data-retention).
 
 The sign-in dialog closes automatically once Nod confirms the connection.
 
@@ -122,6 +127,7 @@ Nod changes your apps only as far as you ask. Ask what needs a reply and it tell
 ## Related resources
 
 - [Local files](/connect/local-files/)
+- [Computer use](/connect/computer-use/)
 - [Models](/connect/models/)
 - [MCP servers, APIs and CLIs](/connect/mcp-api-cli/)
 - [Approvals and the trust check](/trust/approvals/)

@@ -1,4 +1,5 @@
 import { BrowserActionError } from '../../ports/computer.ts';
+import type { BrowserSignInGuard } from '../../shared/browser-errors.ts';
 type FrameNode = {
   frame: { id: string; loaderId?: string; securityOrigin?: string };
   childFrames?: FrameNode[];
@@ -31,6 +32,10 @@ type ControlQuery = {
   control?: { role: string; name: string };
   focused?: boolean;
 };
+
+function signInFailure(guard: BrowserSignInGuard, message: string) {
+  return Object.assign(new Error(message), { signInGuard: guard });
+}
 
 const active = `(() => { if (!document.hasFocus()) return null; let node = document.activeElement; for (;;) { const root = node && (node.shadowRoot ?? (globalThis.__nodRoots ?? []).find(root => root.host === node)); if (!root?.activeElement) break; node = root.activeElement; } return node && !['IFRAME', 'FRAME', 'BODY', 'HTML'].includes(node.tagName) ? node : null; })()`;
 const focusScript = `(() => { const node = ${active}; globalThis.__nodFocused = node; return node ? node.tagName : ''; })()`;
@@ -365,9 +370,16 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
         .node.backendNodeId;
     const hit = async (x: number, y: number, target: string, frame?: string) => {
       type Hit = { nodeName: string; backendNodeId: number; frameId?: string; pseudoType?: string };
+      const { cssLayoutViewport: view } = (await send('Page.getLayoutMetrics', {}, target)) as {
+        cssLayoutViewport: { pageX: number; pageY: number };
+      };
       const found = (await send(
         'DOM.getNodeForLocation',
-        { x, y, ignorePointerEventsNone: !hitTest },
+        {
+          x: Math.round(x + view.pageX),
+          y: Math.round(y + view.pageY),
+          ignorePointerEventsNone: !hitTest,
+        },
         target,
       )) as { backendNodeId?: number; frameId?: string };
       if (!found.backendNodeId || (frame && found.frameId !== frame)) return undefined;
@@ -572,7 +584,7 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           session,
         )) as { result?: { objectId?: string }; exceptionDetails?: unknown };
         if (exceptionDetails || (result?.objectId && found))
-          throw new BrowserActionError('browser_sign_in_choice');
+          throw new BrowserActionError('browser_sign_in_choice', undefined, 'selector_rejected');
         if (result?.objectId) {
           const { node } = (await send(
             'DOM.describeNode',
@@ -897,7 +909,8 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
     },
     async signInControl(query: ControlQuery): Promise<BoundSignInControl> {
       const found = query.selector ? await signInSelector(query.selector) : await locate(query);
-      if (!found) throw new BrowserActionError('browser_sign_in_choice');
+      if (!found)
+        throw new BrowserActionError('browser_sign_in_choice', undefined, 'choice_missing');
       try {
         const frames = await tree(found.session);
         let frame: FrameNode['frame'] | undefined;
@@ -919,7 +932,8 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
             break;
           }
         }
-        if (!frame?.loaderId || !objectId) throw new BrowserActionError('browser_target_changed');
+        if (!frame?.loaderId || !objectId)
+          throw new BrowserActionError('browser_target_changed', undefined, 'frame_changed');
         const { result, exceptionDetails } = (await send(
           'Runtime.callFunctionOn',
           {
@@ -930,22 +944,23 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           found.session,
         )) as { result?: { objectId?: string }; exceptionDetails?: unknown };
         if (exceptionDetails || !result?.objectId)
-          throw new BrowserActionError('browser_sign_in_choice');
+          throw new BrowserActionError('browser_sign_in_choice', undefined, 'choice_ineligible');
         const { node } = (await send(
           'DOM.describeNode',
           { objectId: result.objectId },
           found.session,
         )) as { node: { backendNodeId: number } };
         const snapshot = await snapshotOf(result.objectId, found.session);
-        if (!snapshot) throw new BrowserActionError('browser_sign_in_choice');
+        if (!snapshot)
+          throw new BrowserActionError('browser_sign_in_choice', undefined, 'choice_ineligible');
         const controls = await controlsFor({
           backendNodeId: node.backendNodeId,
           session: found.session,
         });
         if (!controls[0]?.name || !['button', 'link'].includes(controls[0].role))
-          throw new BrowserActionError('browser_sign_in_choice');
+          throw new BrowserActionError('browser_sign_in_choice', undefined, 'choice_accessibility');
         if ((await snapshotOf(result.objectId, found.session)) !== snapshot)
-          throw new BrowserActionError('browser_target_changed');
+          throw new BrowserActionError('browser_target_changed', undefined, 'control_changed');
         const details = JSON.parse(snapshot) as {
           origin: string;
           url: string;
@@ -980,10 +995,11 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           break;
         }
       }
-      if (!session) throw new Error('The sign-in document changed.');
+      if (!session) throw signInFailure('frame_changed', 'The sign-in document changed.');
       const name = `nodSignIn${crypto.randomUUID().replaceAll('-', '')}`;
       let pressed = false;
       let outcome: boolean | undefined;
+      const guardRefused = () => outcome === false;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let context: number | undefined;
       try {
@@ -996,43 +1012,66 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
           session,
         )) as { quads: number[][] };
         const quad = quads.find((value) => value.length === 8 && value.every(Number.isFinite));
-        if (!quad) throw new Error('The sign-in control is no longer visible.');
-        const point = {
+        if (!quad)
+          throw signInFailure('control_hidden', 'The sign-in control is no longer visible.');
+        const inputPoint = {
           x: (quad[0]! + quad[2]! + quad[4]! + quad[6]!) / 4,
           y: (quad[1]! + quad[3]! + quad[5]! + quad[7]!) / 4,
         };
-        if (session !== page) {
-          const { backendNodeId } = (await send(
-            'DOM.getFrameOwner',
-            { frameId: control.targetFrameId },
-            page,
-          )) as { backendNodeId: number };
-          const { model } = (await send('DOM.getBoxModel', { backendNodeId }, page)) as {
-            model: { content: number[]; border: number[]; width: number; height: number };
-          };
-          const content = model.content;
-          if (
-            content[1] !== content[3] ||
-            content[0] !== content[6] ||
-            content[2] !== content[4] ||
-            content[5] !== content[7] ||
-            model.border[2]! - model.border[0]! !== model.width ||
-            model.border[5]! - model.border[1]! !== model.height
-          )
-            throw new Error('The sign-in frame could not be located safely.');
-          point.x += content[0]!;
-          point.y += content[1]!;
-        }
         const check = async () => {
+          const point = { ...inputPoint };
+          if (session !== page) {
+            const { backendNodeId } = (await send(
+              'DOM.getFrameOwner',
+              { frameId: control.targetFrameId },
+              page,
+            )) as { backendNodeId: number };
+            const { model } = (await send('DOM.getBoxModel', { backendNodeId }, page)) as {
+              model: { content: number[]; border: number[]; width: number; height: number };
+            };
+            const content = model.content;
+            if (
+              content[1] !== content[3] ||
+              content[0] !== content[6] ||
+              content[2] !== content[4] ||
+              content[5] !== content[7] ||
+              model.border[2]! - model.border[0]! !== model.width ||
+              model.border[5]! - model.border[1]! !== model.height
+            )
+              throw signInFailure(
+                'frame_transform',
+                'The sign-in frame could not be located safely.',
+              );
+            point.x += content[0]!;
+            point.y += content[1]!;
+            const { cssVisualViewport: viewport } = (await send(
+              'Page.getLayoutMetrics',
+              {},
+              page,
+            )) as {
+              cssVisualViewport: { clientWidth: number; clientHeight: number };
+            };
+            if (
+              point.x < 0 ||
+              point.y < 0 ||
+              point.x >= viewport.clientWidth ||
+              point.y >= viewport.clientHeight
+            )
+              throw signInFailure(
+                'control_hidden',
+                'The sign-in control is outside the browser viewport.',
+              );
+          }
           if (
             (await controlSnapshot(objectId, session!)) !== control.snapshot ||
             JSON.stringify(
               await controlsFor({ backendNodeId: control.backendNodeId, session: session! }),
             ) !== JSON.stringify(control.controls)
           )
-            throw new Error('The sign-in control changed.');
+            throw signInFailure('control_changed', 'The sign-in control changed.');
           const hit = await locate({ pixel: point }, true);
-          if (!hit || hit.session !== session) throw new Error('The sign-in control is covered.');
+          if (!hit || hit.session !== session)
+            throw signInFailure('control_covered', 'The sign-in control is covered.');
           const hitId = await resolveControl(hit.backendNodeId, session!, control.frameId);
           const { result, exceptionDetails } = (await send(
             'Runtime.callFunctionOn',
@@ -1045,10 +1084,10 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
             session,
           )) as { result?: { value?: boolean }; exceptionDetails?: unknown };
           if (exceptionDetails || result?.value !== true)
-            throw new Error('The sign-in control is covered.');
+            throw signInFailure('control_covered', 'The sign-in control is covered.');
         };
         await check();
-        await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...point }, page);
+        await send('Input.dispatchMouseEvent', { type: 'mouseMoved', ...inputPoint }, session);
         await check();
         await send('Runtime.enable', {}, session);
         await send('Runtime.addBinding', { name, executionContextId: context }, session);
@@ -1081,25 +1120,33 @@ export async function openDevtools(url: string, targetId: string, signal?: Abort
         pressed = true;
         await send(
           'Input.dispatchMouseEvent',
-          { type: 'mousePressed', ...point, button: 'left', buttons: 1, clickCount: 1 },
-          page,
+          { type: 'mousePressed', ...inputPoint, button: 'left', buttons: 1, clickCount: 1 },
+          session,
         );
-        if (outcome === false) throw new Error('The sign-in control changed.');
+        if (guardRefused())
+          throw signInFailure('click_guard_changed', 'The sign-in control changed.');
         await check();
         await send(
           'Input.dispatchMouseEvent',
-          { type: 'mouseReleased', ...point, button: 'left', buttons: 0, clickCount: 1 },
-          page,
+          { type: 'mouseReleased', ...inputPoint, button: 'left', buttons: 0, clickCount: 1 },
+          session,
         );
         pressed = false;
         timer = setTimeout(() => resolveClick(false), 5000);
-        if (!(await clicked)) throw new Error('The sign-in control did not receive the click.');
+        if (!(await clicked)) {
+          if (guardRefused())
+            throw signInFailure('click_guard_changed', 'The sign-in control changed.');
+          throw signInFailure(
+            'click_not_received',
+            'The sign-in control did not receive the click.',
+          );
+        }
       } finally {
         if (pressed)
           await send(
             'Input.dispatchMouseEvent',
             { type: 'mouseReleased', x: -1, y: -1, button: 'left', buttons: 0 },
-            page,
+            session,
             true,
           ).catch(() => {});
         clearTimeout(timer);

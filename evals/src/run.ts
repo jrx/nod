@@ -332,7 +332,7 @@ export async function runSuite(options: RunOptions) {
       console.log(
         accounting.unpriced()
           ? 'Stopped: completed model usage has no valid price. Remaining attempts and retries were not run.'
-          : `Stopped: spent $${accounting.knownCostUsd().toFixed(2)} of the $${options.budget} budget. Remaining attempts were not run.`,
+          : `Stopped: counted $${accounting.countedCostUsd().toFixed(2)} of the $${options.budget} budget. Remaining attempts were not run.`,
       );
     };
     const started = Date.now();

@@ -78,7 +78,7 @@ type AnalyticsEvents = {
     action: 'copy' | 'download' | 'download_requested' | 'open' | 'reveal' | 'reuse_requested';
   };
   settings_viewed: {
-    tab: 'general' | 'notifications' | 'models' | 'voice' | 'memory' | 'privacy';
+    tab: 'general' | 'notifications' | 'models' | 'voice' | 'memory' | 'computer' | 'privacy';
   };
   chat_message_sent: {
     has_attachments: boolean;
@@ -226,7 +226,7 @@ const eventProperties: Record<keyof AnalyticsEvents, Record<string, readonly unk
     action: ['copy', 'download', 'download_requested', 'open', 'reveal', 'reuse_requested'],
   },
   settings_viewed: {
-    tab: ['general', 'notifications', 'models', 'voice', 'memory', 'privacy'],
+    tab: ['general', 'notifications', 'models', 'voice', 'memory', 'computer', 'privacy'],
   },
   chat_message_sent: {
     has_attachments: [true, false],

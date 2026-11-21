@@ -1,10 +1,15 @@
-import { browserErrorMessage, type BrowserErrorCode } from '../shared/browser-errors.ts';
+import {
+  browserErrorMessage,
+  type BrowserErrorCode,
+  type BrowserSignInGuard,
+} from '../shared/browser-errors.ts';
 import type { BrowserHandoffInput } from '../shared/browser-handoff.ts';
 
 export class BrowserActionError extends Error {
   constructor(
     readonly code: BrowserErrorCode,
     readonly detail?: string,
+    readonly signInGuard?: BrowserSignInGuard,
   ) {
     super(
       detail

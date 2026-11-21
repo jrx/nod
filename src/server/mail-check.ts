@@ -2,6 +2,15 @@ import type { DecisionModel, DecisionQuestion } from '../ports/decisions.ts';
 import type { MemoryCurator } from '../ports/memory-curator.ts';
 import type { MailCheck } from './integration-result.ts';
 import { spendingLimitReached } from './ledger.ts';
+import { logFailure } from './failure-log.ts';
+
+const decisionFailures: Record<string, string> = {
+  decision_http: 'the check model request failed',
+  decision_transport: 'the check model connection failed',
+  decision_response: 'the check model response could not be read',
+  decision_json: 'the check model returned invalid JSON',
+  decision_validation: 'the check model returned an invalid response',
+};
 
 export function createMailCheck({
   curator,
@@ -127,9 +136,26 @@ export function createMailCheck({
           if (read.signal.aborted) return stopped;
           if (error instanceof Error && error.message === spendingLimitReached)
             return spendingLimitReached;
-          return typeof (error as { status?: unknown })?.status === 'number'
-            ? `the check model request failed (HTTP ${(error as { status: number }).status})`
-            : 'the check model request failed';
+          const status =
+            (error as { status?: unknown })?.status ??
+            (error as { providerStatus?: unknown })?.providerStatus;
+          const httpStatus =
+            typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
+              ? status
+              : undefined;
+          const supplied = (error as { code?: unknown })?.code;
+          const code =
+            typeof supplied === 'string' && Object.hasOwn(decisionFailures, supplied)
+              ? supplied
+              : 'mail_check_request';
+          logFailure(
+            'mail_check_failed',
+            Object.assign(new Error('The mail safety check failed.'), {
+              code,
+              ...(httpStatus === undefined ? {} : { status: httpStatus }),
+            }),
+          );
+          return `${decisionFailures[code] ?? 'the check model request failed'}${httpStatus === undefined ? '' : ` (HTTP ${httpStatus})`}`;
         }
       }),
     );

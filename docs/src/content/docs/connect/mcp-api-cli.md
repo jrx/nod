@@ -23,7 +23,7 @@ Nod can use every tool these servers offer, so it can read and change pages, iss
 
 ## n8n
 
-Nod builds, tests and changes n8n workflows and n8n Agents through your n8n instance's MCP server. Open **Apps**, select **Connect** on n8n and enter your n8n address, such as `https://you.app.n8n.cloud` or `localhost:5678`. Nod opens n8n's own sign-in and consent page. To use an access token instead, open **Use an access token instead** and paste the token from n8n under **Settings**, **Instance-level MCP**.
+Nod builds, tests and changes n8n workflows and n8n Agents through your n8n instance's MCP server. Open **Apps**, select **Connect** on n8n and enter your n8n address, such as `https://you.app.n8n.cloud` or `localhost:5678`. Nod opens n8n's own sign-in and consent page. To use an access token instead, open **Use an access token instead** and paste the token from n8n under **Settings**, **Instance-level MCP**. This is the instance-level MCP token. An n8n API key doesn't work here.
 
 If n8n answers at `http://localhost:5678` from Nod's server, the form opens with that address filled in. Nod checks only that address when the form opens, and connects only when you select **Connect n8n**.
 
@@ -35,7 +35,11 @@ Nod loads n8n's tools only when a task needs them and follows n8n's own guide fo
 
 ## Connect another service
 
+Search **Apps** by service name. If it isn’t listed, select **Ask Nod** on the **Connect another tool** card for help setting it up.
+
 To connect an MCP server yourself, open **Apps** and select **Connect MCP**. Enter a name of up to 80 characters, such as `Work email (n8n)`, and the server URL, then choose browser sign-in, an access token or an API key. Select **Continue** to finish authentication in the private setup dialog. For any MCP server, including Notion, Linear and n8n, the dialog shows the service's reason if sign-in can't start. When the server ends sign-in with an error, the dialog shows that error, with secrets removed. Only a sign-in you decline counts as cancelled. **Connection details** shows any extra setup instructions. Tokens stay outside the chat.
+
+To rename a server you added with **Connect MCP**, open **Apps**, open **Manage accounts** on the server’s card, and select **Rename**. The new name applies to every account on that card. You can search for it in Apps or ask for it by name in chat.
 
 The URL can be a public HTTPS address or, when you type it yourself, an address on your own computer or network, such as `http://127.0.0.1:8080/mcp` or a Tailscale name. Without `http://` or `https://`, Nod uses HTTPS. A public HTTPS address you type can also use a port other than 443. In the desktop app, `localhost` is your computer. Inside Docker, it is Nod's container. A private address stays bound to the origin you entered, also when you reconnect. HTTP is allowed only for private addresses. With browser sign-in, the server's sign-in service can be at another address only when that address is public and uses HTTPS on the standard port. Connections that Nod proposes in chat must use a public HTTPS address.
 
@@ -45,11 +49,11 @@ A failed tool request keeps the server's status and reason. Nod does not retry i
 
 Ask Nod to connect a service it can't find in the app catalog. Nod proposes a way in, called an access path, and sends you a link to a private setup page. There, you paste a token or sign in. The model never sees the token.
 
-| Access path | What Nod calls                                                 | How it signs in                       |
-| ----------- | -------------------------------------------------------------- | ------------------------------------- |
-| MCP server  | Tools on a public HTTPS MCP server, or a private one you enter | A token in a header, or OAuth sign-in |
-| HTTP API    | A method and path on the API                                   | A token in a header                   |
-| CLI         | A command with arguments                                       | Tokens in environment variables       |
+| Access path | What Nod calls                                                 | How it signs in                                    |
+| ----------- | -------------------------------------------------------------- | -------------------------------------------------- |
+| MCP server  | Tools on a public HTTPS MCP server, or a private one you enter | A token in a header, or OAuth sign-in              |
+| HTTP API    | A method and path on the API                                   | A token in a header, or OAuth sign-in              |
+| CLI         | A command with arguments                                       | Tokens and other settings in environment variables |
 
 Some services give each region or workspace its own MCP address, such as a separate EU address, each with its own sign-in. On those services, an account can only sign in through its own address. Nod picks the address from a workspace address you give it, or asks for your workspace address or region before it proposes a connection. If sign-in ends on the service's home page instead of returning to Nod, tell Nod your workspace address and start again, or select **Connect MCP** and enter the address for your region.
 
@@ -67,7 +71,7 @@ A CLI path declares where to install the tool from:
 
 It also names the environment variables the tool reads its credentials from, such as `GITHUB_TOKEN`, or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Each name must end in `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `_ID` or `_SID`, so it can't be a variable that loads code, such as `LD_PRELOAD`. A tool with several variables is its own connection.
 
-The setup page shows the source and one field per variable, so you can check it before you paste anything. A command runs for up to 59 minutes unless Nod asks for longer.
+The setup page shows the source and one field per variable, so you can check it before you paste anything. A command runs for up to 59 minutes unless Nod asks for longer. Installing a missing CLI has its own 10-minute limit before that. When an install runs longer, the error says "The connected CLI install ran longer than its 600-second limit."
 
 ```mermaid
 flowchart LR
