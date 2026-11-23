@@ -88,7 +88,7 @@ Selection can make mistakes. If a call fails or returns invalid data, Nod keeps 
 
 ## How the model saves memory
 
-The memory tools are actions of Pi's `manage_personal_context` tool. Pi never writes a note. `memory_learn` names the owner's messages, and the memory model writes the notes from them:
+The memory tools are actions of Pi's `memory` tool. Pi never writes a note. `memory_learn` names the owner's messages, and the memory model writes the notes from them:
 
 ```mermaid
 flowchart LR

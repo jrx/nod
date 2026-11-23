@@ -1042,12 +1042,14 @@ export function createIntegrationFixture(
         },
         async search() {
           return {
-            tools: realistic
-              ? toolDefinitions.map((tool) => ({
-                  ...tool,
-                  description: tool.description.replace(/synthetic /gi, ''),
-                }))
-              : toolDefinitions,
+            tools: Object.fromEntries(
+              toolDefinitions.map(({ name, ...tool }) => [
+                name,
+                realistic
+                  ? { ...tool, description: tool.description.replace(/synthetic /gi, '') }
+                  : tool,
+              ]),
+            ),
             suggestions: [
               {
                 useCase: realistic

@@ -262,12 +262,18 @@ export function createTrust(options: {
       });
     if (basis) {
       const latest = await context();
-      await withTurnLock(turn.turnId, async () => undefined);
-      unchanged();
       const permission = ({ words }: typeof captured) =>
         JSON.stringify([words.userRules ?? '', words.standingInstruction ?? '']);
       if (permission(latest) !== permission(captured))
         throw new Error('The owner rules changed while this action was being checked.');
+      await withTurnLock(turn.turnId, async (client) => {
+        if (basis.kind !== 'read')
+          await client.query(
+            'UPDATE turns SET outside_action_at=COALESCE(outside_action_at,now()) WHERE id=$1 AND owner_id=$2',
+            [turn.turnId, ownerId],
+          );
+      });
+      unchanged();
       return { confirm: false, basis, ...revision, ...instructionChange };
     }
     if (

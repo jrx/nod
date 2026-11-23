@@ -17,7 +17,7 @@ export type AgentReactionResult =
   | { status: 'updated' | 'unchanged' }
   | {
       status: 'skipped';
-      reason: 'cooldown' | 'already_reacted' | 'unavailable' | 'unsupported' | 'delivery_failed';
+      reason: 'already_reacted' | 'unavailable' | 'unsupported' | 'delivery_failed';
     };
 export interface Message {
   id: string;
@@ -54,6 +54,7 @@ export interface MessageApproval {
   fields?: Array<{ label: string; value: string }>;
   body?: string;
   bodyCut?: true;
+  cardQuestion?: string;
 }
 export interface SubmitMessageResponse {
   threadId: string;

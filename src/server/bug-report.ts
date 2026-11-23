@@ -91,6 +91,8 @@ const tools = [
   'follow_up',
   'manage_apps',
   'manage_personal_context',
+  'memory',
+  'nod',
   'pay',
   'react_to_message',
   'send_message',

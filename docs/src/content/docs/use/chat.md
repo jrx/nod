@@ -231,7 +231,7 @@ Nod can also end a run after five repeated failures for the same tool. These inc
 
 If the service reports an oversized tokens-per-minute request, the error keeps its requested and allowed token counts and suggests shortening the conversation or choosing a model with a higher limit. If a daily quota error includes a retry delay, Nod gives you an approximate wait time. For an account or workspace usage cap, wait for the limit to reset or check its settings; a workspace admin may need to raise it. Nod's next turn knows what went wrong.
 
-If Nod restarts during a run you started, that run fails and Nod posts an interruption notice. Nod never repeats failed or interrupted work on its own. Saved tasks and waiting questions survive a restart.
+If Nod restarts during a run you started, that run fails and Nod posts an interruption notice. The notice says nothing was sent, submitted or deleted when the run hadn't started an outside action since your last message. Otherwise it asks you to check that action before you continue. Reply to continue. Nod never repeats failed or interrupted work on its own. Saved tasks and waiting questions survive a restart.
 
 If Nod may have sent or changed something, verify the result yourself or ask Nod to inspect it before continuing. Don't make a new attempt while the result is unclear.
 

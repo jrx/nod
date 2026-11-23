@@ -2954,7 +2954,7 @@ test('the stack records tool calls, model usage and the main prompts of every tu
           options.onEvent(usage('main'));
           await tool('apps').execute({ action: 'GMAIL_FETCH_EMAILS', args: {} });
           await tool('browser').execute({ action: 'fill', selector: '@e1', text: 'private' });
-          await tool('manage_personal_context').execute({
+          await tool('memory').execute({
             action: 'memory_find',
             args: { query: 'private' },
           });
@@ -3014,12 +3014,8 @@ test('the stack records tool calls, model usage and the main prompts of every tu
     ['tool_end', 'apps', 'succeeded', { messages: ['Receipt'] }],
     ['tool_start', 'browser', { action: 'fill', selector: '@e1', text: '[redacted]' }],
     ['tool_end', 'browser', 'succeeded', 'URL: https://example.com\nFixture page'],
-    [
-      'tool_start',
-      'manage_personal_context',
-      { action: 'memory_find', args: '[private memory omitted]' },
-    ],
-    ['tool_end', 'manage_personal_context', 'succeeded', '-'],
+    ['tool_start', 'memory', { action: 'memory_find', args: '[private memory omitted]' }],
+    ['tool_end', 'memory', 'succeeded', '-'],
     ['tool_start', 'delegate', { title: 'Part', instruction: 'Do one part.' }],
     ['model_usage', 'child'],
     ['tool_end', 'delegate', 'succeeded', 'The subagent finished without an answer.'],

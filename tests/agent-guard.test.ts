@@ -31,7 +31,7 @@ import { createSkillLibrary } from '../src/providers/pi/skills.ts';
 import { createDocumentation } from '../src/server/documentation.ts';
 import { coreSkills } from '../src/runtime/prompt.ts';
 import { localResultTimes } from '../src/runtime/time-context.ts';
-import { personalActions, toolDefinitions } from '../src/runtime/tools.ts';
+import { memoryActions, nodActions, toolDefinitions } from '../src/runtime/tools.ts';
 import { createAgentRuntime } from '../src/runtime/index.ts';
 import {
   inlineAppResult,
@@ -1758,17 +1758,17 @@ test('documentation search ranks sections, bounds reads and cannot read files ou
   let calls = 0;
   await fixture(
     async (tools) => {
-      const read = tools.get('nod_docs')!;
+      const read = tools.get('nod')!;
       assert.ok(read.parallel);
-      const output = await read.execute({ action: 'read', id: results[0].id });
+      const output = await read.execute({ action: 'docs_read', args: { id: results[0].id } });
       assert.match(JSON.stringify(output), /untrusted_tool_result/);
       await assert.rejects(
-        read.execute({ action: 'read', id: '../private.md' }),
+        read.execute({ action: 'docs_read', args: { id: '../private.md' } }),
         /section was not found/,
       );
       await assert.rejects(
-        read.execute({ action: 'read', id: results[0].id, offset: -1 }),
-        /Invalid nod_docs/,
+        read.execute({ action: 'docs_read', args: { id: results[0].id, offset: -1 } }),
+        /offset/,
       );
     },
     {
@@ -2015,11 +2015,11 @@ test('past the monthly spending limit a turn can only reply and change spending 
         /spending limit/,
       );
       await assert.rejects(
-        call(tools, 'manage_personal_context', { action: 'schedule_list', args: {} }),
+        call(tools, 'nod', { action: 'schedule_list', args: {} }),
         /spending limit/,
       );
-      await call(tools, 'manage_personal_context', { action: 'usage_get', args: {} });
-      await call(tools, 'manage_personal_context', {
+      await call(tools, 'nod', { action: 'usage_get', args: {} });
+      await call(tools, 'nod', {
         action: 'limits_update',
         args: { monthlyUsd: null },
       });
@@ -2360,7 +2360,7 @@ test('secure credential pause prevents subsequent tools in the same execution se
           action: 'Open secure step',
         });
         await assert.rejects(
-          call(tools, 'manage_personal_context', {
+          call(tools, 'nod', {
             action: 'schedule_create',
             args: { title: 'must not run' },
           }),
@@ -2749,17 +2749,14 @@ test('bug report actions stay out of background work without a task', async () =
   const draft = { action: 'bug_report_draft', args: { summary: 'Synthetic failure.' } };
   await fixture(
     async (tools) => {
-      await assert.rejects(
-        call(tools, 'manage_personal_context', draft),
-        /only for work the owner follows/,
-      );
+      await assert.rejects(call(tools, 'nod', draft), /only for work the owner follows/);
     },
     { background: true, manage },
   );
   assert.deepEqual(managed, []);
   await fixture(
     async (tools) => {
-      await call(tools, 'manage_personal_context', draft);
+      await call(tools, 'nod', draft);
     },
     {
       background: true,
@@ -2786,7 +2783,7 @@ test('proactive work has no write routes and cannot send model text', async () =
       assert.equal(options.restricted, true);
       assert.deepEqual([...tools.keys()].sort(), [
         'ask_user',
-        'manage_personal_context',
+        'memory',
         'proactive_issue',
         'read_source',
         'task',
@@ -2812,8 +2809,7 @@ test('proactive work has no write routes and cannot send model text', async () =
       ]);
       for (const nested of [false, true]) {
         for (const name of names) {
-          if (['read_source', 'proactive_issue', 'manage_personal_context', 'task'].includes(name))
-            continue;
+          if (['read_source', 'proactive_issue', 'memory', 'task'].includes(name)) continue;
           await assert.rejects(
             options.runTool(
               name,
@@ -2827,11 +2823,11 @@ test('proactive work has no write routes and cannot send model text', async () =
             /unavailable in proactive/,
           );
         }
-        for (const action of personalActions) {
+        for (const action of [...memoryActions, ...nodActions]) {
           if (reads.includes(action)) continue;
           await assert.rejects(
             options.runTool(
-              'manage_personal_context',
+              'memory',
               { action, args: { approved: true } },
               async () => {
                 forbidden++;
@@ -2843,7 +2839,7 @@ test('proactive work has no write routes and cannot send model text', async () =
           );
         }
         for (const action of reads)
-          await call(tools, 'manage_personal_context', {
+          await call(tools, 'memory', {
             action,
             args: { path: 'preferences', query: 'Synthetic preference' },
           });
@@ -3466,12 +3462,9 @@ test(
           let preparationStartedAt = 0;
           let agentStartedAt: number | undefined;
           const { result, replies } = await fixture(
-            async (_tools, emit, options) => {
+            async (_tools, emit, _options, request) => {
               if (explicit)
-                assert.ok(
-                  options.ownerContext?.includes(fact),
-                  'Explicit recall must reach the main agent.',
-                );
+                assert.ok(request.includes(fact), 'Explicit recall must reach the main agent.');
               emit({ type: 'final', text: 'Synthetic answer.' });
             },
             {
@@ -3615,10 +3608,7 @@ test('repeated input, sign-in and action review failures stop while source text 
       'sign_in',
       'Nod could not confirm it was still on the page and control it checked, so nothing was done.',
     ],
-    [
-      'manage_personal_context',
-      'The action review model is unavailable. Synthetic provider failure.',
-    ],
+    ['nod', 'The action review model is unavailable. Synthetic provider failure.'],
     ['apps', 'Nod could not write an accurate confirmation for this action, so it did not run.'],
     [
       'bash',

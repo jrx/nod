@@ -79,6 +79,7 @@ Only the server holds keys and decides what runs. The model, the workspace and a
 
 ### Client access
 
+- API text in JSON bodies, voice message details, query values and route values cannot contain a null character (U+0000). Nod refuses the text with HTTP 400 before storage and leaves the submitted text unchanged.
 - Desktop windows use process sandboxing and context isolation, with Node integration and webviews disabled. Packaged windows disable DevTools and remote debugging switches.
 - Desktop setup uses a private protocol that serves only its five UI files. Its session denies permission requests, and its content policy blocks network access. Chat allows audio recording, clipboard writes, and notifications only from its owned main frame. Native notifications keep the app's existing controls.
 - Packaged chat pages limit external scripts and connections to the selected server. Their content policy permits inline scripts in the chat page, so it does not block inline script injection. This keeps sandboxed HTML previews and stickers working. Those frames have separate policies that block network access. The policy blocks plugins and code evaluation. Map frames use OpenStreetMap.

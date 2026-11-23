@@ -119,7 +119,7 @@ export interface ScheduleDependencies {
   recentTurnUsage?(
     turnId?: string,
     projectAtApiRates?: boolean,
-  ): Promise<Array<WorkUsage & { recordedUsd: number }>>;
+  ): Promise<Array<WorkUsage & { recordedUsd: number; work?: boolean }>>;
   validateModel?(choice: ModelSelection): ModelSelection;
   sessionUsage?(sessionIds: string[]): Promise<Record<string, WorkUsage & { unpriced: boolean }>>;
   workPricing?(own: ModelSelection | null): WorkPrice | undefined;
@@ -382,7 +382,7 @@ export function createSchedules(dependencies: ScheduleDependencies) {
     missed: Date[] = [],
   ) {
     const turnId = await enqueueTurn(
-      `Scheduled task: ${row.title}\n${row.prompt}\nDeliver what this schedule asks for in this run, even when an earlier message covered the same ground. When it asks for nothing to be sent, message the owner only about a useful result, a problem or a necessary question.${note}`,
+      `Scheduled task: ${row.title}\n${row.prompt}\nDo this run now; the schedule already decided its timing. Deliver what this schedule asks for in this run, even when an earlier message covered the same ground. When it asks for nothing to be sent, message the owner only about a useful result, a problem or a necessary question.${note}`,
       {
         sourceId: `schedule:${row.id}:${jobId}`,
         source: 'schedule',
@@ -455,7 +455,13 @@ export function createSchedules(dependencies: ScheduleDependencies) {
           new Error('This schedule already has a run in progress or waiting for your answer.'),
           { statusCode: 409 },
         );
-      return startRun(client, row, input.requestId, now());
+      return startRun(
+        client,
+        row,
+        input.requestId,
+        now(),
+        '\nThe owner started this run with Run now.',
+      );
     });
     refresh();
     return { ...run, activeRun: await activeRun(pool, id) };
@@ -808,14 +814,17 @@ export function createSchedules(dependencies: ScheduleDependencies) {
         const cost = forecast(spent, recorded, target);
         return hasPrice(cost) ? [cost] : [];
       });
-    let fallback: Promise<Array<WorkUsage & { recordedUsd: number }>> | undefined;
+    let fallback: Promise<Array<WorkUsage & { recordedUsd: number; work?: boolean }>> | undefined;
     const recentTurnMedian = async (target: WorkPrice | undefined) => {
-      const samples = (
-        await (fallback ??=
-          dependencies.recentTurnUsage?.(turnId, target !== undefined) ?? Promise.resolve([]))
-      )
-        .map((sample) => forecast(sample, sample.recordedUsd, target))
-        .filter(hasPrice)
+      const recent = await (fallback ??=
+        dependencies.recentTurnUsage?.(turnId, target !== undefined) ?? Promise.resolve([]));
+      const priced = recent.flatMap((sample) => {
+        const cost = forecast(sample, sample.recordedUsd, target);
+        return hasPrice(cost) ? [{ cost, work: sample.work }] : [];
+      });
+      const work = priced.filter((sample) => sample.work);
+      const samples = (work.length ? work : priced)
+        .map((sample) => sample.cost)
         .sort((a, b) => a - b);
       if (!samples.length) return [];
       const middle = Math.floor(samples.length / 2);

@@ -42,7 +42,7 @@ The library combines task guides in [`src/runtime/skills`](https://github.com/n8
 | `learning-and-study`      | `sales-and-crm`         | `research`               |
 | `personal-finance`        | `software-and-websites` | `writing-and-content`    |
 | `privacy-and-accounts`    | `n8n`                   | `visual-replies`         |
-| `shopping`                |                         |                          |
+| `shopping`                | `nod`                   |                          |
 | `subscriptions-and-bills` |                         |                          |
 | `travel`                  |                         |                          |
 

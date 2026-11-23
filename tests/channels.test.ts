@@ -232,6 +232,11 @@ test('contact previews read vCard 2.1, 3.0 and 4.0 without treating field values
     contactCards('BEGIN:VCARD\r\nFN:First\r\nBEGIN:VCARD\r\nFN:Second\r\nEND:VCARD'),
     [],
   );
+  const escaped = contactCards(
+    'BEGIN:VCARD\r\nFN:Synthetic\r\nTITLE:C:\\\\new\\\\\r\nORG:Line\\nOne\\NTwo\\, \\;\r\nEND:VCARD',
+  )[0];
+  assert.equal(escaped.title, 'C:\\new\\');
+  assert.equal(escaped.organization, 'Line\nOne\nTwo, ;');
 });
 
 const vcardOf = (...lines: string[]) => ['BEGIN:VCARD', ...lines, 'END:VCARD'].join('\r\n');
@@ -774,7 +779,7 @@ test('channel transports check literal instructions against their actual formatt
 
 test(
   'WhatsApp links privately, admits only its owner, fences echoes across restart, and reconnects without repeating sends',
-  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000 },
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 30_000, concurrency: true },
   async (t) => {
     const schema = `test_whatsapp_link_${randomUUID().replaceAll('-', '')}`;
     const admin = new pg.Pool({ connectionString: process.env.TEST_DATABASE_URL });
@@ -786,8 +791,15 @@ test(
     const keyStore = { id: 'fixture', configured: true, getKey: async () => key };
     const key = Buffer.alloc(32, 7);
     try {
-      for (const mode of ['bot', 'self-chat'] as const)
-        await t.test(mode, async () => {
+      const setup = await createChannelSessionStore({
+        pool,
+        ownerId: 'fixture-setup',
+        keyStore,
+      }).open();
+      await setup.close();
+      const modes: Promise<void>[] = [];
+      for (const mode of ['bot', 'self-chat'] as const) {
+        const subtest = t.test(mode, async () => {
           type Options = Parameters<typeof createWhatsAppLinkedTransport>[0];
           type Factory = NonNullable<Options['createSocket']>;
           const sockets: { events: EventEmitter; config: Parameters<Factory>[0] }[] = [];
@@ -1510,6 +1522,9 @@ test(
             await transport.close();
           }
         });
+        modes.push(subtest);
+      }
+      await Promise.all(modes);
     } finally {
       await pool.end();
       await admin.query(`DROP SCHEMA ${schema} CASCADE`);
@@ -5489,6 +5504,20 @@ test(
         [ownerMessage],
       );
       assert.deepEqual(await react('👍'), { status: 'updated' });
+      const nextMessage = randomUUID();
+      await pool.query(
+        "INSERT INTO messages(id,owner_id,role,text,thread_id) VALUES($1,'local-development','user','Synthetic context',$2)",
+        [nextMessage, threadId],
+      );
+      assert.deepEqual(
+        await reactions.react({
+          threadId,
+          turnId: reactionTurn,
+          messageId: nextMessage,
+          reaction: '👍',
+        }),
+        { status: 'updated' },
+      );
       failReaction = true;
       assert.deepEqual(await react(null), { status: 'skipped', reason: 'delivery_failed' });
       assert.equal((await storedReaction()).assistant_reaction, '👍');

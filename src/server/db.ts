@@ -83,6 +83,7 @@ export async function initializeDatabase() {
     ALTER TABLE turns ADD COLUMN IF NOT EXISTS start_after timestamptz;
     ALTER TABLE turns ADD COLUMN IF NOT EXISTS withdrawn boolean NOT NULL DEFAULT false;
     ALTER TABLE turns ADD COLUMN IF NOT EXISTS context_exhausted boolean NOT NULL DEFAULT false;
+    ALTER TABLE turns ADD COLUMN IF NOT EXISTS outside_action_at timestamptz;
     CREATE INDEX IF NOT EXISTS turns_withdrawn_message ON turns(message_id) WHERE withdrawn;
     CREATE INDEX IF NOT EXISTS turns_reaction_message ON turns(owner_id,message_id) WHERE starts_with(source_id,'reaction-reply:');
     CREATE OR REPLACE FUNCTION turns_session() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
@@ -139,7 +140,7 @@ export async function initializeDatabase() {
     ALTER TABLE turns ADD COLUMN IF NOT EXISTS handoff_browser_id text;
     DROP INDEX IF EXISTS messages_hidden_thread;
     CREATE INDEX IF NOT EXISTS messages_hidden_thread_recent ON messages(owner_id,thread_id,hidden_at DESC,id DESC) WHERE hidden_at IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS messages_owner_agent_reaction_time ON messages(owner_id,assistant_reacted_at DESC) WHERE assistant_reacted_at IS NOT NULL;
+    DROP INDEX IF EXISTS messages_owner_agent_reaction_time;
     CREATE TABLE IF NOT EXISTS approvals (
       id uuid PRIMARY KEY, owner_id text NOT NULL, thread_id uuid REFERENCES threads(id),
       turn_id uuid REFERENCES turns(id), execution_turn_id uuid REFERENCES turns(id),
@@ -154,7 +155,8 @@ export async function initializeDatabase() {
       ADD COLUMN IF NOT EXISTS expected_revision integer,
       ADD COLUMN IF NOT EXISTS details jsonb,
       ADD COLUMN IF NOT EXISTS title text,
-      ADD COLUMN IF NOT EXISTS decline text;
+      ADD COLUMN IF NOT EXISTS decline text,
+      ADD COLUMN IF NOT EXISTS card_question text;
     CREATE INDEX IF NOT EXISTS approvals_turn ON approvals(turn_id);
     CREATE INDEX IF NOT EXISTS approvals_execution_turn ON approvals(execution_turn_id);
     CREATE INDEX IF NOT EXISTS approvals_confirmation_message ON approvals(confirmation_message_id);

@@ -139,7 +139,7 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
       if (
         !domain.isIcann &&
         !domain.isPrivate &&
-        !/\.(?:internal|local|localhost|test|invalid)$/i.test(match[1])
+        !/\.(?:helsinki|internal|local|localhost|test|invalid)$/i.test(match[1])
       )
         return;
       const tailPattern = new RegExp(linkTail);
@@ -405,7 +405,10 @@ export function createFeedbackRedactor(options: { secrets: string[]; profile: Pe
             ? labelViews(first.value)
             : undefined;
         const privateTuple =
-          first && (!('value' in first) || names === null || names?.some(secretField));
+          typeof length === 'number' &&
+          length > 1 &&
+          first &&
+          (!('value' in first) || names === null || names?.some(secretField));
         if (privateTuple)
           return [
             first && 'value' in first && names !== null

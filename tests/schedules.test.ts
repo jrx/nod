@@ -378,6 +378,19 @@ test(
           await expectMonthly(0.01);
           pricing = { ...original, input: 2.2 };
           await expectMonthly((1.94 + 0.24) / 2);
+
+          const taskTurn = await thread.enqueueTurn('Synthetic task sample', {
+            source: 'task',
+            background: true,
+          });
+          sampleTurns.push(taskTurn);
+          await db.pool.query("UPDATE turns SET status='succeeded' WHERE id=$1", [taskTurn]);
+          await db.pool.query(
+            `INSERT INTO model_usage(id,owner_id,turn_id,cost_usd,details)
+             VALUES($1,$2,$3,0.1,'{"category":"agent","inputTokens":50000}')`,
+            [randomUUID(), ownerId, taskTurn],
+          );
+          await expectMonthly(0.11);
         } finally {
           await request('DELETE', `/api/schedules/${schedule.id}`);
           await db.pool.query('DELETE FROM model_usage WHERE turn_id=ANY($1::uuid[])', [
@@ -2316,8 +2329,14 @@ test('scheduled controls reconcile pause and delete after a client timeout', asy
   );
   for (const [key, value] of Object.entries(globals))
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
-  const nativeTimeout = AbortSignal.timeout.bind(AbortSignal);
-  t.mock.method(AbortSignal, 'timeout', (duration: number) => nativeTimeout(duration / 50));
+  t.mock.method(AbortSignal, 'timeout', (duration: number) => {
+    const controller = new AbortController();
+    setTimeout(
+      () => controller.abort(new DOMException('The operation timed out.', 'TimeoutError')),
+      duration / 50,
+    );
+    return controller.signal;
+  });
   const schedule: Schedule = {
     id: randomUUID(),
     title: 'Delayed schedule',
@@ -2401,6 +2420,7 @@ test('scheduled controls reconcile pause and delete after a client timeout', asy
   const { PauseSwitch, PlanToast, ScheduleEditor, useDirectChange } =
     await import('../src/web/components/plan-controls.tsx');
   const { DeletePlan } = await import('../src/web/components/delete-plan.tsx');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   pageDataCache.clear();
   pageDataCache.update('/api/schedules', () => [schedule]);
   const root = createRoot(dom.window.document.getElementById('root')!);
@@ -2452,10 +2472,12 @@ test('scheduled controls reconcile pause and delete after a client timeout', asy
     await act(async () => commit());
   };
   const waitFor = async (ready: () => boolean, name: string, timeoutMs = 5000) => {
-    const deadline = Date.now() + timeoutMs;
-    while (!ready()) {
-      if (Date.now() >= deadline) assert.fail(`Timed out waiting for ${name}`);
-      await act(async () => new Promise((resolve) => setTimeout(resolve, 50)));
+    for (let waited = 0; !ready(); waited += 50) {
+      if (waited >= timeoutMs) assert.fail(`Timed out waiting for ${name}`);
+      await act(async () => {
+        t.mock.timers.tick(50);
+        await new Promise((resolve) => setImmediate(resolve));
+      });
     }
   };
   await click('[role="switch"]');

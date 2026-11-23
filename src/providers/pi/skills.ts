@@ -51,15 +51,20 @@ export function createSkillLibrary(
     );
   const enabled = skills.filter((skill) => !skill.disableModelInvocation);
   const byName = new Map(enabled.map((skill) => [skill.name, skill.baseDir]));
-  const toolsByName = new Map(
-    enabled.map((skill) => {
-      const { tools } = parseFrontmatter(readFileSync(skill.filePath, 'utf8')).frontmatter;
-      return [
-        skill.name,
-        [tools].flat().filter((tool): tool is string => typeof tool === 'string'),
-      ] as const;
+  const toolsOf = (path: string) =>
+    [parseFrontmatter(readFileSync(path, 'utf8')).frontmatter.tools]
+      .flat()
+      .filter((tool): tool is string => typeof tool === 'string');
+  const toolsByName = new Map([
+    ...excluded.flatMap((name) => {
+      try {
+        return [[name, toolsOf(checkedPath(resolve(roots[0], name), 'SKILL.md'))] as const];
+      } catch {
+        return [];
+      }
     }),
-  );
+    ...enabled.map((skill) => [skill.name, toolsOf(skill.filePath)] as const),
+  ]);
   return {
     core: excluded,
     catalog: enabled.map(({ name, description }) => ({ name, description: description.trim() })),

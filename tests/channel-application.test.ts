@@ -629,7 +629,7 @@ test(
         const opening = createApplication({
           agent: { open: async (options) => ({ resumed: false, abort() {}, dispose() {}, prompt: async () => {
             calls++;
-            const tool = options.tools.find(tool => tool.name === 'manage_personal_context');
+            const tool = options.tools.find(tool => tool.name === 'nod');
             assert.ok(tool);
             await tool.execute({ action: 'schedule_create', args: { title: 'Synthetic startup review', prompt, kind: 'recurring', cron: '0 15 * * *', timeZone: 'UTC' } });
             options.onEvent({ type: 'final', text: '' });

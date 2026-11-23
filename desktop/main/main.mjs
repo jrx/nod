@@ -32,6 +32,7 @@ import {
   createSettingsStore,
   desktopContentPolicy,
   serverOrigin,
+  serverToken,
   setupResource,
 } from './settings.mjs';
 import { createDesktopAnalytics } from './analytics.mjs';
@@ -1774,13 +1775,12 @@ function showConnectionSettings() {
 
 async function checkRemoteConnection(connection) {
   const url = serverOrigin(connection.url);
-  if (typeof connection.token !== 'string' || !/^[A-Za-z0-9_-]{43,}$/.test(connection.token))
-    throw new Error('Enter the authentication token configured on your server.');
-  knownSecrets.add(connection.token);
+  const token = serverToken(connection.token);
+  knownSecrets.add(token);
   let response;
   try {
     response = await fetch(`${url}/api/session`, {
-      headers: { Authorization: `Bearer ${connection.token}` },
+      headers: { Authorization: `Bearer ${token}` },
       redirect: 'error',
       signal: AbortSignal.timeout(10000),
     });
@@ -1821,7 +1821,7 @@ async function checkRemoteConnection(connection) {
     typeof revision === 'string' && /^(?:0|[1-9]\d{0,18})$/.test(revision) ? revision : null;
   return {
     url,
-    token: connection.token,
+    token,
     owner: account.user.id,
     usageDataRevision,
     analyticsAllowed:
@@ -1898,7 +1898,8 @@ async function saveConnection(input) {
   if (input !== null) {
     if (!input || typeof input !== 'object' || Array.isArray(input))
       throw new Error('Enter your server address and authentication token.');
-    await checkRemoteConnection(input);
+    const connection = await checkRemoteConnection(input);
+    input = { ...input, token: connection.token };
   }
   if (!(await confirmRestart())) return;
   await settings.saveConnection(input);

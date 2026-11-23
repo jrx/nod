@@ -69,7 +69,7 @@ A CLI path declares where to install the tool from:
 - a PyPI package, installed with `pipx`, or
 - an HTTPS download of a release program or archive, with an optional `sha256` checksum.
 
-It also names the environment variables the tool reads its credentials from, such as `GITHUB_TOKEN`, or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Each name must end in `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `_ID` or `_SID`, so it can't be a variable that loads code, such as `LD_PRELOAD`. A tool with several variables is its own connection.
+It also names the environment variables the tool reads its credentials from, such as `GITHUB_TOKEN`, or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. Each name must end in `TOKEN`, `KEY`, `SECRET`, `PASSWORD`, `URL`, `_ID`, `_SID`, `USERNAME`, `USER` or `EMAIL`, so it can't be a variable that loads code, such as `LD_PRELOAD`. A tool with several variables is its own connection.
 
 The setup page shows the source and one field per variable, so you can check it before you paste anything. A command runs for up to 59 minutes unless Nod asks for longer. Installing a missing CLI has its own 10-minute limit before that. When an install runs longer, the error says "The connected CLI install ran longer than its 600-second limit."
 

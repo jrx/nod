@@ -65,12 +65,13 @@ import type { createChatVerification } from './chat-verification.ts';
 import { registerWorkAdmission, type WorkAdmission } from './work-admission.ts';
 import { registerAnalyticsRoutes, snapshotAnalytics, type CaptureAnalytics } from './analytics.ts';
 import { messagePreview } from './message-preview.ts';
+import { validateRequestText } from './request-text.ts';
 
 const messageFields = `m.id,m.role,m.text,CASE WHEN m.role='user' THEN m.display_text END AS "displayText",m.audio_caption AS "audioCaption",m.turn_id AS "turnId",m.created_at AS "createdAt",m.attachments,m.stream_id AS "streamId",m.reaction,m.assistant_reaction AS "assistantReaction",m.reply_to_message_id AS "replyToMessageId",m.suggestions,m.presentation,m.answer_choices AS "answerChoices",(${pendingAnswerChoicesSql}) AS "answerChoicesPending",
  (m.role='user' AND (m.approval_answer IS NOT NULL OR (m.question_answer IS NOT NULL AND m.text<>'' AND jsonb_array_length(m.attachments)=0))) AS "cardAnswer",
  CASE WHEN m.role='assistant' AND m.answer_choices IS NOT NULL THEN (SELECT json_build_object('answer',a.question_answer,'text',a.text) FROM messages a
    WHERE a.reply_to_message_id=m.id AND a.owner_id=m.owner_id AND a.role='user' AND a.question_answer IS NOT NULL AND a.text<>'' AND jsonb_array_length(a.attachments)=0 ORDER BY a.created_at,a.id LIMIT 1) END AS "choiceAnswer",
- CASE WHEN m.role='assistant' THEN (SELECT json_build_object('id',a.id,'status',a.status,'action',a.action,'title',a.title,'decline',a.decline,'args',a.args,'failure',CASE WHEN a.status IN ('expired','uncertain') AND jsonb_typeof(a.result->'error')='string' THEN a.result->>'error' END,'active',u.status IN ('running','waiting'),'executionActive',e.status IN ('queued','running','waiting')) FROM approvals a
+ CASE WHEN m.role='assistant' THEN (SELECT json_build_object('id',a.id,'status',a.status,'action',a.action,'title',a.title,'decline',a.decline,'cardQuestion',a.card_question,'args',a.args,'failure',CASE WHEN a.status IN ('expired','uncertain') AND jsonb_typeof(a.result->'error')='string' THEN a.result->>'error' END,'active',u.status IN ('running','waiting'),'executionActive',e.status IN ('queued','running','waiting')) FROM approvals a
    JOIN turns u ON u.id=a.turn_id AND u.owner_id=a.owner_id LEFT JOIN turns e ON e.id=a.execution_turn_id AND e.owner_id=a.owner_id
    WHERE a.confirmation_message_id=m.id AND a.owner_id=m.owner_id LIMIT 1) END AS "approval",
  CASE WHEN m.role='assistant' AND (m.answer_choices IS NOT NULL OR EXISTS (SELECT 1 FROM approvals a WHERE a.confirmation_message_id=m.id AND a.owner_id=m.owner_id))
@@ -109,6 +110,7 @@ type ApprovalRow = {
   args: unknown;
   title?: string | null;
   decline?: string | null;
+  cardQuestion?: string | null;
   active: boolean;
   executionActive: boolean | null;
   failure?: string | null;
@@ -186,6 +188,7 @@ function messageView(row: MessageRow): Message {
             ...(approval.title ? { title: approval.title } : {}),
             ...(approval.decline ? { decline: approval.decline } : {}),
             ...approvalContent(approval.action, approval.args),
+            ...(approval.cardQuestion ? { cardQuestion: approval.cardQuestion } : {}),
           },
         }
       : {}),
@@ -222,6 +225,7 @@ export interface AppDependencies {
   taskLedger?: () => Promise<import('../shared/contracts.ts').Task[]>;
   activity?: () => Promise<Activity[]>;
   planningTasks?: () => string | undefined;
+  rateLimit?: boolean;
 }
 
 export async function createApp(dependencies: AppDependencies = {}) {
@@ -291,6 +295,9 @@ export async function createApp(dependencies: AppDependencies = {}) {
           bearer: authToken !== undefined,
         },
   );
+  app.addHook('preValidation', async (request) => {
+    validateRequestText([request.body, request.query, request.params]);
+  });
   if (desktopAccess && dependencies.admission) registerWorkAdmission(app, dependencies.admission);
   app.setErrorHandler((error, request, reply) => {
     const known =
@@ -331,6 +338,7 @@ export async function createApp(dependencies: AppDependencies = {}) {
   await app.register(rateLimit, {
     global: false,
     keyGenerator: () => ownerId,
+    allowList: () => dependencies.rateLimit === false,
   });
   await app.register(multipart, { limits: { fileSize: fileBytes, files: 1, fields: 5 } });
   const audioMessages = registerAudioMessages(app, dependencies);

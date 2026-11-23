@@ -59,15 +59,17 @@ Nod repairs incomplete assistant text and thinking blocks when it restores or sa
 
 Pi validates tool arguments as JSON Schema with `@earendil-works/pi-schema`. It can convert a numeric string to a number or a single value to an array. This also applies to MCP tools. TypeBox refinements and custom TypeBox formats do not run. Nod's tool checks, turn guard, and trust check still apply before an action runs.
 
-When an action has one matching input form, a rejected call names its missing or invalid fields. The `nod_docs`, `skills`, `browser_session`, and `task` tools list all valid actions when an action is invalid. Each action requires its own fields and refuses extra fields. Five repeated input, tool availability, sign-in binding, or action review failures for the same tool end the run before another model request. A successful call to that tool clears its count. Parent and helper sessions have separate counts. The failure keeps its last specific cause after secret removal. Nod reports it without creating an unexpected-error report. This limit does not repeat any tool or bypass an approval.
+When an action has one matching input form, a rejected call names its missing or invalid fields. The `skills`, `browser_session`, and `task` tools list all valid actions when an action is invalid. Each action requires its own fields and refuses extra fields. Five repeated input, tool availability, sign-in binding, or action review failures for the same tool end the run before another model request. A successful call to that tool clears its count. Parent and helper sessions have separate counts. The failure keeps its last specific cause after secret removal. Nod reports it without creating an unexpected-error report. This limit does not repeat any tool or bypass an approval.
 
-Nod applies provider settings when it opens a model connection. Groq Qwen uses the system message role. OpenRouter MiMo V2.6 Flash uses tools without optional strict sampling, so tools with different sampling settings can share a request. A tool that requires strict sampling still refuses a model that cannot supply it. OpenRouter's free route keeps reasoning enabled because a routed model can require it. Its picker does not offer Off; a saved Off choice uses the lowest supported effort. Ollama models with on or off thinking use boolean controls instead of a named effort. OpenCode helper calls get a separate session ID for each helper request, shared by that request's model retries.
+Nod applies provider settings when it opens a model connection. Groq Qwen uses the system message role. OpenRouter MiMo V2.6 Flash uses tools without optional strict sampling, so tools with different sampling settings can share a request. A tool that requires strict sampling still refuses a model that cannot supply it. OpenRouter's free route keeps reasoning enabled because a routed model can require it. Its picker does not offer Off; a saved Off choice uses the lowest supported effort. Ollama models with only on or off thinking send an effort value: `none` turns thinking off and `high` turns it on. Models with named thinking levels send a supported effort instead. OpenCode helper calls get a separate session ID for each helper request, shared by that request's model retries.
 
 Some OpenAI-compatible models, such as Mistral reasoning models, stream the answer as a list of content parts. Nod reads the text parts as the answer and leaves out reasoning parts.
 
 After a model list refresh or a connection is saved again, an unsupported saved effort changes to a supported effort for the same model. Nod chooses the first listed effort that is Off, Minimal, Low or Medium. If none is listed, it uses the first listed effort. A supported choice stays unchanged.
 
 If Ollama does not report its thinking controls, Nod uses the server's default instead of sending an effort value.
+
+Nod corrects saved Ollama boolean effort values when it opens a model connection. A model that advertises only On keeps thinking enabled. Its selected-model check can still fail if reasoning uses the check's 512-token limit.
 
 Helper requests use Pi's bounded retry policy. Invalid requests, account limits, and authentication failures do not get unconditional retries. Provider-client retries remain off. A model retry does not repeat a turn or a completed tool action.
 
@@ -93,6 +95,8 @@ A stopped turn does not wait for a source check that ignores cancellation. A lat
 ## Keeping the context small
 
 Optional next steps belong in the result message. There is no separate offer tool, queue or delivery delay.
+
+The agent's context lists the tool names of each connected MCP server, taken from the tool list Nod already keeps, so the agent can load a tool by name instead of searching for it. All servers share one limit of 150 names, filled in connection order; a server whose tools don't fit in what is left shows only its count. The compact context for small models keeps only the counts. Names use the same lowercase letters, digits and `_` as the loaded tools, and they are data from the server, never permission. Apps connected through the connection service are still found with tool search. Loading a server's first tool with `nod_tool_search` also returns that server's guide, as untrusted data, so the agent doesn't need a separate `skills` read before using it.
 
 App tool search returns account IDs with the schemas. It needs no separate account list. When a search returns more than six tools, the first three keep full schemas and the rest form an index. Search an exact tool name to read its full schema, or separate several names with commas to read them together. A missing exact app tool name returns an explicit schema error with the available tool index. The agent must choose a returned name. Each action still uses the same account binding, validation and trust check. The observer also receives the names of tools whose schemas are deferred, so it can ask for an exact schema. A name alone cannot run a tool.
 
@@ -154,12 +158,11 @@ Tool definitions live in [`src/runtime/tools.ts`](https://github.com/n8n-io/nod/
 
 | Tool                                                                | What it does                                                                                                                                                  |
 | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `read`, `bash`, `edit`, `write`, `find`, `ls`                       | Pi's native tools. They run inside the workspace container.                                                                                                   |
+| `read`, `bash`, `edit`, `write`                                     | Pi's native tools. They run inside the workspace container. `bash` covers listing and finding files.                                                          |
 | `skills`                                                            | Reads a [guide](/how-it-works/skills/) or [learned skill](/how-it-works/memory/#learned-skills); only owner-started work writes one.                          |
-| `nod_docs`                                                          | Searches the documentation shipped with Nod and reads relevant sections with source links.                                                                    |
 | `send_message`                                                      | Sends a message now. Schedule and event runs use explicit delivery; saved tasks also deliver their final reply.                                               |
 | `ask_user`                                                          | Asks one question and ends the turn as waiting.                                                                                                               |
-| `react_to_message`                                                  | Now and then, reacts to the user's message with one emoji, on web, Telegram and WhatsApp. At most one every five minutes.                                     |
+| `react_to_message`                                                  | Reacts to the user's message with one emoji, on web, Telegram and WhatsApp, such as when a message only gives context.                                        |
 | `browser`                                                           | Drives the private browser: open, snapshot, click, fill, evaluate, download and handoff.                                                                      |
 | `sign_in`                                                           | Enters a Vault login or code into the page without showing it to the model, then returns the page that follows.                                               |
 | `pay`                                                               | Submits a Vault card at checkout after your approval. Submission does not establish that payment succeeded.                                                   |
@@ -167,7 +170,8 @@ Tool definitions live in [`src/runtime/tools.ts`](https://github.com/n8n-io/nod/
 | `apps`                                                              | Runs an action on a connected account, after the trust check.                                                                                                 |
 | `computer`                                                          | Uses native apps on macOS, Windows and Linux (experimental) through their accessibility tree, when the owner turns on [computer use](/connect/computer-use/). |
 | `manage_apps`                                                       | Lists, discovers, connects or proposes app connections.                                                                                                       |
-| `manage_personal_context`                                           | Schedules, notification preferences, memory, history and usage.                                                                                               |
+| `memory`                                                            | Finds, reads, learns and forgets memory notes, searches chat history, and reads or changes notification preferences and standing rules.                       |
+| `nod`                                                               | Nod's own docs, schedules, models, usage, limits, prepared work and bug reports. Reading the `nod` guide loads it.                                            |
 | `task`                                                              | Starts saved task sessions, sends owner updates, reports progress and stops one task or all background work. It grants no permission.                         |
 | `share_file`                                                        | Attaches a workspace file to Nod's next reply or question, or sends it alone when a turn finishes or fails without one.                                       |
 | `create_audio`                                                      | Turns text into speech and sends it to you.                                                                                                                   |
@@ -181,9 +185,9 @@ The `pi-web-access` extension runs in the server process with the server's permi
 
 ### Questions about Nod
 
-Nod searches its own documentation before answering any question about Nod. This covers setup, models, channels, schedules, memory, privacy, safety, troubleshooting, and development. It reads the relevant sections and links to them. The same rule applies when Nod uses its shorter instructions for a small model context.
+Nod searches its own documentation before answering any question about Nod. This covers setup, models, channels, schedules, memory, privacy, safety, troubleshooting, and development. It reads the relevant sections and links to them. The `nod` guide holds this rule, the greeting and ideas guidance, how Nod's settings work and when to draft a bug report; reading it loads the `nod` tool.
 
-The `nod_docs` tool builds an index on its first use and keeps it in memory. Search ignores case and accents, while keeping different words distinct. It gives more weight to section titles and terms that occur in fewer sections. Search adjusts for section length and limits the effect of repeated words. Search returns up to five results with short excerpts. A read returns up to 8,000 characters. Longer sections include an offset to read the next part. Neither action calls a model or sends a network request.
+The `nod` tool's `docs_search` and `docs_read` actions build an index on its first use and keeps it in memory. Search ignores case and accents, while keeping different words distinct. It gives more weight to section titles and terms that occur in fewer sections. Search adjusts for section length and limits the effect of repeated words. Search returns up to five results with short excerpts. A read returns up to 8,000 characters. Longer sections include an offset to read the next part. Neither action calls a model or sends a network request.
 
 Desktop packages and self-hosted images include the Markdown and MDX pages from the same source as the application. The tool reads only indexed sections. It accepts no file path or website address. Documentation is data, not permission to act. Nod still uses live tools to check current account state and owner settings.
 
@@ -204,13 +208,13 @@ flowchart TD
 - **Observations:** the guard reports each call to an optional observer. Only the capability evals and the voice eval script set one; the capability evals redact typed text and memory arguments.
 - **App actions:** `apps` and every connected MCP server tool also pass the server's [trust check](/trust/approvals/).
 
-`apps` and `manage_personal_context` calls run in parallel with each other and with subagents. The trust check covers app actions, changes to schedules, notification settings, the owner's rules and spending limits, and forgetting a note or turning memory on, off or clearing it, and those checks run in parallel too. Other `manage_personal_context` operations, such as saving a note and reads, have no trust check and count as decided as soon as they reach the server.
+`apps`, `memory` and `nod` calls run in parallel with each other and with subagents. The trust check covers app actions, changes to schedules, notification settings, the owner's rules and spending limits, and forgetting a note or turning memory on, off or clearing it, and those checks run in parallel too. Other `memory` and `nod` operations, such as saving a note and reads, have no trust check and count as decided as soon as they reach the server.
 
 Public web reads and flight searches also run in parallel when the model requests independent searches or pages in one step. Each call passes the same turn guard. Browser steps run in sequence.
 
 Managed app requests use the request's time limit, or the client's default, for the whole response. Nod keeps that deadline and the caller's Stop signal active after headers arrive. The SDK keeps its normal lazy parsing: a raw response is available at headers, and Nod does not read an extra copy first. Completed parsing removes the timer and Stop listener without aborting the retained raw response. Without parsing, a raw response with a body keeps those guards until its deadline or Stop. Client and request options cannot enable retries.
 
-A call acts only once every `apps` or `manage_personal_context` call issued before it in the turn is decided, and each earlier one that asks has opened its question or failed. If one of them opened a question, the later call is refused. A turn has at most one open confirmation: while one waits for the owner, approvals refuse to open another.
+A call acts only once every `apps`, `memory` or `nod` call issued before it in the turn is decided, and each earlier one that asks has opened its question or failed. If one of them opened a question, the later call is refused. A turn has at most one open confirmation: while one waits for the owner, approvals refuse to open another.
 
 ## Codemode
 
@@ -231,7 +235,7 @@ Nod keeps one MCP connection per account and address for a minute after its last
 
 Calls from different sessions share that connection. When one call is stopped or times out, only that call ends. Nod opens a new connection for later calls and closes the old one when its other calls finish. An error reply from the server also ends only its own call. A network failure or a lost connection ends every call on it.
 
-When a known tool list expires, a new turn uses the last successful list while Nod refreshes it. It does not wait for that refresh. The first load still waits for the server. Explicit tool searches wait for a current list. Each turn checks the connected accounts again, and each tool call checks its account binding and permission before it runs.
+When a known tool list expires, a new turn uses the last successful list while Nod refreshes it. It does not wait for that refresh. Nod loads each server's list when it starts, so the first turn doesn't wait for it unless the server is still answering. Explicit tool searches wait for a current list. Each turn checks the connected accounts again, and each tool call checks its account binding and permission before it runs.
 
 ## Untrusted results
 
@@ -241,13 +245,13 @@ Results from apps, the browser, the web and codemode reach Pi inside one `untrus
 
 The prompt has three layers, built in [`src/runtime/prompt.ts`](https://github.com/n8n-io/nod/blob/main/src/runtime/prompt.ts).
 
-| Layer         | Contains                                                                               | Sent                       |
-| ------------- | -------------------------------------------------------------------------------------- | -------------------------- |
-| Static prompt | Shared behavior and security rules, guide names, and Pi's tool guidelines              | Once per session           |
-| Owner context | Account details, date format, the memory index and the learned skill index             | Again only when it changes |
-| Turn message  | Mode, time, channel, message ID, reply target, recent conversation and the instruction | Every turn                 |
+| Layer         | Contains                                                                                                                                        | Sent                       |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------- |
+| Static prompt | Shared behavior and security rules, how to read request data, guide names, and Pi's tool guidelines                                             | Once per session           |
+| Owner context | Account details, date format, the memory index and the learned skill index                                                                      | Again only when it changes |
+| Turn message  | Mode, time, channel, message ID, reply target, open and recent tasks, memory selected for this request, recent conversation and the instruction | Every turn                 |
 
-One shared prompt serves large and small context windows. Guides load only when their procedures are needed. Pi's tool guidelines are appended to the shared prompt.
+One prompt serves every model, with a chat, task or background section for the work at hand; small context windows get a shorter variant without the browser procedure. Guides load only when their procedures are needed. The turn message carries data only; how to read it is in the static prompt, so it isn't repeated every turn. Pi's tool guidelines are appended to the shared prompt.
 
 The model receives a small presentation object schema for `send_message`. The server still validates the complete visual before delivery.
 

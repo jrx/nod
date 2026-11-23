@@ -1548,7 +1548,7 @@ test('HTML approval previews show the actual link destination', () => {
 
 test(
   'approvals preserve explicit-request authority, execute confirmed snapshots once and fence owners',
-  { skip: !process.env.TEST_DATABASE_URL, timeout: 60_000 },
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 180_000 },
   async (t) => {
     const fixtureRoot = await realpath(await mkdtemp(join(tmpdir(), 'nod-approvals-')));
     const previousDirectory = process.cwd();
@@ -2872,6 +2872,64 @@ test(
           assert.equal(reviews.length, reviewed + 1);
         },
       );
+
+      await t.test('a follow-up task sees the task result the owner answered', async (t) => {
+        const start = async (parent: { threadId: string; turnId: string }, title: string) => {
+          const task = (await tasks.execute(
+            parent,
+            {
+              action: 'start',
+              title,
+              message: `Starting ${title}.`,
+              doneWhen: `${title} is done`,
+              now: 'Working',
+            },
+            (await row(parent.turnId)).message_id,
+          )) as { id: string };
+          t.after(async () => {
+            await db.pool.query(
+              "UPDATE turns SET task_id=NULL,status='cancelled',finished_at=now() WHERE task_id=$1",
+              [task.id],
+            );
+            await db.pool.query('DELETE FROM tasks WHERE id=$1', [task.id]);
+          });
+          await finish(parent.turnId, 'succeeded');
+          const worker = await running(
+            (
+              await db.pool.query("SELECT id FROM turns WHERE task_id=$1 AND source='task'", [
+                task.id,
+              ])
+            ).rows[0].id,
+          );
+          await tasks.inherit(worker);
+          return worker;
+        };
+        const drafting = await start(
+          await begin('Draft a reply to Ana saying the synthetic report is ready.'),
+          'Synthetic draft',
+        );
+        const draft = 'Saved an unsent draft to ana@example.test: The synthetic report is ready.';
+        await db.pool.query(
+          "INSERT INTO messages(id,owner_id,thread_id,turn_id,role,text) VALUES($1,$2,$3,$4,'assistant',$5)",
+          [randomUUID(), ownerId, drafting.threadId, drafting.turnId, draft],
+        );
+        await finish(drafting.turnId, 'succeeded');
+        const sending = await start(await begin('Looks good, send it.'), 'Synthetic send');
+        const marked = async () => (await row(sending.turnId)).outside_action_at instanceof Date;
+        assert.equal(
+          (await trust.check(sending, 'GMAIL_SEND_EMAIL', email('ana@example.test'))).confirm,
+          true,
+        );
+        assert.equal(reviews.at(-1)?.assistantMessageBeforeLatestUserMessage, draft);
+        assert.equal(await marked(), false);
+        aligned = true;
+        assert.equal(
+          (await trust.check(sending, 'GMAIL_SEND_EMAIL', email('ana@example.test'))).confirm,
+          false,
+        );
+        assert.equal(await marked(), true);
+        await finish(sending.turnId, 'cancelled');
+      });
 
       await t.test('replies do not borrow authority from other assistant messages', async (t) => {
         const turnIds: string[] = [];
