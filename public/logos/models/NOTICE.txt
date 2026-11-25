@@ -63,4 +63,12 @@ Local asset: hostinger.svg
 The SVG path is unmodified. The title and role attributes are removed and
 width and height are set to 24 pixels.
 
+Cortecs
+Source: https://cortecs.ai/favicon.ico (reviewed 2026-11-16)
+Local asset: cortecs.png
+The favicon's white mark is extracted as a transparent monochrome PNG mask,
+with the blue background removed and padding normalized.
+Attribution: Cortecs GmbH. This asset is not covered by either bundled MIT
+license.
+
 Provider names and trademarks remain with their respective owners.
